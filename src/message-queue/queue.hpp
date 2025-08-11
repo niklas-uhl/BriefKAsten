@@ -196,6 +196,11 @@ public:
         return reserved_receive_buffer_size_;
     }
 
+    void resize_receive_buffers(std::size_t new_size, MessageHandler<T, MessageContainer> auto&& on_message) {
+        receiver_.resize_buffers(new_size, std::forward<decltype(on_message)>(on_message));
+        reserved_receive_buffer_size_ = new_size;
+    }
+
     void allow_large_messages(bool allow = true) {
         allow_large_messages_ = allow;
     }

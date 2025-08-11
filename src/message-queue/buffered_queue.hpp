@@ -99,21 +99,9 @@ public:
                                MessageHandler<MessageType> auto&& on_message) {
         auto ret = post_message_impl(
             std::forward<decltype(message)>(message), receiver, envelope_sender, envelope_receiver, tag,
+
             [&](auto it) {  // handle_overflow
-                            // poll until some send finishes, so we have a send slot ready
-                while (true) {
-                    auto res = poll(std::forward<decltype(on_message)>(on_message));
-                    if (res && res->first) {  // finished some send
-                        break;
-                    }
-                }
-                // now actually resolve the overflow
-                bool success = resolve_overflow(it);
-                if (success) {
-                    return;
-                }
-                throw std::runtime_error(
-                    "Failed to resolve overflow in post_message_blocking. This should not happen.");
+                resolve_overflow_blocking(it, on_message);
             },
             [&] {  // get_new_buffer
                 while (true) {
@@ -122,7 +110,7 @@ public:
                     if (buf.has_value()) {
                         return std::move(*buf);
                     }
-                    poll(std::forward<decltype(on_message)>(on_message));
+                    poll(on_message);
                 }
             });
         return ret;
@@ -271,68 +259,33 @@ public:
         return queue_.probe_for_one_message(split_handler(on_message), source, tag);
     }
 
-    // void global_threshold(size_t threshold) {
-    //     if (threshold == std::numeric_limits<size_t>::max()) {
-    //         global_threshold_bytes(std::numeric_limits<size_t>::max());
-    //     } else {
-    //         global_threshold_bytes(threshold * sizeof(BufferType));
-    //     }
-    // }
-
-    // void global_threshold_bytes(size_t threshold) {
-    //     global_threshold_bytes_ = threshold;
-    //     if (threshold != std::numeric_limits<size_t>::max()) {
-    //         queue_.reserved_receive_buffer_size((threshold + sizeof(BufferType) - 1) / sizeof(BufferType));
-    //     } else {
-    //         queue_.allow_large_messages();
-    //     }
-    //     if (check_for_global_buffer_overflow(0)) {
-    //         flush_all_buffers();
-    //     }
-    // }
-
-    [[nodiscard]] size_t global_threshold() const {
-        if (global_threshold_bytes_ == std::numeric_limits<std::size_t>::max()) {
-            return std::numeric_limits<std::size_t>::max();
-        }
-        return global_threshold_bytes_ / sizeof(BufferType);
-    }
-
     [[nodiscard]] size_t global_threshold_bytes() const {
         return global_threshold_bytes_;
     }
 
-    // void local_threshold(size_t threshold) {
-    //     if (threshold == std::numeric_limits<size_t>::max()) {
-    //         local_threshold_bytes(std::numeric_limits<size_t>::max());
-    //     } else {
-    //         local_threshold_bytes(threshold * sizeof(BufferType));
+    // void global_threshold_bytes(std::size_t new_threshold, MessageHandler<MessageType> auto&& on_message) {
+    //     Config config;
+    //     config.global_threshold_bytes = new_threshold;
+    //     global_threshold_bytes_ = new_threshold;
+    //     if (check_for_global_buffer_overflow(0)) {
+    //         resolve_overflow_blocking(on_message);
     //     }
+    //     auto new_buffer_size = compute_buffer_size(config);
+    //     if (new_buffer_size > queue_.reserved_receive_buffer_size()) {
+    //         // we need to resize the buffers, and catch potential stale messages
+    //         queue_.resize_receive_buffers(new_buffer_size, split_handler(on_message));
+    //     }  // otherwise we can just continue using the already allocated buffers
     // }
 
-    // void local_threshold_bytes(size_t threshold) {
-    //     local_threshold_bytes_ = threshold;
-    //     if (threshold != std::numeric_limits<size_t>::max()) {
-    //         queue_.reserved_receive_buffer_size((threshold + sizeof(BufferType) - 1) / sizeof(BufferType));
-    //     } else {
-    //         queue_.allow_large_messages();
-    //     }
-    //     for (auto& [receiver, buffer] : buffers_) {
-    //         if (check_for_local_buffer_overflow(buffer, 0)) {
-    //             flush_buffer(receiver);
-    //         }
-    //     }
+    // void local_threshold_bytes(std::size_t new_threshold, MessageHandler<MessageType> auto&& on_message) {
+    //     Config config;
+    //     config.local_threshold_bytes = new_threshold;
+    //     local_threshold_bytes_ = new_threshold;
     // }
+	
 
     [[nodiscard]] size_t local_threshold_bytes() const {
         return local_threshold_bytes_;
-    }
-
-    [[nodiscard]] size_t local_threshold() const {
-        if (local_threshold_bytes_ == std::numeric_limits<std::size_t>::max()) {
-            return std::numeric_limits<std::size_t>::max();
-        }
-        return local_threshold_bytes_ / sizeof(BufferType);
     }
 
     [[nodiscard]] PEID rank() const {
@@ -577,6 +530,24 @@ private:
         }
         // unreachable
         return false;
+    }
+
+    void resolve_overflow_blocking(BufferMap::iterator current_buffer, MessageHandler<MessageType> auto&& on_message) {
+        while (true) {
+            auto res = poll(std::forward<decltype(on_message)>(on_message));
+            if (res && res->first) {  // finished some send
+                break;
+            }
+        }
+        // now actually resolve the overflow
+        bool success = resolve_overflow(current_buffer);
+        if (success) {
+            return;
+        }
+        throw std::runtime_error("Failed to resolve overflow in post_message_blocking. This should not happen.");
+    }
+    void resolve_overflow_blocking(MessageHandler<MessageType> auto&& on_message) {
+        resolve_overflow_blocking(buffers_.end(), std::forward<decltype(on_message)>(on_message));
     }
 
     [[nodiscard]] bool check_for_global_buffer_overflow(std::uint64_t buffer_size_delta) const {
