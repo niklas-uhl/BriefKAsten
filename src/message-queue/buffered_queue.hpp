@@ -263,26 +263,38 @@ public:
         return global_threshold_bytes_;
     }
 
-    // void global_threshold_bytes(std::size_t new_threshold, MessageHandler<MessageType> auto&& on_message) {
-    //     Config config;
-    //     config.global_threshold_bytes = new_threshold;
-    //     global_threshold_bytes_ = new_threshold;
-    //     if (check_for_global_buffer_overflow(0)) {
-    //         resolve_overflow_blocking(on_message);
-    //     }
-    //     auto new_buffer_size = compute_buffer_size(config);
-    //     if (new_buffer_size > queue_.reserved_receive_buffer_size()) {
-    //         // we need to resize the buffers, and catch potential stale messages
-    //         queue_.resize_receive_buffers(new_buffer_size, split_handler(on_message));
-    //     }  // otherwise we can just continue using the already allocated buffers
-    // }
+    void global_threshold_bytes(std::size_t new_threshold, MessageHandler<MessageType> auto&& on_message) {
+        Config config;
+        config.global_threshold_bytes = new_threshold;
+        global_threshold_bytes_ = new_threshold;
+        if (check_for_global_buffer_overflow(0)) {
+            // it's fine to send out message here, since we only grow buffers
+            // so this will fit into buffer on even we resizing is not synchronized
+            resolve_overflow_blocking(on_message);
+        }
+        auto new_buffer_size = compute_buffer_size(config);
+        if (new_buffer_size > queue_.reserved_receive_buffer_size()) {
+            // we need to resize the buffers, and catch potential stale messages
+            queue_.resize_receive_buffers(new_buffer_size, split_handler(on_message));
+            // no need to resize send buffers, they will grow while merging
+            // newly allocated buffers will have the right size
+        }  // otherwise we can just continue using the already allocated buffers
+    }
 
-    // void local_threshold_bytes(std::size_t new_threshold, MessageHandler<MessageType> auto&& on_message) {
-    //     Config config;
-    //     config.local_threshold_bytes = new_threshold;
-    //     local_threshold_bytes_ = new_threshold;
-    // }
-	
+    void local_threshold_bytes(std::size_t new_threshold, MessageHandler<MessageType> auto&& on_message) {
+        Config config;
+        config.local_threshold_bytes = new_threshold;
+        local_threshold_bytes_ = new_threshold;
+        for (auto current = buffers_.begin(); current != buffers_.end(); current++) {
+            if (check_for_local_buffer_overflow(current->second, 0)) {
+                resolve_overflow_blocking(current, on_message);
+            }
+        }
+        auto new_buffer_size = compute_buffer_size(config);
+        if (new_buffer_size > queue_.reserved_receive_buffer_size()) {
+	  queue_.resize_receive_buffers(new_buffer_size, split_handler(on_message));
+        }
+    }
 
     [[nodiscard]] size_t local_threshold_bytes() const {
         return local_threshold_bytes_;
