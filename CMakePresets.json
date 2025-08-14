@@ -18,7 +18,10 @@
     }],
     "buildPresets": [{
         "name": "debug",
-        "configuration": "Debug",
         "configurePreset": "debug"
+    }],
+    "testPresets": [{
+	"name": "debug",
+	"configurePreset": "debug"
     }]
 }
