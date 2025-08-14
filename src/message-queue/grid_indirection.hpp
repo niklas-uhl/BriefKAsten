@@ -25,7 +25,7 @@
 
 #include <kassert/kassert.hpp>
 
-#include "./definitions.hpp"
+#include "./detail/definitions.hpp"
 
 namespace message_queue {
 

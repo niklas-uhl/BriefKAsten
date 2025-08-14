@@ -23,7 +23,7 @@
 #include <kamping/mpi_datatype.hpp>
 #include <ranges>
 #include <vector>
-#include "message-queue/definitions.hpp"
+#include "./definitions.hpp"
 
 namespace message_queue {
 

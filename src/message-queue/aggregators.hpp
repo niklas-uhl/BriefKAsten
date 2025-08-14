@@ -21,7 +21,7 @@
 
 #include <iterator>
 #include <span>
-#include "message-queue/concepts.hpp"
+#include "./detail/concepts.hpp"
 
 namespace message_queue::aggregation {
 

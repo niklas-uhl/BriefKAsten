@@ -22,7 +22,7 @@
 #include <mpi.h>
 #include "./aggregators.hpp"
 #include "./buffered_queue.hpp"
-#include "./concepts.hpp"
+#include "./detail/concepts.hpp"
 
 namespace message_queue {
 

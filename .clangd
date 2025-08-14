@@ -1,7 +1,7 @@
   CompileFlags:
     Add: [-std=c++23]
     Remove: [-fconcepts-diagnostics-depth=*]
-    CompilationDatabase: build-ninja
+    CompilationDatabase: build
   InlayHints:
     Designators: Yes
     Enabled: Yes

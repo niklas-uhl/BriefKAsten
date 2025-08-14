@@ -6,14 +6,14 @@ target_sources(
   aggregators.hpp
   buffered_queue.hpp
   queue_builder.hpp
-  concepts.hpp
-  definitions.hpp
   indirection.hpp
-  queue.hpp
-  request_pool.hpp
-  termination_counter.hpp
-  fixed_size_buffer.hpp
   grid_indirection.hpp
-  receiver.hpp
-  sender.hpp
+  detail/concepts.hpp
+  detail/definitions.hpp
+  detail/queue.hpp
+  detail/request_pool.hpp
+  detail/termination_counter.hpp
+  detail/fixed_size_buffer.hpp
+  detail/receiver.hpp
+  detail/sender.hpp
 )

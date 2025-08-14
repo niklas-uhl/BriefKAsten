@@ -101,6 +101,8 @@ public:
           tag_(other.tag_),
           receive_requests_(std::move(other.receive_requests_)),
           receive_buffers_(std::move(other.receive_buffers_)),
+	  statuses_(std::move(other.statuses_)),
+	  indices_(std::move(other.indices_)),
           termination_(other.termination_),
           rank_(other.rank_) {
         other.termination_ = nullptr;
@@ -113,6 +115,8 @@ public:
         tag_ = other.tag_;
         receive_requests_ = std::move(other.receive_requests_);
         receive_buffers_ = std::move(other.receive_buffers_);
+        statuses_ = std::move(other.statuses_);
+	indices_ = std::move(other.indices_);
         termination_ = other.termination_;
         rank_ = other.rank_;
         other.termination_ = nullptr;
@@ -142,6 +146,7 @@ public:
     bool probe_for_messages(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
         int num_completed = 0;
         MPI_Status* status = statuses_.data();
+	assert(status != nullptr);
         MPI_Testsome(static_cast<int>(receive_requests_.size()),  // count
                      receive_requests_.data(),                    // array_of_requests
                      &num_completed,                              // outcount

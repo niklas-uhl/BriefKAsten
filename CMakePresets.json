@@ -6,54 +6,19 @@
         "patch": 0
     },
     "configurePresets": [{
-        "name": "default",
-        "generator": "Ninja Multi-Config",
-        "binaryDir": "${sourceDir}/build-ninja/",
+        "name": "debug",
+        "generator": "Ninja",
+        "binaryDir": "${sourceDir}/build",
         "cacheVariables": {
             "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
             "CMAKE_CXX_FLAGS": "-fconcepts-diagnostics-depth=3 -Wall -Wextra -pedantic",
 	    "CMAKE_C_COMPILER": "gcc-15",
 	    "CMAKE_CXX_COMPILER": "g++-15"
         }
-    },
-    {
-        "name": "debug-make",
-        "generator": "Unix Makefiles",
-        "binaryDir": "${sourceDir}/build-make/Debug",
-        "cacheVariables": {
-            "CMAKE_BUILD_TYPE": "Debug",
-            "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
-        }
-    },
-    {
-        "name": "release-make",
-        "generator": "Unix Makefiles",
-        "binaryDir": "${sourceDir}/build-make/Release",
-        "cacheVariables": {
-            "CMAKE_BUILD_TYPE": "Release",
-            "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
-        }
     }],
     "buildPresets": [{
         "name": "debug",
         "configuration": "Debug",
-        "configurePreset": "default",
-        "jobs": 2
-    },
-                     {
-        "name": "release",
-        "configuration": "Release",
-        "configurePreset": "default",
-        "jobs": 2
-    },
-    {
-        "name": "debug-make",
-        "configurePreset": "debug-make",
-        "jobs": 2
-    },
-    {
-        "name": "release-make",
-        "configurePreset": "release-make",
-        "jobs": 2
+        "configurePreset": "debug"
     }]
 }

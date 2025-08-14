@@ -32,8 +32,8 @@
 #include <vector>
 
 #include "./aggregators.hpp"
-#include "./concepts.hpp"
-#include "./queue.hpp"
+#include "./detail/concepts.hpp"
+#include "./detail/queue.hpp"
 
 namespace message_queue {
 

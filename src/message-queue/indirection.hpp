@@ -21,8 +21,8 @@
 
 #include <mpi.h>
 #include <kassert/kassert.hpp>
-#include "message-queue/concepts.hpp"  // IWYU pragma: keep
-#include "message-queue/definitions.hpp"
+#include "./detail/concepts.hpp"  // IWYU pragma: keep
+#include "./detail/definitions.hpp"
 
 #include <kamping/measurements/timer.hpp>
 
