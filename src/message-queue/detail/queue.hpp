@@ -65,6 +65,46 @@ public:
         static_cast<void>(kamping::mpi_datatype<T>());
     }
 
+    MessageQueue(MessageQueue const&) = delete;
+
+    MessageQueue(MessageQueue&& other) noexcept
+        : comm_(other.comm_),
+          SMALL_MESSAGE_TAG(other.SMALL_MESSAGE_TAG),
+          LARGE_MESSAGE_TAG(other.LARGE_MESSAGE_TAG),
+          termination_(std::move(other.termination_)),
+          sender_(std::move(other.sender_)),
+          receiver_(std::move(other.receiver_)),
+          large_message_receiver_(other.large_message_receiver_),
+          reserved_receive_buffer_size_(other.reserved_receive_buffer_size_),
+          rank_(other.rank_),
+          size_(other.size_),
+          allow_large_messages_(other.allow_large_messages_),
+          termination_state_(other.termination_state_),
+          synchronous_mode_(other.synchronous_mode_) {
+        receiver_.rebind_termination_counter(termination_);
+        large_message_receiver_.rebind_termination_counter(termination_);
+    }
+
+    MessageQueue& operator=(MessageQueue const& other) = delete;
+  
+    MessageQueue& operator=(MessageQueue&& other) noexcept {
+        comm_ = other.comm_;
+        SMALL_MESSAGE_TAG = other.SMALL_MESSAGE_TAG;
+        LARGE_MESSAGE_TAG = other.LARGE_MESSAGE_TAG;
+        termination_ = std::move(termination_);
+        sender_ = std::move(other.sender_);
+        receiver_ = std::move(other.receiver_);
+	large_message_receiver_ = std::move(large_message_receiver_);
+        reserved_receive_buffer_size_ = other.reserved_receive_buffer_size_;
+        rank_ = other.rank_;
+        size_ = other.size_;
+        allow_large_messages_ = other.allow_large_messages_;
+        termination_state_ = other.termination_state_;
+        synchronous_mode_ = other.synchronous_mode_;
+	receiver_.rebind_termination_counter(termination_);
+	large_message_receiver_.rebind_termination_counter(termination_);
+    }
+
     /// Post a message to the message queue
     /// Posting a message may fail if the message box is full and no send slots are available.
     /// @return an optional containing the request id if the message was successfully posted, otherwise nullopt

@@ -96,30 +96,14 @@ public:
 
     PersistentReceiver(const PersistentReceiver&) = delete;
 
-    PersistentReceiver(PersistentReceiver&& other) noexcept
-        : comm_(other.comm_),
-          tag_(other.tag_),
-          receive_requests_(std::move(other.receive_requests_)),
-          receive_buffers_(std::move(other.receive_buffers_)),
-	  statuses_(std::move(other.statuses_)),
-	  indices_(std::move(other.indices_)),
-          termination_(other.termination_),
-          rank_(other.rank_) {
-        other.termination_ = nullptr;
-    }
+    PersistentReceiver(PersistentReceiver&& other) = default;
 
     PersistentReceiver& operator=(const PersistentReceiver&) = delete;
 
-    PersistentReceiver& operator=(PersistentReceiver&& other) noexcept {
-        comm_ = other.comm_;
-        tag_ = other.tag_;
-        receive_requests_ = std::move(other.receive_requests_);
-        receive_buffers_ = std::move(other.receive_buffers_);
-        statuses_ = std::move(other.statuses_);
-	indices_ = std::move(other.indices_);
-        termination_ = other.termination_;
-        rank_ = other.rank_;
-        other.termination_ = nullptr;
+    PersistentReceiver& operator=(PersistentReceiver&& other) = default;
+
+    void rebind_termination_counter(internal::TerminationCounter& termination_counter) {
+        termination_ = &termination_counter;
     }
 
     bool probe_for_one_message(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
@@ -146,7 +130,6 @@ public:
     bool probe_for_messages(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
         int num_completed = 0;
         MPI_Status* status = statuses_.data();
-	assert(status != nullptr);
         MPI_Testsome(static_cast<int>(receive_requests_.size()),  // count
                      receive_requests_.data(),                    // array_of_requests
                      &num_completed,                              // outcount
@@ -235,6 +218,11 @@ public:
             buffer.resize(reserved_receive_buffer_size);
         }
     }
+
+    void rebind_termination_counter(internal::TerminationCounter& termination_counter) {
+        termination_ = &termination_counter;
+    }
+
     bool probe_for_one_message(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
         MPI_Message message = MPI_MESSAGE_NULL;
         MPI_Status status;
@@ -324,6 +312,11 @@ public:
         KASSERT(tag < kamping::mpi_env.tag_upper_bound());
         MPI_Comm_rank(comm_, &rank_);
     }
+
+    void rebind_termination_counter(internal::TerminationCounter& termination_counter) {
+        termination_ = &termination_counter;
+    }
+
     bool probe_for_one_message(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
         MPI_Message message = MPI_MESSAGE_NULL;
         MPI_Status status;
