@@ -11,8 +11,8 @@ target_link_libraries(alltoall_test PRIVATE message-queue::message-queue)
 target_link_libraries(alltoall_test PRIVATE KaTestrophe::main)
 katestrophe_add_mpi_test(alltoall_test CORES 1 2 4)
 
-# include(GoogleTest)
-# add_executable(view_adaptor_test view_adaptor_test.cpp)
-# target_link_libraries(view_adaptor_test PRIVATE message-queue::message-queue GTest::gtest_main)
-# gtest_discover_tests(view_adaptor_test)
+include(GoogleTest)
+add_executable(view_adaptor_test view_adaptor_test.cpp)
+target_link_libraries(view_adaptor_test PRIVATE message-queue::message-queue GTest::gtest_main GTest::gmock)
+gtest_discover_tests(view_adaptor_test)
 
