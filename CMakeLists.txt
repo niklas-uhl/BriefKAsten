@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
+
 project(message-queue LANGUAGES CXX)
 
-option(MESSAGE_QUEUE_BUILD_EXAMPLES "Build examples" "${PROJECT_IS_TOP_LEVEL}")
-option(MESSAGE_QUEUE_BUILD_TESTS "Build tests" "${PROJECT_IS_TOP_LEVEL}")
+option(MESSAGE_QUEUE_BUILD_EXAMPLES "Build examples" ${PROJECT_IS_TOP_LEVEL})
+option(MESSAGE_QUEUE_BUILD_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
 
 include(cmake/dependencies.cmake)
 
@@ -10,6 +11,8 @@ find_package(MPI REQUIRED)
 
 include(cmake/setup_assertion_level.cmake)
 FetchContent_MakeAvailable(kassert kamping)
+
+
 
 try_compile(
   MESSAGE_QUEUE_HAS_LAZY_SPLIT_VIEW ${CMAKE_CURRENT_BINARY_DIR}
@@ -35,10 +38,11 @@ else()
 endif()
 add_library(message-queue::message-queue ALIAS message-queue)
 
-if(MESSAGE_QUEUE_BUILD_TESTS)
-  add_subdirectory(tests)
-endif()
-
 if(MESSAGE_QUEUE_BUILD_EXAMPLES)
   # add_subdirectory(examples)
+endif()
+
+if(MESSAGE_QUEUE_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
 endif()

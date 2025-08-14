@@ -31,9 +31,10 @@ namespace message_queue {
 
 class GridIndirectionScheme {
 public:
-    GridIndirectionScheme(MPI_Comm comm) : comm_(comm), grid_size_(static_cast<int>(std::round(std::sqrt(size())))) {
+  GridIndirectionScheme(MPI_Comm comm) : comm_(comm) {
         MPI_Comm_rank(comm_, &my_rank_);
         MPI_Comm_size(comm_, &my_size_);
+	grid_size_ = static_cast<int>(std::round(std::sqrt(my_size_)));
     }
 
     [[nodiscard]] PEID next_hop(PEID /*sender*/, PEID receiver) const {
@@ -92,7 +93,7 @@ private:
         return grid_position_to_rank(proxy);
     }
     MPI_Comm comm_;
-    PEID grid_size_;
+    PEID grid_size_ = 0;
     int my_rank_ = 0;
     int my_size_ = 0;
 };
