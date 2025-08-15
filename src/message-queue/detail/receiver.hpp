@@ -131,10 +131,9 @@ public:
                     &index,                                      // indx
                     &request_completed,                          // flag
                     &status);                                    // status
-        if (!request_completed) {
+        if (!request_completed || index == MPI_UNDEFINED) {
             return false;
         }
-        KASSERT(index != MPI_UNDEFINED, "This should not happen, because we always have pending receive requests.");
         termination_->track_receive();
         ReceiveBufferContainer& buffer = receive_buffers_[index];
         auto envelope = build_envelope(buffer, status, rank_);
@@ -151,11 +150,13 @@ public:
                      &num_completed,                              // outcount
                      indices_.data(),                             // indices
                      status);                                     // array_of_statuses
-        if (num_completed == 0) {
+        if (num_completed == 0 || num_completed == MPI_UNDEFINED) {
+            // previously, this code assumed, that all requests are always active
+            // but when this method is called recursively in the message handler, e.g. when using indirection,
+            // it is possible that some requests have finished somewhere up the call stack and have not been restarted
+            // yet.
             return false;
         }
-        KASSERT(num_completed != MPI_UNDEFINED,
-                "This should not happen, because we always have pending receive requests.");
         auto indices = std::span(indices_).first(num_completed);
         auto statuses = std::span(statuses_).first(num_completed);
         auto buffers = indices | std::views::transform([&](int index) -> auto& { return receive_buffers_[index]; });
@@ -261,6 +262,7 @@ public:
 
     bool probe_for_messages(MessageHandler<value_type, std::span<value_type>> auto&& on_message,
                             std::size_t max_receives) {
+        // TODO check if this works when called recursively
         MPI_Message message = MPI_MESSAGE_NULL;
         MPI_Status status;
         int probe_successful = 1;
