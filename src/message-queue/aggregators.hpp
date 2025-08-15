@@ -84,11 +84,12 @@ struct SentinelSplitter {
 
     // NOLINTNEXTLINE(*-easily-swappable-parameters)
     auto operator()(MPIBuffer<BufferType> auto const& buffer, PEID buffer_origin, PEID my_rank) const {
-        return std::views::split(buffer, sentinel_) |
+        return buffer | std::views::take(buffer.size() - 1) |  // drop the last sentinel
+               std::views::split(sentinel_) |
                std::views::transform([&, buffer_origin = buffer_origin, my_rank = my_rank](auto range) {
 #ifdef MESSAGE_QUEUE_SPLIT_VIEW_IS_LAZY
                    auto size = std::ranges::distance(range);
-                   auto sized_range = std::span(range.begin().base(), size);
+                   auto sized_range = std::views::counted(range.begin(), size);
 #else
                    auto sized_range = std::move(range);
 #endif
