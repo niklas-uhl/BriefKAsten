@@ -35,11 +35,12 @@ struct AppendMerger {
                     Envelope<std::ranges::range_value_t<BufferContainer>> auto envelope) const {
         buffer.insert(std::end(buffer), std::begin(envelope.message), std::end(envelope.message));
     }
+
     template <typename MessageContainer, typename BufferContainer>
-    size_t estimate_new_buffer_size(BufferContainer const& buffer,
-                                    PEID /* buffer_destination */,
-                                    PEID /* my_rank */,
-                                    MessageEnvelope<MessageContainer> const& envelope) const {
+    [[nodiscard]] size_t estimate_new_buffer_size(BufferContainer const& buffer,
+                                                  PEID /* buffer_destination */,
+                                                  PEID /* my_rank */,
+                                                  MessageEnvelope<MessageContainer> const& envelope) const {
         return buffer.size() + envelope.message.size();
     };
 };
@@ -59,16 +60,17 @@ struct SentinelMerger {
     SentinelMerger(BufferType sentinel) : sentinel_(sentinel) {}
 
     void operator()(MPIBuffer<BufferType> auto& buffer,
-                    PEID buffer_destination,
-                    PEID my_rank,
+                    PEID /* buffer_destination */,
+                    PEID /* my_rank */,
                     Envelope<BufferType> auto envelope) const {
         buffer.insert(std::end(buffer), std::begin(envelope.message), std::end(envelope.message));
         buffer.push_back(sentinel_);
     }
-    size_t estimate_new_buffer_size(MPIBuffer<BufferType> auto const& buffer,
-                                    PEID buffer_destination,
-                                    PEID my_rank,
-                                    Envelope<BufferType> auto const& envelope) const {
+
+    [[nodiscard]] size_t estimate_new_buffer_size(MPIBuffer<BufferType> auto const& buffer,
+                                                  PEID /* buffer_destination */,
+                                                  PEID /* my_rank */,
+                                                  Envelope<BufferType> auto const& envelope) const {
         return buffer.size() + envelope.message.size() + 1;
     };
     BufferType sentinel_;
@@ -80,9 +82,10 @@ template <MPIType BufferType>
 struct SentinelSplitter {
     SentinelSplitter(BufferType sentinel) : sentinel_(sentinel) {}
 
+    // NOLINTNEXTLINE(*-easily-swappable-parameters)
     auto operator()(MPIBuffer<BufferType> auto const& buffer, PEID buffer_origin, PEID my_rank) const {
         return std::views::split(buffer, sentinel_) |
-               std::views::transform([&, buffer_origin = buffer_origin, my_rank = my_rank](auto&& range) {
+               std::views::transform([&, buffer_origin = buffer_origin, my_rank = my_rank](auto range) {
 #ifdef MESSAGE_QUEUE_SPLIT_VIEW_IS_LAZY
                    auto size = std::ranges::distance(range);
                    auto sized_range = std::span(range.begin().base(), size);
@@ -146,7 +149,7 @@ struct EnvelopeSerializationSplitter {
 
 struct NoOpCleaner {
     template <typename BufferContainer>
-    void operator()(BufferContainer& /* buffer */, PEID) const {}
+    void operator()(BufferContainer& /* buffer */, PEID /* buffer_destination */) const {}
 };
 static_assert(BufferCleaner<NoOpCleaner, std::vector<int>>);
 

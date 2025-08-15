@@ -137,7 +137,7 @@ public:
                 });
             }
             round_robin_index++;
-            if (round_robin_index == capacity()) {
+            if (round_robin_index == static_cast<int>(capacity())) {
                 round_robin_index = 0;
             }
         }

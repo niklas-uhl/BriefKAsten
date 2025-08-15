@@ -48,7 +48,7 @@ class MessageQueue {
 public:
     MessageQueue(MPI_Comm comm,
                  size_t num_request_slots,
-                 size_t reserved_receive_buffer_size,
+                 size_t reserved_receive_buffer_size, // NOLINT(*-easily-swappable-parameters)
                  size_t out_buffer_capacity = 0)
 
         : comm_(comm),
@@ -64,6 +64,7 @@ public:
         // cast to void to silence nodiscard warning
         static_cast<void>(kamping::mpi_datatype<T>());
     }
+    ~MessageQueue() = default;
 
     MessageQueue(MessageQueue const&) = delete;
 
@@ -199,7 +200,7 @@ public:
             // poll at least once, so we don't miss any messages
             // if the the message box is empty upon calling this function
             // we never get to poll if message counting finishes instantly
-            do {
+            do { //NOLINT(*-avoid-do-while)
                 poll(std::forward<decltype(on_message)>(on_message),
                      std::forward<decltype(on_finished_sending)>(on_finished_sending));
                 progress_hook();

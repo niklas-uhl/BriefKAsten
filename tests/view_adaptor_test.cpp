@@ -4,6 +4,7 @@
 #include "gmock/gmock.h"
 #include "message-queue/detail/view_adaptors.hpp"
 
+// NOLINTBEGIN(*-magic-numbers)
 TEST(ViewAdaptors, chunk_by_embedded_size_view) {
     std::vector<int> buf = {3, 1, 1, 1, 2, 42, 42, 5, 8, 8, 8, 8, 8};
     auto chunks =
@@ -20,3 +21,4 @@ TEST(ViewAdaptors, chunk_by_embedded_size_view) {
     EXPECT_THAT(chunks[2], SizeIs(5));
     EXPECT_THAT(chunks[2], Each(Eq(8)));
 }
+// NOLINTEND(*-magic-numbers)

@@ -31,9 +31,11 @@ public:
         MPI_Comm_size(comm, &my_size_);
     }
 
+    // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
     [[nodiscard]] PEID next_hop(PEID /* sender */, PEID receiver) const {
         return receiver;
     }
+
     [[nodiscard]] bool should_redirect(PEID /*sender*/, PEID receiver) const {
         return receiver != rank();
     }
@@ -43,6 +45,7 @@ public:
         return placeholder;
     }
 
+    // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
     [[nodiscard]] PEID num_groups() const {
         return 1;
     }
@@ -51,7 +54,7 @@ private:
     [[nodiscard]] int rank() const {
         return my_rank_;
     }
-  
+
     [[nodiscard]] int size() const {
         return my_size_;
     }

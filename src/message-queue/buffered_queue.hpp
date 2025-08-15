@@ -292,7 +292,7 @@ public:
         }
         auto new_buffer_size = compute_buffer_size(config);
         if (new_buffer_size > queue_.reserved_receive_buffer_size()) {
-	  queue_.resize_receive_buffers(new_buffer_size, split_handler(on_message));
+            queue_.resize_receive_buffers(new_buffer_size, split_handler(on_message));
         }
     }
 
@@ -342,6 +342,7 @@ private:
         reserve_send_buffers(num_buffers, buffer_size);
     }
 
+    // NOLINTNEXTLINE(*-easily-swappable-parameters)
     void reserve_send_buffers(std::size_t num_buffers, std::size_t buffer_size) {
         if (num_send_buffers_ + num_buffers > max_num_send_buffers_) {
             throw std::runtime_error("Exceeded maximum number of send buffers.");
@@ -376,7 +377,7 @@ private:
     /// Note: messages have to be passed as rvalues. If you want to send static
     /// data without an additional copy, wrap it in a std::ranges::ref_view.
     bool post_message_impl(InputMessageRange<MessageType> auto&& message,
-                           PEID receiver,
+                           PEID receiver,  // NOLINT(*-easily-swappable-parameters)
                            PEID envelope_sender,
                            PEID envelope_receiver,
                            int tag,
