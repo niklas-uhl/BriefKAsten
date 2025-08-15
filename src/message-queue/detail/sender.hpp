@@ -121,8 +121,13 @@ private:
                     std::size_t request_index) {
         auto& in_transit_message = in_transit_messages_[request_index];
         in_transit_message = std::move(message.message);
+#if MPI_VERSION >= 4
         MPI_Isend_c(in_transit_message->message.data(), in_transit_message->message.size(),
                     kamping::mpi_datatype<value_type>(), message.destination, message.tag, comm_, &request);
+#else
+        MPI_Isend(in_transit_message->message.data(), static_cast<int>(in_transit_message->message.size()),
+                  kamping::mpi_datatype<value_type>(), message.destination, message.tag, comm_, &request);
+#endif
     }
 
     void flush_out_buffer() {

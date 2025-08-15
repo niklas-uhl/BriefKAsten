@@ -36,8 +36,13 @@ namespace internal {
 auto build_envelope(MPIBuffer auto const& buffer, MPI_Status& status, int rank)
     -> MessageEnvelope<std::span<const std::ranges::range_value_t<decltype(buffer)>>> {
     using T = std::ranges::range_value_t<decltype(buffer)>;
+#if MPI_VERSION >= 4
     MPI_Count count = 0;
     MPI_Get_count_c(&status, kamping::mpi_datatype<T>(), &count);
+#else
+    int count = 0;
+    MPI_Get_count(&status, kamping::mpi_datatype<T>(), &count);
+#endif
     KASSERT(count <= buffer.size());
     std::span<const T> message = std::span(buffer).first(count);
     auto envelope = MessageEnvelope<std::span<const T>>{std::move(message), status.MPI_SOURCE, rank, status.MPI_TAG};
@@ -66,6 +71,7 @@ public:
         MPI_Comm_rank(comm, &rank_);
         for (auto [request, buffer] : std::views::zip(receive_requests_, receive_buffers_)) {
             buffer.resize(reserved_receive_buffer_size);
+#if MPI_VERSION >= 4
             MPI_Recv_init_c(buffer.data(),                        // buf
                             buffer.size(),                        // count
                             kamping::mpi_datatype<value_type>(),  // datatype
@@ -74,6 +80,16 @@ public:
                             comm_,                                // comm
                             &request                              // request
             );
+#else
+            MPI_Recv_init(buffer.data(),                        // buf
+                          static_cast<int>(buffer.size()),      // count
+                          kamping::mpi_datatype<value_type>(),  // datatype
+                          MPI_ANY_SOURCE,                       // source
+                          tag_,                                 // tag
+                          comm_,                                // comm
+                          &request                              // request
+            );
+#endif
             MPI_Start(&request);
         }
     }
@@ -123,7 +139,7 @@ public:
         ReceiveBufferContainer& buffer = receive_buffers_[index];
         auto envelope = build_envelope(buffer, status, rank_);
         on_message(std::move(envelope));
-        MPI_Start(receive_requests_[index]);
+        MPI_Start(&receive_requests_[index]);
         return true;
     }
 
@@ -327,10 +343,20 @@ public:
         }
 
         ReceiveBufferContainer buffer;
+#if MPI_VERSION >= 4
         MPI_Count count = 0;
         MPI_Get_count_c(&status, kamping::mpi_datatype<value_type>(), &count);
+#else
+        int count = 0;
+        MPI_Get_count(&status, kamping::mpi_datatype<value_type>(), &count);
+#endif
         buffer.resize(count);
+#if MPI_VERSION >= 4
         MPI_Mrecv_c(buffer.data(), buffer.size(), kamping::mpi_datatype<value_type>(), &message, &status);
+#else
+        MPI_Mrecv(buffer.data(), static_cast<int>(buffer.size()), kamping::mpi_datatype<value_type>(), &message,
+                  &status);
+#endif
         termination_->track_receive();
         auto envelope =
             MessageEnvelope<ReceiveBufferContainer>{std::move(buffer), status.MPI_SOURCE, rank_, status.MPI_TAG};
