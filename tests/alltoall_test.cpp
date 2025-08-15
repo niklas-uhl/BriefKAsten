@@ -58,6 +58,8 @@ TEST(BufferedQueueTest, alltoall_indirect) {
     // queue setup
     message_queue::IndirectionAdapter queue{
         message_queue::BufferedMessageQueueBuilder<int>()
+            // we have to use splitters and merges which encode receiver information and size,
+            // so that indirection works.
             .with_merger(message_queue::aggregation::EnvelopeSerializationMerger{})
             .with_splitter(message_queue::aggregation::EnvelopeSerializationSplitter<int>{})
             .build(),
