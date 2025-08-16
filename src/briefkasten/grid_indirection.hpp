@@ -27,14 +27,14 @@
 
 #include "./detail/definitions.hpp"
 
-namespace message_queue {
+namespace briefkasten {
 
 class GridIndirectionScheme {
 public:
-  GridIndirectionScheme(MPI_Comm comm) : comm_(comm) {
+    GridIndirectionScheme(MPI_Comm comm) : comm_(comm) {
         MPI_Comm_rank(comm_, &my_rank_);
         MPI_Comm_size(comm_, &my_size_);
-	grid_size_ = static_cast<int>(std::round(std::sqrt(my_size_)));
+        grid_size_ = static_cast<int>(std::round(std::sqrt(my_size_)));
     }
 
     [[nodiscard]] PEID next_hop(PEID /*sender*/, PEID receiver) const {
@@ -98,4 +98,4 @@ private:
     int my_size_ = 0;
 };
 
-}  // namespace message_queue
+}  // namespace briefkasten

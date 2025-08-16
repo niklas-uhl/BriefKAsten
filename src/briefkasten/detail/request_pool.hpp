@@ -28,7 +28,7 @@
 #include <utility>
 #include <vector>
 
-namespace message_queue::internal {
+namespace briefkasten::internal {
 
 enum class SearchStrategy : std::uint8_t { linear, local };
 enum class CompletionStrategy : std::uint8_t { active, all, round_robin };
@@ -222,4 +222,4 @@ private:
     std::pair<int, int> active_range = {0, 0};
     int round_robin_index = 0;
 };
-}  // namespace message_queue::internal
+}  // namespace briefkasten::internal

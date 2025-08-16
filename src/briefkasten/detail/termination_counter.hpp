@@ -24,7 +24,7 @@
 #include <kamping/mpi_datatype.hpp>
 #include <limits>
 
-namespace message_queue::internal {
+namespace briefkasten::internal {
 
 struct MessageCounter {
     size_t send;
@@ -80,4 +80,4 @@ private:
                                     .receive = std::numeric_limits<std::size_t>::max() - 1};
 };
 
-}  // namespace message_queue::internal
+}  // namespace briefkasten::internal

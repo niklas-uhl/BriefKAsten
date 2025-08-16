@@ -24,7 +24,7 @@
 #include "./buffered_queue.hpp"
 #include "./detail/concepts.hpp"
 
-namespace message_queue {
+namespace briefkasten {
 
 template <typename MessageType,
           typename BufferType = MessageType,
@@ -100,4 +100,4 @@ private:
     Splitter splitter_{};
     BufferCleaner cleaner_{};
 };
-}  // namespace message_queue
+}  // namespace briefkasten

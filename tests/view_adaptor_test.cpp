@@ -1,14 +1,16 @@
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
 #include <print>
 #include <ranges>
-#include "gmock/gmock.h"
-#include "message-queue/detail/view_adaptors.hpp"
+
+#include "briefkasten/detail/view_adaptors.hpp"
 
 // NOLINTBEGIN(*-magic-numbers)
 TEST(ViewAdaptors, chunk_by_embedded_size_view) {
     std::vector<int> buf = {3, 1, 1, 1, 2, 42, 42, 5, 8, 8, 8, 8, 8};
     auto chunks =
-        buf | chunk_by_embedded_size(0) |
+        buf | briefkasten::chunk_by_embedded_size(0) |
         std::views::transform([](auto chunk) { return chunk | std::views::drop(1) | std::ranges::to<std::vector>(); }) |
         std::ranges::to<std::vector>();
 

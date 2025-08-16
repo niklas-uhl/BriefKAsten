@@ -25,7 +25,7 @@
 #include <vector>
 #include "./definitions.hpp"
 
-namespace message_queue {
+namespace briefkasten {
 
 template <typename T>
 concept MPIType = kamping::has_static_type_v<T>;
@@ -136,4 +136,4 @@ concept BufferCleaner = requires(BufferCleanerType pre_send_cleanup, BufferConta
     pre_send_cleanup(buffer, receiver);
 };
 }  // namespace aggregation
-}  // namespace message_queue
+}  // namespace briefkasten

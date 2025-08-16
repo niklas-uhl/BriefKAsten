@@ -26,7 +26,7 @@
 
 #include <kamping/measurements/timer.hpp>
 
-namespace message_queue {
+namespace briefkasten {
 template <typename T>
 concept IndirectionScheme = requires(T scheme, MPI_Comm comm, PEID sender, PEID receiver) {
     { scheme.next_hop(sender, receiver) } -> std::same_as<PEID>;
@@ -157,4 +157,4 @@ private:
     Indirector indirection_;
 };
 
-}  // namespace message_queue
+}  // namespace briefkasten

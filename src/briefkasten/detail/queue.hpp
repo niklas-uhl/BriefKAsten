@@ -35,7 +35,7 @@
 #include "./sender.hpp"
 #include "./termination_counter.hpp"
 
-namespace message_queue {
+namespace briefkasten {
 
 static constexpr std::size_t DEFAULT_POLL_SKIP_THRESHOLD = 100;
 
@@ -48,7 +48,7 @@ class MessageQueue {
 public:
     MessageQueue(MPI_Comm comm,
                  size_t num_request_slots,
-                 size_t reserved_receive_buffer_size, // NOLINT(*-easily-swappable-parameters)
+                 size_t reserved_receive_buffer_size,  // NOLINT(*-easily-swappable-parameters)
                  size_t out_buffer_capacity = 0)
 
         : comm_(comm),
@@ -87,7 +87,7 @@ public:
     }
 
     MessageQueue& operator=(MessageQueue const& other) = delete;
-  
+
     MessageQueue& operator=(MessageQueue&& other) noexcept {
         comm_ = other.comm_;
         SMALL_MESSAGE_TAG = other.SMALL_MESSAGE_TAG;
@@ -95,15 +95,15 @@ public:
         termination_ = std::move(termination_);
         sender_ = std::move(other.sender_);
         receiver_ = std::move(other.receiver_);
-	large_message_receiver_ = std::move(large_message_receiver_);
+        large_message_receiver_ = std::move(large_message_receiver_);
         reserved_receive_buffer_size_ = other.reserved_receive_buffer_size_;
         rank_ = other.rank_;
         size_ = other.size_;
         allow_large_messages_ = other.allow_large_messages_;
         termination_state_ = other.termination_state_;
         synchronous_mode_ = other.synchronous_mode_;
-	receiver_.rebind_termination_counter(termination_);
-	large_message_receiver_.rebind_termination_counter(termination_);
+        receiver_.rebind_termination_counter(termination_);
+        large_message_receiver_.rebind_termination_counter(termination_);
     }
 
     /// Post a message to the message queue
@@ -200,7 +200,7 @@ public:
             // poll at least once, so we don't miss any messages
             // if the the message box is empty upon calling this function
             // we never get to poll if message counting finishes instantly
-            do { //NOLINT(*-avoid-do-while)
+            do {  // NOLINT(*-avoid-do-while)
                 poll(std::forward<decltype(on_message)>(on_message),
                      std::forward<decltype(on_finished_sending)>(on_finished_sending));
                 progress_hook();
@@ -295,4 +295,4 @@ private:
     bool synchronous_mode_ = false;
 };
 
-}  // namespace message_queue
+}  // namespace briefkasten

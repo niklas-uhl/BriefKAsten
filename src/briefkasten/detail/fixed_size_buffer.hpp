@@ -22,7 +22,7 @@
 #include <cstddef>
 #include <memory>
 
-namespace message_queue {
+namespace briefkasten {
 
 template <typename T>
 class FixedSizeBuffer {
@@ -65,4 +65,4 @@ public:
     }
 };
 
-}  // namespace message_queue
+}  // namespace briefkasten

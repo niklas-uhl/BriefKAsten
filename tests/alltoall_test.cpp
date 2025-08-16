@@ -1,15 +1,16 @@
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
-
-#include <algorithm>
 #include <kamping/collectives/allreduce.hpp>
 #include <kamping/communicator.hpp>
-#include <message-queue/queue_builder.hpp>
+
+#include <algorithm>
 #include <random>
-#include "gmock/gmock.h"
-#include "message-queue/aggregators.hpp"
-#include "message-queue/buffered_queue.hpp"
-#include "message-queue/grid_indirection.hpp"
-#include "message-queue/indirection.hpp"
+
+#include "briefkasten/aggregators.hpp"
+#include "briefkasten/buffered_queue.hpp"
+#include "briefkasten/grid_indirection.hpp"
+#include "briefkasten/indirection.hpp"
+#include "briefkasten/queue_builder.hpp"
 
 constexpr std::size_t NUM_LOCAL_ELEMENTS = 1'000'000;
 
@@ -25,7 +26,7 @@ TEST(BufferedQueueTest, alltoall) {
     std::ranges::generate(data, [&]() { return distribution(generator); });
 
     // init queue
-    auto queue = message_queue::BufferedMessageQueueBuilder<int>().build();
+    auto queue = briefkasten::BufferedMessageQueueBuilder<int>().build();
     queue.synchronous_mode();
 
     // communication
@@ -56,14 +57,14 @@ TEST(BufferedQueueTest, alltoall_indirect) {
     std::ranges::generate(data, [&]() { return distribution(generator); });
 
     // queue setup
-    message_queue::IndirectionAdapter queue{
-        message_queue::BufferedMessageQueueBuilder<int>()
+    briefkasten::IndirectionAdapter queue{
+        briefkasten::BufferedMessageQueueBuilder<int>()
             // we have to use splitters and merges which encode receiver information and size,
             // so that indirection works.
-            .with_merger(message_queue::aggregation::EnvelopeSerializationMerger{})
-            .with_splitter(message_queue::aggregation::EnvelopeSerializationSplitter<int>{})
+            .with_merger(briefkasten::aggregation::EnvelopeSerializationMerger{})
+            .with_splitter(briefkasten::aggregation::EnvelopeSerializationSplitter<int>{})
             .build(),
-        message_queue::GridIndirectionScheme{comm.mpi_communicator()}};
+        briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
     queue.synchronous_mode();
 
     // communication

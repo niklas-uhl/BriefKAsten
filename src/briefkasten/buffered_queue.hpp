@@ -35,7 +35,7 @@
 #include "./detail/concepts.hpp"
 #include "./detail/queue.hpp"
 
-namespace message_queue {
+namespace briefkasten {
 
 static constexpr std::size_t DEFAULT_NUM_REQUEST_SLOTS = 8;
 static constexpr std::size_t DEFAULT_BUFFER_THRESHOLD = 32ULL * 1024;
@@ -599,4 +599,4 @@ private:
 
     FlushStrategy flush_strategy_;
 };
-}  // namespace message_queue
+}  // namespace briefkasten

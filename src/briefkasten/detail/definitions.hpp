@@ -19,6 +19,6 @@
 
 #pragma once
 
-namespace message_queue {
+namespace briefkasten {
 using PEID = int;
 }

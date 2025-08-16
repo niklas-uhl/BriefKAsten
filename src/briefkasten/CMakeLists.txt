@@ -1,5 +1,5 @@
 target_sources(
-  message-queue
+  BriefKAsten_BriefKAsten
   INTERFACE
   FILE_SET HEADERS
   FILES
@@ -8,6 +8,7 @@ target_sources(
   queue_builder.hpp
   indirection.hpp
   grid_indirection.hpp
+  noop_indirection.hpp
   detail/concepts.hpp
   detail/definitions.hpp
   detail/queue.hpp
@@ -16,4 +17,5 @@ target_sources(
   detail/fixed_size_buffer.hpp
   detail/receiver.hpp
   detail/sender.hpp
+  detail/view_adaptors.hpp
 )

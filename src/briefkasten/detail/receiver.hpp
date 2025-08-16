@@ -31,7 +31,7 @@
 #include "./concepts.hpp"
 #include "./termination_counter.hpp"
 
-namespace message_queue {
+namespace briefkasten {
 namespace internal {
 auto build_envelope(MPIBuffer auto const& buffer, MPI_Status& status, int rank)
     -> MessageEnvelope<std::span<const std::ranges::range_value_t<decltype(buffer)>>> {
@@ -412,4 +412,4 @@ private:
     int rank_ = 0;
 };
 
-}  // namespace message_queue
+}  // namespace briefkasten

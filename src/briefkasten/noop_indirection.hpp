@@ -23,7 +23,7 @@
 
 #include "./detail/definitions.hpp"
 
-namespace message_queue {
+namespace briefkasten {
 class NoopIndirectionScheme {
 public:
     NoopIndirectionScheme(MPI_Comm comm) {
@@ -62,4 +62,4 @@ private:
     int my_rank_ = 0;
     int my_size_ = 0;
 };
-}  // namespace message_queue
+}  // namespace briefkasten

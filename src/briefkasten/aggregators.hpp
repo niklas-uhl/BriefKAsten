@@ -25,7 +25,7 @@
 #include "./detail/concepts.hpp"
 #include "./detail/view_adaptors.hpp"
 
-namespace message_queue::aggregation {
+namespace briefkasten::aggregation {
 
 struct AppendMerger {
     template <MPIBuffer BufferContainer>
@@ -154,4 +154,4 @@ struct NoOpCleaner {
 };
 static_assert(BufferCleaner<NoOpCleaner, std::vector<int>>);
 
-}  // namespace message_queue::aggregation
+}  // namespace briefkasten::aggregation

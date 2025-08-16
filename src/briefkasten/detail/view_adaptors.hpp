@@ -4,6 +4,8 @@
 #include <ranges>
 #include <span>
 
+namespace briefkasten {
+
 // Simple iterator that chunks data based on embedded size field
 template <std::forward_iterator UnderlyingIteratorType>
 class chunk_iterator {
@@ -140,3 +142,5 @@ inline auto chunk_by_embedded_size(std::size_t size_offset) {
 static_assert(std::input_iterator<chunk_iterator<std::span<int>::iterator>>);
 static_assert(std::forward_iterator<chunk_iterator<std::span<int>::iterator>>);
 static_assert(std::ranges::forward_range<chunk_by_embedded_size_view<std::span<int>>>);
+
+}  // namespace briefkasten

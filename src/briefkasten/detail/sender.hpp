@@ -30,7 +30,7 @@
 #include "./concepts.hpp"
 #include "./request_pool.hpp"
 
-namespace message_queue {
+namespace briefkasten {
 template <MPIBuffer MessageContainer>
 class Sender {
 public:
@@ -68,7 +68,7 @@ public:
         return receipt;
     };
 
-    auto progress_sending(message_queue::SendFinishedCallback<MessageContainer> auto&& on_finished_sending) {
+    auto progress_sending(SendFinishedCallback<MessageContainer> auto&& on_finished_sending) {
         constexpr bool move_back_buffer = std::invocable<decltype(on_finished_sending), std::size_t, MessageContainer>;
         // check for finished sends and try starting new ones
         bool any_completed = request_pool_.test_any([&](int completed_request_index) {
@@ -102,7 +102,7 @@ public:
     }
 
     [[nodiscard]] std::size_t pending_messages() const {
-      return out_buffer_.size() + request_pool_.active_requests();
+        return out_buffer_.size() + request_pool_.active_requests();
     }
 
 private:
@@ -146,4 +146,4 @@ private:
     std::size_t out_buffer_capacity_;
     int next_receipt_id_ = 0;
 };
-}  // namespace message_queue
+}  // namespace briefkasten
