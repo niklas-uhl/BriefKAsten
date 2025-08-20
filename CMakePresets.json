@@ -11,7 +11,7 @@
         "binaryDir": "${sourceDir}/build",
         "cacheVariables": {
             "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-            "CMAKE_CXX_FLAGS": "-fconcepts-diagnostics-depth=3 -Wall -Wextra -pedantic -DKASSERT_ASSERTION_LEVEL=30",
+	    "CMAKE_CXX_FLAGS": "-fconcepts-diagnostics-depth=3 -Wall -Wextra -pedantic",
 	    "CMAKE_C_COMPILER": "gcc-15",
 	    "CMAKE_CXX_COMPILER": "g++-15"
         }

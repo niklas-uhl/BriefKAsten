@@ -32,7 +32,7 @@ TEST(BufferedQueueTest, alltoall) {
     // communication
     std::vector<int> received_data;
     auto on_message = [&](auto envelope) {
-        received_data.insert_range(received_data.end(), envelope.message);
+        received_data.insert(received_data.end(), envelope.message.begin(), envelope.message.end());
     };
     for (auto& element : data) {
         queue.post_message_blocking(element, element, on_message);
@@ -70,7 +70,7 @@ TEST(BufferedQueueTest, alltoall_indirect) {
     // communication
     std::vector<int> received_data;
     auto on_message = [&](auto envelope) {
-        received_data.insert_range(received_data.end(), envelope.message);
+	received_data.insert(received_data.end(), envelope.message.begin(), envelope.message.end());
     };
     for (auto& element : data) {
         queue.post_message_blocking(element, element, on_message);

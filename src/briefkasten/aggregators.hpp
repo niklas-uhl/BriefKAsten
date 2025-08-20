@@ -42,7 +42,7 @@ struct AppendMerger {
                                                   PEID /* my_rank */,
                                                   MessageEnvelope<MessageContainer> const& envelope) const {
         return buffer.size() + envelope.message.size();
-    };
+    }
 };
 static_assert(Merger<AppendMerger, int, std::vector<int>>);
 static_assert(EstimatingMerger<AppendMerger, int, std::vector<int>>);

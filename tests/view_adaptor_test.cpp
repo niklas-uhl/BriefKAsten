@@ -1,7 +1,6 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
-#include <print>
 #include <ranges>
 
 #include "briefkasten/detail/view_adaptors.hpp"
@@ -9,10 +8,18 @@
 // NOLINTBEGIN(*-magic-numbers)
 TEST(ViewAdaptors, chunk_by_embedded_size_view) {
     std::vector<int> buf = {3, 1, 1, 1, 2, 42, 42, 5, 8, 8, 8, 8, 8};
+#ifdef __cpp_lib_ranges_to_container
     auto chunks =
         buf | briefkasten::chunk_by_embedded_size(0) |
         std::views::transform([](auto chunk) { return chunk | std::views::drop(1) | std::ranges::to<std::vector>(); }) |
         std::ranges::to<std::vector>();
+#else
+    auto chunks_range = buf | briefkasten::chunk_by_embedded_size(0) | std::views::transform([](auto chunk) {
+                            auto chunk_new = chunk | std::views::drop(1);
+                            return std::vector(chunk_new.begin(), chunk_new.end());
+                        });
+    auto chunks = std::vector(chunks_range.begin(), chunks_range.end());
+#endif
 
     using namespace ::testing;
     ASSERT_THAT(chunks, SizeIs(3));
