@@ -10,12 +10,24 @@ project(
 option(BRIEFKASTEN_BUILD_EXAMPLES "Build examples" ${PROJECT_IS_TOP_LEVEL})
 option(BRIEFKASTEN_BUILD_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
 
-include(cmake/dependencies.cmake)
-
 find_package(MPI REQUIRED)
 
-include(cmake/setup_assertion_level.cmake)
-FetchContent_MakeAvailable(kassert kamping)
+include(FetchContent)
+FetchContent_Declare(
+  kamping
+  GIT_REPOSITORY https://github.com/kamping-site/kamping.git
+  GIT_TAG packaging/update-kassert
+  SYSTEM
+)
+
+FetchContent_Declare(
+  kassert
+  GIT_REPOSITORY https://github.com/kamping-site/kassert.git
+  GIT_TAG v1.0.0
+  SYSTEM
+)
+
+FetchContent_MakeAvailable(kamping kassert)
 
 try_compile(
   BRIEFKASTEN_HAS_LAZY_SPLIT_VIEW ${CMAKE_CURRENT_BINARY_DIR}

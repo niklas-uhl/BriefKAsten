@@ -59,6 +59,7 @@ TEST(BufferedQueueTest, workloop) {
                 // task is done, check if num hops matches trace.
                 EXPECT_EQ(task[1], task.size() - 2);
             }
+            queue.poll_throttled(on_message);
         }
     } while (!queue.terminate(on_message));
 }
@@ -109,6 +110,7 @@ TEST(BufferedQueueTest, workloop_indirect) {
                 // task is done, check if num hops matches trace.
                 EXPECT_EQ(task[1], task.size() - 2);
             }
+            queue.poll_throttled(on_message);
         }
     } while (!queue.terminate(on_message));
 }
