@@ -1,0 +1,21 @@
+target_sources(
+  BriefKAsten_BriefKAsten
+  INTERFACE
+  FILE_SET HEADERS
+  FILES
+  aggregators.hpp
+  buffered_queue.hpp
+  queue_builder.hpp
+  indirection.hpp
+  grid_indirection.hpp
+  noop_indirection.hpp
+  detail/concepts.hpp
+  detail/definitions.hpp
+  detail/queue.hpp
+  detail/request_pool.hpp
+  detail/termination_counter.hpp
+  detail/fixed_size_buffer.hpp
+  detail/receiver.hpp
+  detail/sender.hpp
+  detail/view_adaptors.hpp
+)

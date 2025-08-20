@@ -1,8 +1,8 @@
-// Copyright (c) 2021-2023 Tim Niklas Uhl
+// Copyright (c) 2021-2025 Tim Niklas Uhl
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of
 // this software and associated documentation files (the "Software"), to deal in
-// the Software without restriction, including without limitation the rights to
+// the Software without restriction, including without limitation the rights too
 // use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
 // the Software, and to permit persons to whom the Software is furnished to do so,
 // subject to the following conditions:
@@ -23,9 +23,9 @@
 #include <kamping/mpi_datatype.hpp>
 #include <ranges>
 #include <vector>
-#include "message-queue/definitions.hpp"
+#include "./definitions.hpp"
 
-namespace message_queue {
+namespace briefkasten {
 
 template <typename T>
 concept MPIType = kamping::has_static_type_v<T>;
@@ -64,6 +64,7 @@ template <MessageRange MessageRangeType>
 struct MessageEnvelope {
     explicit MessageEnvelope(MessageRangeType message, PEID sender, PEID receiver, int tag)
         : message(std::move(message)), sender(sender), receiver(receiver), tag(tag) {}
+    MessageEnvelope() = default;
     // MessageEnvelope(MessageEnvelope const&) = delete;
     // MessageEnvelope(MessageEnvelope&&) = default;
     // MessageEnvelope& operator=(MessageEnvelope const&) = delete;
@@ -87,6 +88,18 @@ concept MessageHandler = MessageRange<MessageContainerType, MessageDataType> &&
                          requires(MessageFunc on_message, MessageEnvelope<MessageContainerType> envelope) {
                              { on_message(std::move(envelope)) };
                          };
+
+template <typename Func, typename MessageContainerType>
+concept SendFinishedCallback =
+    std::invocable<Func, std::size_t> || std::invocable<Func, std::size_t, MessageContainerType>;
+
+template <typename Fn, typename BufferMapType>
+concept OverflowHandler = requires(Fn handle_overflow, typename BufferMapType::iterator it) { handle_overflow(it); };
+
+template <typename Fn, typename BufferType>
+concept BufferProvider = requires(Fn get_new_buffer) {
+    { get_new_buffer() } -> std::same_as<BufferType>;
+};
 
 namespace aggregation {
 template <typename MergerType, typename MessageType, typename BufferContainer>
@@ -123,4 +136,4 @@ concept BufferCleaner = requires(BufferCleanerType pre_send_cleanup, BufferConta
     pre_send_cleanup(buffer, receiver);
 };
 }  // namespace aggregation
-}  // namespace message_queue
+}  // namespace briefkasten

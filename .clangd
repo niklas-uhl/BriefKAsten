@@ -1,0 +1,9 @@
+  CompileFlags:
+    Add: [-std=c++23]
+    Remove: [-fconcepts-diagnostics-depth=*]
+    CompilationDatabase: build
+  InlayHints:
+    Designators: Yes
+    Enabled: Yes
+    ParameterNames: Yes
+    DeducedTypes: Yes

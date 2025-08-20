@@ -1,0 +1,18 @@
+# -*- mode: yaml; -*-
+Checks:
+  - 'readability-*'
+  - 'modernize-*'
+  - '-modernize-use-trailing-return-type'
+  - 'mpi-*'
+  - 'cppcoreguidelines-*'
+  - 'bugprone-*'
+  - 'performance-*'
+  - 'misc-*'
+  - '-misc-include-*'
+HeaderFilterRegex: 'include/'
+UseColor: true
+CheckOptions:
+  readability-identifier-length.IgnoredVariableNames: '^([Guv]|it)$'
+  readability-identifier-length.IgnoredParameterNames: '^([Guv]|it)$'
+  readability-function-cognitive-complexity.Threshold: 80
+  misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic: True

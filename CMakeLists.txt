@@ -1,46 +1,64 @@
 cmake_minimum_required(VERSION 3.24)
-project(message-queue LANGUAGES CXX)
 
-option(MESSAGE_QUEUE_BACKTRACE "Enable stacktraces" ON)
+project(
+  BriefKAsten
+  DESCRIPTION
+    "A C++ library for transparent, asynchronous, and lazy messaging using MPI"
+  VERSION 0.2.0
+  LANGUAGES CXX)
 
-include(cmake/dependencies.cmake)
+option(BRIEFKASTEN_BUILD_EXAMPLES "Build examples" ${PROJECT_IS_TOP_LEVEL})
+option(BRIEFKASTEN_BUILD_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
 
 find_package(MPI REQUIRED)
 
-include(cmake/setup_assertion_level.cmake)
-FetchContent_MakeAvailable(kassert kamping)
+include(FetchContent)
+FetchContent_Declare(
+  kamping
+  GIT_REPOSITORY https://github.com/kamping-site/kamping.git
+  GIT_TAG packaging/update-kassert
+  SYSTEM
+)
+
+FetchContent_Declare(
+  kassert
+  GIT_REPOSITORY https://github.com/kamping-site/kassert.git
+  GIT_TAG v1.0.0
+  SYSTEM
+)
+
+FetchContent_MakeAvailable(kamping kassert)
 
 try_compile(
-  MESSAGE_QUEUE_HAS_LAZY_SPLIT_VIEW
-  ${CMAKE_CURRENT_BINARY_DIR}
-  SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/compile_check.cpp
-  CXX_STANDARD 20
-)
+  BRIEFKASTEN_HAS_LAZY_SPLIT_VIEW ${CMAKE_CURRENT_BINARY_DIR}
+  SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/compile_check.cpp CXX_STANDARD 23)
 
-set(message_queue_source_files
-  src/queue.cpp
-  src/buffered_queue.cpp
-  src/debug_print.cpp
-  src/concepts.cpp
-  src/aggregators.cpp
-  src/definitions.cpp
-  src/indirection.cpp
-)
+add_library(BriefKAsten_BriefKAsten INTERFACE)
+target_sources(BriefKAsten_BriefKAsten INTERFACE FILE_SET HEADERS BASE_DIRS src)
+add_subdirectory(src/briefkasten/)
+target_link_libraries(BriefKAsten_BriefKAsten INTERFACE MPI::MPI_CXX
+                                                        kassert::kassert)
+target_link_libraries(BriefKAsten_BriefKAsten INTERFACE kamping::kamping)
 
-add_library(message-queue ${message_queue_source_files})
-target_include_directories(message-queue PUBLIC include)
-target_link_libraries(message-queue PUBLIC MPI::MPI_CXX kassert::kassert)
-target_link_libraries(message-queue PUBLIC kamping::kamping)
-  
-target_compile_features(message-queue PUBLIC cxx_std_20)
-if (NOT MESSAGE_QUEUE_HAS_LAZY_SPLIT_VIEW)
-  message(STATUS "Your compiler has std::views::split implementation which is lazy, see the caveats in the README")
-  target_compile_definitions(message-queue PUBLIC MESSAGE_QUEUE_SPLIT_VIEW_IS_LAZY)
+target_compile_features(BriefKAsten_BriefKAsten INTERFACE cxx_std_23)
+if(NOT BRIEFKASTEN_HAS_LAZY_SPLIT_VIEW)
+  message(
+    STATUS
+      "Your compiler has std::views::split implementation which is lazy, see the caveats in the README"
+  )
+  target_compile_definitions(BriefKAsten
+                             INTERFACE MESSAGE_QUEUE_SPLIT_VIEW_IS_LAZY)
 else()
-  message(STATUS "Compiler supports std::views::split and std::views::lazy_split")
+  message(
+    STATUS "Compiler supports std::views::split and std::views::lazy_split")
 endif()
-add_library(message-queue::message-queue ALIAS message-queue)
+add_library(BriefKAsten::BriefKAsten ALIAS BriefKAsten_BriefKAsten)
 
-if (CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME OR MESSAGE_QUEUE_BUILD_EXAMPLES)
+if(BRIEFKASTEN_BUILD_EXAMPLES)
   add_subdirectory(examples)
+endif()
+
+if(BRIEFKASTEN_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
 endif()

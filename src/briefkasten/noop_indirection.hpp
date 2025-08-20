@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2023 Tim Niklas Uhl
+// Copyright (c) 2021-2025 Tim Niklas Uhl
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of
 // this software and associated documentation files (the "Software"), to deal in
@@ -19,6 +19,47 @@
 
 #pragma once
 
-namespace message_queue {
-using PEID = int;
-}
+#include <mpi.h>
+
+#include "./detail/definitions.hpp"
+
+namespace briefkasten {
+class NoopIndirectionScheme {
+public:
+    NoopIndirectionScheme(MPI_Comm comm) {
+        MPI_Comm_rank(comm, &my_rank_);
+        MPI_Comm_size(comm, &my_size_);
+    }
+
+    // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
+    [[nodiscard]] PEID next_hop(PEID /* sender */, PEID receiver) const {
+        return receiver;
+    }
+
+    [[nodiscard]] bool should_redirect(PEID /*sender*/, PEID receiver) const {
+        return receiver != rank();
+    }
+
+    [[nodiscard]] PEID group_size() const {
+        auto placeholder = size();
+        return placeholder;
+    }
+
+    // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
+    [[nodiscard]] PEID num_groups() const {
+        return 1;
+    }
+
+private:
+    [[nodiscard]] int rank() const {
+        return my_rank_;
+    }
+
+    [[nodiscard]] int size() const {
+        return my_size_;
+    }
+
+    int my_rank_ = 0;
+    int my_size_ = 0;
+};
+}  // namespace briefkasten
