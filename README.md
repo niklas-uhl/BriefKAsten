@@ -1,7 +1,6 @@
-# 📬 message-queue
-Asynchronous (buffering) MPI message queue implementation 📬
+# 📬 BriefKAsten
 
-This library provides transparent buffering and asynchronous lazy messaging for MPI.
+This library provides a MPI message queue with transparent buffering, message indirection and effortless asynchronous lazy messaging.
 
 This has been developed as part of our work on [distributed triangle counting](https://github.com/niklas-uhl/katric).
 
@@ -34,17 +33,17 @@ To use it in your project, include this repo using `FetchContent`, as `git submo
 add_subdirectory(path/to/submodule)
 
 # if using FetchContent
-FetchContent_Declare(message-queue
-  GIT_REPOSITORY https://github.com/niklas-uhl/message-queue
-  GIT_TAG main
+FetchContent_Declare(BriefKAsten
+  GIT_REPOSITORY https://github.com/niklas-uhl/BriefKAsten
+  GIT_TAG v0.2.0
 )
-FetchContent_MakeAvailable(message-queue)
+FetchContent_MakeAvailable(BriefKAsten)
 
 # link against the target
-target_link_libraries(<your-target> PRIVATE message-queue::message-queue)
+target_link_libraries(<your-target> PRIVATE BriefKAsten::BriefKAsten)
 ```
 
-For usage examples checks out the test directory.
+Check out the [tests directory](./tests/) to see how to use this library.
 
 ## Caveats
 This library relies heavily on C++ concepts and the ranges
