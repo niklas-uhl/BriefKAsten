@@ -3,7 +3,6 @@
 #include <kamping/communicator.hpp>
 
 #include <deque>
-#include <print>
 #include <random>
 #include <vector>
 

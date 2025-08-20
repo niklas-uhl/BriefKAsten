@@ -257,7 +257,7 @@ public:
     }
 
     bool probe_for_messages(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
-        probe_for_messages(std::forward<decltype(on_message)>(on_message), receive_buffers_.size());
+        return probe_for_messages(std::forward<decltype(on_message)>(on_message), receive_buffers_.size());
     }
 
     bool probe_for_messages(MessageHandler<value_type, std::span<value_type>> auto&& on_message,
