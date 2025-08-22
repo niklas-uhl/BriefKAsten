@@ -40,7 +40,18 @@ target_link_libraries(BriefKAsten_BriefKAsten INTERFACE MPI::MPI_CXX
                                                         kassert::kassert)
 target_link_libraries(BriefKAsten_BriefKAsten INTERFACE kamping::kamping)
 
-target_compile_features(BriefKAsten_BriefKAsten INTERFACE cxx_std_23)
+target_compile_features(BriefKAsten_BriefKAsten INTERFACE cxx_std_20)
+
+FetchContent_Declare(
+  range-v3
+  GIT_REPOSITORY https://github.com/ericniebler/range-v3
+  GIT_TAG 0.12.0
+  GIT_SHALLOW ON
+  SYSTEM
+)
+FetchContent_MakeAvailable(range-v3)
+target_link_libraries(BriefKAsten_BriefKAsten INTERFACE range-v3::range-v3)
+
 if(NOT BRIEFKASTEN_HAS_LAZY_SPLIT_VIEW)
   message(
     STATUS
