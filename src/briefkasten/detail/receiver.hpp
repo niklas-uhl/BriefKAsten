@@ -31,6 +31,10 @@
 #include "./concepts.hpp"
 #include "./termination_counter.hpp"
 
+#ifdef BRIEFKASTEN_CXX20
+#include <range/v3/view/zip.hpp>
+#endif
+
 namespace briefkasten {
 namespace internal {
 auto build_envelope(MPIBuffer auto const& buffer, MPI_Status& status, int rank)
@@ -69,7 +73,12 @@ public:
           termination_(&termination_counter) {
         KASSERT(tag_ < kamping::mpi_env.tag_upper_bound());
         MPI_Comm_rank(comm, &rank_);
-        for (auto [request, buffer] : std::views::zip(receive_requests_, receive_buffers_)) {
+#ifdef BRIEFKASTEN_CXX20
+        namespace views = ranges::views;
+#else
+        namespace views = std::views;
+#endif
+        for (auto [request, buffer] : views::zip(receive_requests_, receive_buffers_)) {
             buffer.resize(reserved_receive_buffer_size);
 #if MPI_VERSION >= 4
             MPI_Recv_init_c(buffer.data(),                        // buf
@@ -100,7 +109,12 @@ public:
             MPI_Cancel(&request);
         }
         MPI_Waitall(static_cast<int>(receive_requests_.size()), receive_requests_.data(), statuses.data());
-        for (auto [request, status] : std::views::zip(receive_requests_, statuses)) {
+#ifdef BRIEFKASTEN_CXX20
+        namespace views = ranges::views;
+#else
+        namespace views = std::views;
+#endif
+        for (auto [request, status] : views::zip(receive_requests_, statuses)) {
             int cancelled = 0;
             MPI_Test_cancelled(&status, &cancelled);
             KASSERT(cancelled,
@@ -162,7 +176,12 @@ public:
         auto buffers = indices | std::views::transform([&](int index) -> auto& { return receive_buffers_[index]; });
         auto requests = indices | std::views::transform([&](int index) -> auto& { return receive_requests_[index]; });
 
-        for (auto [buffer, status, request] : std::views::zip(buffers, statuses, requests)) {
+#ifdef BRIEFKASTEN_CXX20
+        namespace views = ranges::views;
+#else
+        namespace views = std::views;
+#endif
+        for (auto [buffer, status, request] : views::zip(buffers, statuses, requests)) {
             termination_->track_receive();
             auto envelope = internal::build_envelope(buffer, status, rank_);
             on_message(std::move(envelope));
@@ -177,7 +196,12 @@ public:
             MPI_Cancel(&request);
         }
         MPI_Waitall(static_cast<int>(receive_requests_.size()), receive_requests_.data(), statuses.data());
-        for (auto& [buffer, request, status] : std::views::zip(receive_buffers_, receive_requests_, statuses)) {
+#ifdef BRIEFKASTEN_CXX20
+        namespace views = ranges::views;
+#else
+        namespace views = std::views;
+#endif
+        for (auto& [buffer, request, status] : views::zip(receive_buffers_, receive_requests_, statuses)) {
             int cancelled = 0;
             MPI_Test_cancelled(&status, &cancelled);
             if (!cancelled) {
@@ -274,7 +298,12 @@ public:
             }
             MPI_Waitall(num_recvs, receive_requests_.data(), statuses_.data());
             auto buffers = std::span(receive_buffers_).first(num_recvs);
-            for (auto& [buffer, status] : std::views::zip(buffers, statuses_)) {
+#ifdef BRIEFKASTEN_CXX20
+            namespace views = ranges::views;
+#else
+            namespace views = std::views;
+#endif
+            for (auto& [buffer, status] : views::zip(buffers, statuses_)) {
                 termination_->track_receive();
                 auto envelope = internal::build_envelope(buffer, status, rank_);
                 on_message(std::move(envelope));
@@ -390,7 +419,12 @@ public:
         }
         statuses_.resize(receive_requests_.size());
         MPI_Waitall(static_cast<int>(receive_requests_.size()), receive_requests_.data(), statuses_.data());
-        for (auto [buffer, status] : std::views::zip(receive_buffers_, statuses_)) {
+#ifdef BRIEFKASTEN_CXX20
+        namespace views = ranges::views;
+#else
+        namespace views = std::views;
+#endif
+        for (auto [buffer, status] : views::zip(receive_buffers_, statuses_)) {
             termination_->track_receive();
             auto envelope =
                 MessageEnvelope<ReceiveBufferContainer>{std::move(buffer), status.MPI_SOURCE, rank_, status.MPI_TAG};
