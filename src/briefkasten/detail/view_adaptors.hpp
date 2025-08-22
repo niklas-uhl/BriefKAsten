@@ -4,6 +4,10 @@
 #include <ranges>
 #include <span>
 
+#ifdef BRIEFKASTEN_CXX20
+#include <range/v3/functional/pipeable.hpp>
+#endif
+
 namespace briefkasten {
 
 // Simple iterator that chunks data based on embedded size field
@@ -121,6 +125,23 @@ public:
 };
 
 // Range adaptor closure for piping
+#ifdef BRIEFKASTEN_CXX20
+struct chunk_by_embedded_size_fn {
+    template <std::ranges::contiguous_range Range>
+    auto operator()(Range&& range, std::size_t size_offset) const {
+        return chunk_by_embedded_size_view<std::views::all_t<Range>>(std::views::all(std::forward<Range>(range)),
+                                                                     size_offset);
+    }
+
+    auto operator()(std::size_t size_offset) const {
+        return ranges::make_pipeable([size_offset, this](auto&& range) {
+            return this->operator()(std::forward<decltype(range)>(range), size_offset);
+        });
+    }
+};
+
+inline constexpr chunk_by_embedded_size_fn chunk_by_embedded_size{};
+#else
 struct chunk_by_embedded_size_adaptor : std::ranges::range_adaptor_closure<chunk_by_embedded_size_adaptor> {
     std::size_t size_offset_;
 
@@ -137,6 +158,7 @@ struct chunk_by_embedded_size_adaptor : std::ranges::range_adaptor_closure<chunk
 inline auto chunk_by_embedded_size(std::size_t size_offset) {
     return chunk_by_embedded_size_adaptor{size_offset};
 }
+#endif
 
 // Static assertions to verify concepts
 static_assert(std::input_iterator<chunk_iterator<std::span<int>::iterator>>);
