@@ -25,6 +25,7 @@ You can also find a [freely accessible postprint in the arXiv](https://arxiv.org
 
 ## Usage
 This library is header only. You need a C++23 ready compiler, since it relies heavily on C++ concepts and the ranges library.
+There is also a C++20 compatible version, which you can enable by setting the CMake option `BRIEFKASTEN_USE_CXX23` to `OFF`.
 
 To use it in your project, include this repo using `FetchContent`, as `git submodule` or your preferred way of CMake dependency management and (if needed) include it as subdirectory. You can link against it using
 
@@ -35,7 +36,7 @@ add_subdirectory(path/to/submodule)
 # if using FetchContent
 FetchContent_Declare(BriefKAsten
   GIT_REPOSITORY https://github.com/niklas-uhl/BriefKAsten
-  GIT_TAG v0.2.0
+  GIT_TAG v0.2.1
 )
 FetchContent_MakeAvailable(BriefKAsten)
 
