@@ -9,6 +9,7 @@ target_sources(
   indirection.hpp
   grid_indirection.hpp
   noop_indirection.hpp
+  topology_aware_indirection.hpp
   detail/concepts.hpp
   detail/definitions.hpp
   detail/queue.hpp
