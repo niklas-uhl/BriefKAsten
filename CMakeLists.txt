@@ -4,7 +4,7 @@ project(
   BriefKAsten
   DESCRIPTION
     "A C++ library for transparent, asynchronous, and lazy messaging using MPI"
-  VERSION 0.2.0
+  VERSION 0.2.1
   LANGUAGES CXX)
 
 option(BRIEFKASTEN_BUILD_EXAMPLES "Build examples" ${PROJECT_IS_TOP_LEVEL})
