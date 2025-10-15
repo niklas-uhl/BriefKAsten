@@ -37,7 +37,12 @@ if(BRIEFKASTEN_USE_CXX23)
 endif()
 try_compile(
   BRIEFKASTEN_HAS_LAZY_SPLIT_VIEW ${CMAKE_CURRENT_BINARY_DIR}
-  SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/compile_check.cpp CXX_STANDARD
+  SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/lazy_split_compile_check.cpp
+  CXX_STANDARD ${try_compile_version})
+
+try_compile(
+  BRIEFKASTEN_HAS_CHUNK_VIEW ${CMAKE_CURRENT_BINARY_DIR}
+  SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/chunk_view_compile_check.cpp CXX_STANDARD
           ${try_compile_version})
 
 add_library(BriefKAsten_BriefKAsten INTERFACE)
