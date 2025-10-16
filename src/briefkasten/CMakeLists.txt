@@ -4,6 +4,8 @@ target_sources(
   FILE_SET HEADERS
   FILES
   aggregators.hpp
+  simple_aggregators.hpp
+  envelope_aggregators.hpp
   buffered_queue.hpp
   queue_builder.hpp
   indirection.hpp

@@ -58,6 +58,8 @@ public:
                       PEID envelope_receiver,
                       int tag,
                       bool direct_send = false) {
+        KASSERT(envelope_receiver < this->size());
+        KASSERT(receiver < this->size());
         PEID next_hop = receiver;
         if (!direct_send) {
             next_hop = indirection_.next_hop(envelope_sender, envelope_receiver);
@@ -89,6 +91,8 @@ public:
                                int tag,
                                MessageHandler<MessageType> auto&& on_message,
                                bool direct_send = false) {
+        KASSERT(envelope_receiver < this->size());
+        KASSERT(receiver < this->size());
         PEID next_hop = receiver;
         if (!direct_send) {
             next_hop = indirection_.next_hop(envelope_sender, envelope_receiver);
