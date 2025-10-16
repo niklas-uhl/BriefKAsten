@@ -20,13 +20,14 @@ jobs:
     strategy:
       matrix:
         use_cxx_23: [ON, OFF]
-    name: build (cxx_23=${{ matrix.use_cxx_23 }})
+        mpi_impl: [mpich, ompi]
+    name: build (cxx_23=${{ matrix.use_cxx_23 }},mpi=${{ matrix.mpi_impl }})
     steps:
     - uses: actions/checkout@v4
     - name: Setup MPI  
       uses: mpi4py/setup-mpi@v1
       with:
-          mpi: mpich
+          mpi: ${{ matrix.mpi_impl }}
 
     - name: Configure CMake
       # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
