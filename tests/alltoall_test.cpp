@@ -136,9 +136,6 @@ TEST(BufferedQueueTest, alltoall_indirect_tuple) {
             // so that indirection works.
             .with_merger(briefkasten::aggregation::EnvelopeSerializationMerger{})
             .with_splitter(briefkasten::aggregation::EnvelopeSerializationSplitter<std::tuple<int, int>>{})
-	.with_buffer_cleaner([&](auto buf, int rank){
-	  // std::println("Sending {} to {}", buf, rank);
-})
             .build(),
         briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
     queue.synchronous_mode();
