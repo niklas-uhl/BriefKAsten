@@ -7,8 +7,6 @@ on:
     branches: [ "main" ]
 
 env:
-  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
-  BUILD_TYPE: Release
   CXX_FLAGS:  -Wall -Wextra -pedantic
 
 jobs:
@@ -20,26 +18,28 @@ jobs:
     strategy:
       matrix:
         use_cxx_23: [ON, OFF]
-    name: build (cxx_23=${{ matrix.use_cxx_23 }})
+        mpi_impl: [mpich, ompi]
+        build_type: [Debug, Release]
+    name: cmake-build (cxx_std=${{ matrix.use_cxx_23 == 'ON' && '23' || '20' }}, build_type=${{ matrix.build_type }}, mpi=${{ matrix.mpi_impl }})
     steps:
     - uses: actions/checkout@v4
     - name: Setup MPI  
       uses: mpi4py/setup-mpi@v1
       with:
-          mpi: mpich
+          mpi: ${{ matrix.mpi_impl }}
 
     - name: Configure CMake
       # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
       # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
-      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_CXX_FLAGS='${{env.CXX_FLAGS}}' -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DBRIEFKASTEN_USE_CXX23=${{ matrix.use_cxx_23 }}
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DCMAKE_CXX_FLAGS='${{env.CXX_FLAGS}}' -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DBRIEFKASTEN_USE_CXX23=${{ matrix.use_cxx_23 }}
 
     - name: Build
       # Build your program with the given configuration
-      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
+      run: cmake --build ${{github.workspace}}/build
 
     - name: Test
       working-directory: ${{github.workspace}}/build
       # Execute tests defined by the CMake configuration.
       # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
-      run: ctest -C ${{env.BUILD_TYPE}} --output-on-failure
+      run: ctest --output-on-failure
 
