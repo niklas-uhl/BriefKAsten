@@ -68,10 +68,10 @@ public:
           tag_(tag),
           receive_requests_(num_receive_slots, MPI_REQUEST_NULL),
           receive_buffers_(num_receive_slots),
-          statuses_(num_receive_slots),
-          indices_(num_receive_slots),
+          statuses_(1, std::vector<MPI_Status>(num_receive_slots)),
+          indices_(1, std::vector<int>(num_receive_slots)),
           termination_(&termination_counter) {
-        KASSERT(tag_ < kamping::mpi_env.tag_upper_bound());
+        KASSERT(tag_ < kamping::Environment<>::tag_upper_bound());
         MPI_Comm_rank(comm, &rank_);
 #ifdef BRIEFKASTEN_CXX20
         namespace views = ranges::views;
@@ -137,15 +137,17 @@ public:
     }
 
     bool probe_for_one_message(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
-        int& index = indices_[0];
+        auto [statuses_buf, indices_buf] = step_probe_recursion();
+        int& index = indices_buf[0];
         int request_completed = 0;
-        MPI_Status& status = statuses_[0];
+        MPI_Status& status = statuses_buf[0];
         MPI_Testany(static_cast<int>(receive_requests_.size()),  // count
                     receive_requests_.data(),                    // array_of_requests
                     &index,                                      // indx
                     &request_completed,                          // flag
                     &status);                                    // status
         if (!request_completed || index == MPI_UNDEFINED) {
+            unstep_probe_recursion();
             return false;
         }
         termination_->track_receive();
@@ -153,26 +155,31 @@ public:
         auto envelope = build_envelope(buffer, status, rank_);
         on_message(std::move(envelope));
         MPI_Start(&receive_requests_[index]);
+        unstep_probe_recursion();
         return true;
     }
 
     bool probe_for_messages(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
+        // calling probe for messages recursively (i.e. via indirection), might lead to corruption of indices and
+        // statuses buffers. Therefore we track the recursion depth and allocate more buffers if needed.
+        // TODO: make this scope guarded
+        auto [statuses_buf, indices_buf] = step_probe_recursion();
         int num_completed = 0;
-        MPI_Status* status = statuses_.data();
         MPI_Testsome(static_cast<int>(receive_requests_.size()),  // count
                      receive_requests_.data(),                    // array_of_requests
                      &num_completed,                              // outcount
-                     indices_.data(),                             // indices
-                     status);                                     // array_of_statuses
+                     indices_buf.data(),                          // indices
+                     statuses_buf.data());                        // array_of_statuses
         if (num_completed == 0 || num_completed == MPI_UNDEFINED) {
             // previously, this code assumed, that all requests are always active
             // but when this method is called recursively in the message handler, e.g. when using indirection,
             // it is possible that some requests have finished somewhere up the call stack and have not been restarted
             // yet.
+            unstep_probe_recursion();
             return false;
         }
-        auto indices = std::span(indices_).first(num_completed);
-        auto statuses = std::span(statuses_).first(num_completed);
+        auto indices = std::span(indices_buf).first(num_completed);
+        auto statuses = std::span(statuses_buf).first(num_completed);
         auto buffers = indices | std::views::transform([&](int index) -> auto& { return receive_buffers_[index]; });
         auto requests = indices | std::views::transform([&](int index) -> auto& { return receive_requests_[index]; });
 
@@ -187,6 +194,7 @@ public:
             on_message(std::move(envelope));
             MPI_Start(&request);
         }
+        unstep_probe_recursion();
         return true;
     }
 
@@ -227,12 +235,26 @@ public:
     }
 
 private:
+    auto step_probe_recursion() -> std::tuple<std::vector<MPI_Status>&, std::vector<int>&> {
+        probe_recursion_depth_++;
+        if (probe_recursion_depth_ >= static_cast<int>(statuses_.size())) {
+            statuses_.emplace_back(receive_requests_.size());
+            indices_.emplace_back(receive_requests_.size());
+        }
+        return {statuses_[probe_recursion_depth_], indices_[probe_recursion_depth_]};
+    }
+
+    auto unstep_probe_recursion() -> void {
+        probe_recursion_depth_--;
+    }
+
     MPI_Comm comm_;
     int tag_;
     std::vector<MPI_Request> receive_requests_;
     std::vector<ReceiveBufferContainer> receive_buffers_;
-    std::vector<MPI_Status> statuses_;
-    std::vector<int> indices_;
+    std::vector<std::vector<MPI_Status>> statuses_;
+    std::vector<std::vector<int>> indices_;
+    int probe_recursion_depth_ = 0;
     internal::TerminationCounter* termination_;
     int rank_ = 0;
 };
