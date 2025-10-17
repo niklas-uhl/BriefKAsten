@@ -93,9 +93,6 @@ public:
         KASSERT(envelope_receiver < this->size());
         KASSERT(receiver < this->size());
         PEID next_hop = receiver;
-	if (receiver == 5) {
-	  std::println("message {} to 5 from {}", message[0], envelope_sender);
-	}
         if (!direct_send) {
             next_hop = indirection_.next_hop(envelope_sender, envelope_receiver);
         }
