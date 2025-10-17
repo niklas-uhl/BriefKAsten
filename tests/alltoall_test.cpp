@@ -123,7 +123,6 @@ TEST(BufferedQueueTest, alltoall_indirect_tuple) {
 
     // generate data
     std::vector<std::tuple<int, int>> data(NUM_LOCAL_ELEMENTS);
-    // std::vector<std::tuple<int, int>> data(2);
     std::default_random_engine generator;
     std::uniform_int_distribution<int> distribution(0, comm.size_signed() - 1);
     std::ranges::generate(data, [&]() { return std::tuple{distribution(generator), comm.rank_signed()}; });
