@@ -23,6 +23,7 @@
 #include <kassert/kassert.hpp>
 #include "./detail/concepts.hpp"  // IWYU pragma: keep
 #include "./detail/definitions.hpp"
+#include "./buffered_queue.hpp" // IWYU pragma: keep
 
 #include <kamping/measurements/timer.hpp>
 
