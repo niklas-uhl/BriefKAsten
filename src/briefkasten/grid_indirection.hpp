@@ -80,6 +80,8 @@ private:
     }
 
     [[nodiscard]] PEID get_proxy(PEID from, PEID to) const {  // NOLINT(readability-identifier-length)
+        KASSERT(from < my_size_);
+	KASSERT(to < my_size_);
         auto from_pos = rank_to_grid_position(from);
         auto to_pos = rank_to_grid_position(to);
         GridPosition proxy = {.row = from_pos.row, .column = to_pos.column};

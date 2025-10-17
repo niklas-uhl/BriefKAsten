@@ -57,6 +57,8 @@ public:
                       PEID envelope_receiver,
                       int tag,
                       bool direct_send = false) {
+        KASSERT(envelope_receiver < this->size());
+        KASSERT(receiver < this->size());
         PEID next_hop = receiver;
         if (!direct_send) {
             next_hop = indirection_.next_hop(envelope_sender, envelope_receiver);
@@ -88,7 +90,12 @@ public:
                                int tag,
                                MessageHandler<MessageType> auto&& on_message,
                                bool direct_send = false) {
+        KASSERT(envelope_receiver < this->size());
+        KASSERT(receiver < this->size());
         PEID next_hop = receiver;
+	if (receiver == 5) {
+	  std::println("message {} to 5 from {}", message[0], envelope_sender);
+	}
         if (!direct_send) {
             next_hop = indirection_.next_hop(envelope_sender, envelope_receiver);
         }
@@ -113,6 +120,7 @@ public:
                                MessageHandler<MessageType> auto&& on_message,
                                int tag = 0,
                                bool direct_send = false) {
+      KASSERT(receiver < this->size());
         return post_message_blocking(std::ranges::views::single(message), receiver,
                                      std::forward<decltype(on_message)>(on_message), tag, direct_send);
     }
@@ -144,6 +152,7 @@ public:
 private:
     auto redirection_handler(MessageHandler<typename queue_type::message_type> auto&& on_message) {
         return [&](Envelope<typename queue_type::message_type> auto envelope) {
+	  KASSERT(envelope.receiver < this->size());
             bool should_redirect = indirection_.should_redirect(envelope.sender, envelope.receiver);
             if (should_redirect) {
                 post_message_blocking(std::move(envelope.message), envelope.receiver, envelope.sender,
