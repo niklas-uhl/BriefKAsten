@@ -23,6 +23,7 @@
 #include <kassert/kassert.hpp>
 #include "./detail/concepts.hpp"  // IWYU pragma: keep
 #include "./detail/definitions.hpp"
+#include "./buffered_queue.hpp" // IWYU pragma: keep
 
 #include <kamping/measurements/timer.hpp>
 
@@ -113,6 +114,7 @@ public:
                                MessageHandler<MessageType> auto&& on_message,
                                int tag = 0,
                                bool direct_send = false) {
+        KASSERT(receiver < this->size());
         return post_message_blocking(std::ranges::views::single(message), receiver,
                                      std::forward<decltype(on_message)>(on_message), tag, direct_send);
     }
@@ -123,6 +125,12 @@ public:
     auto poll(MessageHandler<typename queue_type::message_type> auto&& on_message)
         -> std::optional<std::pair<bool, bool>> {
         return queue_type::poll(redirection_handler(std::forward<decltype(on_message)>(on_message)));
+    }
+
+    auto poll_throttled(MessageHandler<MessageType> auto&& on_message,
+                        std::size_t poll_skip_threshold = DEFAULT_POLL_SKIP_THRESHOLD) {
+        return queue_type::poll_throttled(redirection_handler(std::forward<decltype(on_message)>(on_message)),
+                                          poll_skip_threshold);
     }
 
     /// Note: Message handlers take a MessageEnvelope as single argument. The Envelope
@@ -141,9 +149,33 @@ public:
                                      progress_hook);
     }
 
+    bool probe_for_messages(MessageHandler<typename queue_type::message_type> auto&& on_message) {
+        return queue_type::probe_for_messages(redirection_handler(std::forward<decltype(on_message)>(on_message)));
+    }
+
+    bool probe_for_one_message(MessageHandler<typename queue_type::message_type> auto&& on_message,
+                               PEID source = MPI_ANY_SOURCE,
+                               int tag = MPI_ANY_TAG) {
+        return queue_type::probe_for_one_message(redirection_handler(std::forward<decltype(on_message)>(on_message)),
+                                                 source, tag);
+    }
+
+    void global_threshold_bytes(std::size_t new_threshold,
+                                MessageHandler<typename queue_type::message_type> auto&& on_message) {
+        queue_type::global_threshold_bytes(new_threshold,
+                                           redirection_handler(std::forward<decltype(on_message)>(on_message)));
+    }
+
+    void local_threshold_bytes(std::size_t new_threshold,
+                               MessageHandler<typename queue_type::message_type> auto&& on_message) {
+        queue_type::local_threshold_bytes(new_threshold,
+                                          redirection_handler(std::forward<decltype(on_message)>(on_message)));
+    }
+
 private:
     auto redirection_handler(MessageHandler<typename queue_type::message_type> auto&& on_message) {
         return [&](Envelope<typename queue_type::message_type> auto envelope) {
+            KASSERT(envelope.receiver < this->size());
             bool should_redirect = indirection_.should_redirect(envelope.sender, envelope.receiver);
             if (should_redirect) {
                 post_message_blocking(std::move(envelope.message), envelope.receiver, envelope.sender,
