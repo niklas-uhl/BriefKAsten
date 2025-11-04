@@ -19,7 +19,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <concepts>
 #include <ranges>
 #include <tuple>
 #include <type_traits>
@@ -98,7 +100,45 @@ ElementType reconstruct_from_chunk(Range&& chunk) {
 
 }  // namespace detail
 
+enum class EnvelopeMetadataField { size, tag, sender, receiver };
+
+template <EnvelopeMetadataField... meta>
+struct EnvelopeMetadata {
+    static constexpr std::array<EnvelopeMetadataField, sizeof...(meta)> values = {meta...};
+    static_assert(
+        [] {
+            auto values_copy = values;
+            std::ranges::sort(values_copy);
+            auto it = std::ranges::adjacent_find(values_copy);
+            return it == values_copy.end();
+        }(),
+        "Duplicate metadata fields are not allowed");
+    static constexpr std::size_t size = sizeof...(meta);
+    static constexpr bool contains(EnvelopeMetadataField field) {
+        auto it = std::ranges::find(values, field);
+        return it != values.end();
+    }
+};
+
+template <typename metadata = EnvelopeMetadata<EnvelopeMetadataField::size, EnvelopeMetadataField::receiver>,
+          typename message_size = void>
 struct EnvelopeSerializationMerger {
+    // static_assert(
+    //     [] {
+    //         if (!metadata::contains(EnvelopeMetadataField::size)) {
+    //             if constexpr (requires {
+    //                               message_size::value;
+    //                               message_size::type;
+    //                           }) {
+    //                 return std::same_as<typename message_size::type, std::size_t>;
+    //             }
+    //             return false;
+    //         };
+    //         return true;
+    //     }(),
+    //     "When not including size in the metadata, message_size must be an integral constant of type std::size_t "
+    //     "containing the fixed message size.");
+
     template <MPIBuffer BufferContainer,
               SerializableEnvelope<BufferContainer> EnvType>  // requires that both the message value type and
     void operator()(BufferContainer& buffer, PEID /* buffer_destination */, PEID /* my_rank */, EnvType envelope) {
@@ -108,9 +148,23 @@ struct EnvelopeSerializationMerger {
         constexpr std::size_t elem_size = detail::element_cardinality<env_type>();
         const std::size_t message_buffer_elements = envelope.message.size() * elem_size;
 
-        std::vector<buffer_type> combined(message_buffer_elements + 2);  // extra space for receiver and size
-        combined[0] = static_cast<buffer_type>(envelope.receiver);
-        combined[1] = static_cast<buffer_type>(envelope.message.size() * elem_size);
+        std::vector<buffer_type> combined(message_buffer_elements +
+                                          metadata::size);  // extra space for receiver and size
+        std::size_t meta_index = 0;
+        if constexpr (metadata::contains(EnvelopeMetadataField::size)) {
+            combined[meta_index++] =
+                static_cast<buffer_type>(envelope.message.size() * elem_size) + metadata::size -
+                1;  // when chunking by size, we need to include the metadata fields except size itself
+        }
+        if constexpr (metadata::contains(EnvelopeMetadataField::sender)) {
+            combined[meta_index++] = static_cast<buffer_type>(envelope.sender);
+        }
+        if constexpr (metadata::contains(EnvelopeMetadataField::receiver)) {
+            combined[meta_index++] = static_cast<buffer_type>(envelope.receiver);
+        }
+        if constexpr (metadata::contains(EnvelopeMetadataField::tag)) {
+            combined[meta_index++] = static_cast<buffer_type>(envelope.tag);
+        }
 
         // Copy the message into the combined vector, starting from index 2
         // and transform the message values to the buffer type.
@@ -118,45 +172,87 @@ struct EnvelopeSerializationMerger {
                                      return detail::convert_to_buffer<buffer_type>(value);
                                  });
         if constexpr (elem_size > 1) {
-            std::ranges::copy(converted_message | std::views::join, combined.begin() + 2);
+            std::ranges::copy(converted_message | std::views::join, combined.begin() + meta_index);
         } else {
-            std::ranges::copy(converted_message, combined.begin() + 2);
+            std::ranges::copy(converted_message, combined.begin() + meta_index);
         }
         buffer.insert(buffer.end(), combined.begin(), combined.end());
     }
+
     template <MPIBuffer BufferContainer, SerializableEnvelope<BufferContainer> EnvType>
     size_t estimate_new_buffer_size(BufferContainer const& buffer,
                                     PEID /* buffer_destination */,
                                     PEID /* my_rank */,
                                     EnvType const& envelope) const {
         constexpr std::size_t elem_size = detail::element_cardinality<typename EnvType::message_value_type>();
-        return buffer.size() + (envelope.message.size() * elem_size) + 2;  // 2 for receiver and size
+        return buffer.size() + (envelope.message.size() * elem_size) + metadata::size;  // 2 for receiver and size
     }
 };
 
-static_assert(Merger<EnvelopeSerializationMerger, int, std::vector<int>>);
-static_assert(Merger<EnvelopeSerializationMerger, std::pair<int, int>, std::vector<int>>);
+static_assert(Merger<EnvelopeSerializationMerger<>, int, std::vector<int>>);
+static_assert(Merger<EnvelopeSerializationMerger<>, std::pair<int, int>, std::vector<int>>);
 
-template <typename MessageType>
+template <typename MessageType,
+          typename metadata = EnvelopeMetadata<EnvelopeMetadataField::size, EnvelopeMetadataField::receiver>,
+          typename message_size = void>
 struct EnvelopeSerializationSplitter {
+    // static_assert(
+    //     [] {
+    //         if (!metadata::contains(EnvelopeMetadataField::size)) {
+    //             if constexpr (requires {
+    //                               message_size::value;
+    //                               message_size::type;
+    //                           }) {
+    //                 return std::same_as<typename message_size::type, std::size_t>;
+    //             }
+    //             return false;
+    //         };
+    //         return true;
+    //     }(),
+    //     "When not including size in the metadata, message_size must be an integral constant of type std::size_t "
+    //     "containing the fixed message size.");
+
     template <MPIBuffer BufferContainer>
-    auto operator()(BufferContainer const& buffer, PEID /* buffer_origin */, PEID /* my_rank */) const {
-        return buffer | chunk_by_embedded_size(1) | std::views::transform([&](auto chunk) {
-                   PEID receiver = static_cast<PEID>(chunk[0]);
-                   auto message_data = chunk | std::views::drop(2);
-                   if constexpr (detail::element_cardinality<MessageType>() > 1) {
-                       auto message = message_data | std::views::chunk(detail::element_cardinality<MessageType>()) |
-                                      std::views::transform([&](auto chunk) {
-                                          return detail::reconstruct_from_chunk<MessageType>(std::move(chunk));
-                                      });
-                       return MessageEnvelope{std::move(message), 0, receiver, 0};
-                   } else {
-                       auto message = message_data | std::views::transform([](auto const& elem) {
-                                          return static_cast<MessageType>(elem);
-                                      });
-                       return MessageEnvelope{std::move(message), 0, receiver, 0};
-                   }
-               });
+    auto operator()(BufferContainer const& buffer, PEID buffer_origin, PEID my_rank) const {
+        auto chunk = [] {
+            if constexpr (metadata::contains(EnvelopeMetadataField::size)) {
+                // size is always the first field
+                return chunk_by_embedded_size(0);
+            } else {
+                return std::views::chunk((message_size::value * detail::element_cardinality<MessageType>()) +
+                                         metadata::size);
+            }
+        }();
+        auto split_to_envelope =
+            chunk | std::views::transform([&](auto chunk) {
+                PEID sender = buffer_origin;
+                PEID receiver = my_rank;
+                PEID tag = 0;
+                std::size_t meta_index = metadata::contains(EnvelopeMetadataField::size) ? 1 : 0;  // start after size
+                if constexpr (metadata::contains(EnvelopeMetadataField::sender)) {
+                    sender = static_cast<PEID>(chunk[meta_index++]);
+                }
+                if constexpr (metadata::contains(EnvelopeMetadataField::receiver)) {
+                    receiver = static_cast<PEID>(chunk[meta_index++]);
+                }
+                if constexpr (metadata::contains(EnvelopeMetadataField::tag)) {
+                    tag = static_cast<PEID>(chunk[meta_index++]);
+                }
+
+                auto message_data = chunk | std::views::drop(meta_index);
+                if constexpr (detail::element_cardinality<MessageType>() > 1) {
+                    auto message = message_data | std::views::chunk(detail::element_cardinality<MessageType>()) |
+                                   std::views::transform([&](auto chunk) {
+                                       return detail::reconstruct_from_chunk<MessageType>(std::move(chunk));
+                                   });
+                    return MessageEnvelope{std::move(message), sender, receiver, tag};
+                } else {
+                    auto message = message_data | std::views::transform(
+                                                      [](auto const& elem) { return static_cast<MessageType>(elem); });
+                    return MessageEnvelope{std::move(message), sender, receiver, tag};
+                }
+            });
+        return buffer | split_to_envelope;
     }
 };
 

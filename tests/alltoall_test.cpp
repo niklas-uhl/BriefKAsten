@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <random>
+#include <type_traits>
 
 #include "briefkasten/aggregators.hpp"
 #include "briefkasten/buffered_queue.hpp"
+#include "briefkasten/envelope_aggregators.hpp"
 #include "briefkasten/grid_indirection.hpp"
 #include "briefkasten/indirection.hpp"
 #include "briefkasten/queue_builder.hpp"
@@ -60,6 +62,47 @@ TEST(BufferedQueueTest, alltoall_tuple) {
 
     // init queue
     auto queue = briefkasten::BufferedMessageQueueBuilder<std::tuple<int, int>>().build();
+    queue.synchronous_mode();
+
+    // communication
+    std::vector<std::tuple<int, int>> received_data;
+    auto on_message = [&](auto envelope) {
+        received_data.insert(received_data.end(), envelope.message.begin(), envelope.message.end());
+    };
+    for (auto& element : data) {
+        queue.post_message_blocking(element, std::get<0>(element), on_message);
+    }
+    std::ignore = queue.terminate(on_message);
+
+    // tests
+    EXPECT_THAT(received_data, Each(FieldsAre(Eq(comm.rank()), A<int>())));
+    auto total_receive_count = comm.allreduce_single(kmp::send_buf(received_data.size()), kmp::op(std::plus<>{}));
+    EXPECT_EQ(total_receive_count, data.size() * comm.size());
+}
+
+TEST(BufferedQueueTest, alltoall_tuple_envelope) {
+    using namespace ::testing;
+    namespace kmp = kamping::params;
+    kamping::Communicator<> comm;
+    // generate data
+    std::vector<std::tuple<int, int>> data(NUM_LOCAL_ELEMENTS);
+    std::default_random_engine generator;
+    std::uniform_int_distribution<int> distribution(0, comm.size_signed() - 1);
+    std::ranges::generate(data, [&]() { return std::tuple{distribution(generator), comm.rank_signed()}; });
+
+    // init queue
+    using metadata =
+        briefkasten::aggregation::EnvelopeMetadata<briefkasten::aggregation::EnvelopeMetadataField::receiver>;
+    auto queue =
+        briefkasten::BufferedMessageQueueBuilder<std::tuple<int, int>>()
+            .with_buffer_type<int>()
+            .with_merger(
+                briefkasten::aggregation::EnvelopeSerializationMerger<metadata,
+                                                                      std::integral_constant<std::size_t, 1>>{})
+            .with_splitter(
+                briefkasten::aggregation::EnvelopeSerializationSplitter<std::tuple<int, int>, metadata,
+                                                                        std::integral_constant<std::size_t, 1>>{})
+            .build();
     queue.synchronous_mode();
 
     // communication
