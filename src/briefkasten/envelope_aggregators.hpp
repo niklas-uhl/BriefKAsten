@@ -120,24 +120,21 @@ struct EnvelopeMetadata {
     }
 };
 
+template <typename T>
+concept is_integral_constant = requires {
+    typename T::value_type;
+    { T::value } -> std::convertible_to<typename T::value_type>;
+};
+template <typename T, typename U>
+concept is_integral_constant_of_type = is_integral_constant<T> && std::same_as<typename T::value_type, U>;
+
 template <typename metadata = EnvelopeMetadata<EnvelopeMetadataField::size, EnvelopeMetadataField::receiver>,
           typename message_size = void>
 struct EnvelopeSerializationMerger {
-    // static_assert(
-    //     [] {
-    //         if (!metadata::contains(EnvelopeMetadataField::size)) {
-    //             if constexpr (requires {
-    //                               message_size::value;
-    //                               message_size::type;
-    //                           }) {
-    //                 return std::same_as<typename message_size::type, std::size_t>;
-    //             }
-    //             return false;
-    //         };
-    //         return true;
-    //     }(),
-    //     "When not including size in the metadata, message_size must be an integral constant of type std::size_t "
-    //     "containing the fixed message size.");
+    static_assert(
+        metadata::contains(EnvelopeMetadataField::size) || (is_integral_constant_of_type<message_size, std::size_t>),
+        "When not including size in the metadata, message_size must be an integral constant of type std::size_t "
+        "containing the fixed message size.");
 
     template <MPIBuffer BufferContainer,
               SerializableEnvelope<BufferContainer> EnvType>  // requires that both the message value type and
@@ -196,21 +193,10 @@ template <typename MessageType,
           typename metadata = EnvelopeMetadata<EnvelopeMetadataField::size, EnvelopeMetadataField::receiver>,
           typename message_size = void>
 struct EnvelopeSerializationSplitter {
-    // static_assert(
-    //     [] {
-    //         if (!metadata::contains(EnvelopeMetadataField::size)) {
-    //             if constexpr (requires {
-    //                               message_size::value;
-    //                               message_size::type;
-    //                           }) {
-    //                 return std::same_as<typename message_size::type, std::size_t>;
-    //             }
-    //             return false;
-    //         };
-    //         return true;
-    //     }(),
-    //     "When not including size in the metadata, message_size must be an integral constant of type std::size_t "
-    //     "containing the fixed message size.");
+    static_assert(
+        metadata::contains(EnvelopeMetadataField::size) || (is_integral_constant_of_type<message_size, std::size_t>),
+        "When not including size in the metadata, message_size must be an integral constant of type std::size_t "
+        "containing the fixed message size.");
 
     template <MPIBuffer BufferContainer>
     auto operator()(BufferContainer const& buffer, PEID buffer_origin, PEID my_rank) const {
