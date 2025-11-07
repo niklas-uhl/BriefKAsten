@@ -11,9 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        cxx_std: [23, 20]
-        mpi_impl: [mpich, ompi]
         build_type: [Debug, Release]
+        mpi_impl: [mpich, ompi]
+        cxx_std: [23, 20]
     steps:
       - uses: actions/checkout@v4
       - name: Setup MPI
