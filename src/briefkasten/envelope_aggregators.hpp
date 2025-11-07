@@ -128,6 +128,14 @@ concept is_integral_constant = requires {
 template <typename T, typename U>
 concept is_integral_constant_of_type = is_integral_constant<T> && std::same_as<typename T::value_type, U>;
 
+namespace meta {
+using empty = EnvelopeMetadata<>;
+using receiver = EnvelopeMetadata<EnvelopeMetadataField::receiver>;
+using receiver_and_size = EnvelopeMetadata<EnvelopeMetadataField::receiver, EnvelopeMetadataField::size>;
+template <std::size_t size>
+using fixed_size = std::integral_constant<std::size_t, size>;
+}  // namespace meta
+
 template <typename metadata = EnvelopeMetadata<EnvelopeMetadataField::size, EnvelopeMetadataField::receiver>,
           typename message_size = void>
 struct EnvelopeSerializationMerger {
