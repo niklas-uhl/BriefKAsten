@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <random>
+#include <iostream>
 
 #include "briefkasten/aggregators.hpp"
 #include "briefkasten/buffered_queue.hpp"
@@ -70,9 +71,12 @@ TEST(BufferedQueueTest, alltoall_indirect) {
     // communication
     std::vector<int> received_data;
     auto on_message = [&](auto envelope) {
+      std::vector v (envelope.message.begin(), envelope.message.end());
+      EXPECT_THAT(v, ElementsAre(comm.rank()));
 	received_data.insert(received_data.end(), envelope.message.begin(), envelope.message.end());
     };
     for (auto& element : data) {
+        // std::cout << "[R" << comm.rank() << "] send " << element << "\n";
         queue.post_message_blocking(element, element, on_message);
     }
     std::ignore = queue.terminate(on_message);

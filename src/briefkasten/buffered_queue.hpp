@@ -546,11 +546,26 @@ private:
     }
 
     void resolve_overflow_blocking(BufferMap::iterator current_buffer, MessageHandler<MessageType> auto&& on_message) {
+        unsigned int poll_rounds = 0;
+        bool infinite_loop = false;
         while (true) {
             auto res = poll(std::forward<decltype(on_message)>(on_message));
+	    if (poll_rounds > 0 && poll_rounds % 10'000'000 == 0) {
+	      std::cout << "potential infinite loop while resolving overflow on rank " << rank() << "(iteration " << poll_rounds << ")\n";
+	      infinite_loop = true;
+	      // KASSERT(false);
+	    }
+	    if (res && infinite_loop) {
+	      std::cout << std::boolalpha << "res=(" << res->first << ", " << res->second << ")\n";
+	    }
+
             if (res && res->first) {  // finished some send
+	      if (infinite_loop) {
+	      std::cout << "resolved overflow after " << poll_rounds << " rounds\n";
+	      }
                 break;
             }
+	    poll_rounds++;
         }
         // now actually resolve the overflow
         bool success = resolve_overflow(current_buffer);

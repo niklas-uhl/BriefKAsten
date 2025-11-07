@@ -24,6 +24,7 @@
 #include <limits>
 #include <optional>
 #include <ranges>
+#include <format>
 
 #include <mpi.h>
 
@@ -69,6 +70,18 @@ public:
     };
 
     auto progress_sending(SendFinishedCallback<MessageContainer> auto&& on_finished_sending) {
+      int rank = 0;
+      MPI_Comm_rank(comm_, &rank);
+      if (rank == 0) {
+	auto in_transit = in_transit_messages_ | std::views::transform([](auto const& msg) {
+	  if(msg.has_value()) {
+	    return "foo";
+	  }
+	  return "bar";
+	});
+	std::cout << std::format("in_transit {}\n", in_transit);
+	
+      }
         constexpr bool move_back_buffer = std::invocable<decltype(on_finished_sending), std::size_t, MessageContainer>;
         // check for finished sends and try starting new ones
         bool any_completed = request_pool_.test_any([&](int completed_request_index) {
