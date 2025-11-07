@@ -91,18 +91,15 @@ TEST(BufferedQueueTest, alltoall_tuple_envelope) {
     std::ranges::generate(data, [&]() { return std::tuple{distribution(generator), comm.rank_signed()}; });
 
     // init queue
-    using metadata =
-        briefkasten::aggregation::EnvelopeMetadata<briefkasten::aggregation::EnvelopeMetadataField::receiver>;
-    auto queue =
-        briefkasten::BufferedMessageQueueBuilder<std::tuple<int, int>>()
-            .with_buffer_type<int>()
-            .with_merger(
-                briefkasten::aggregation::EnvelopeSerializationMerger<metadata,
-                                                                      std::integral_constant<std::size_t, 1>>{})
-            .with_splitter(
-                briefkasten::aggregation::EnvelopeSerializationSplitter<std::tuple<int, int>, metadata,
-                                                                        std::integral_constant<std::size_t, 1>>{})
-            .build();
+    auto [merger, splitter] =
+        briefkasten::aggregation::make_envelope_merger_and_splitter<std::tuple<int, int>,
+                                                                    briefkasten::aggregation::meta::receiver,
+                                                                    briefkasten::aggregation::meta::fixed_size<1>>();
+    auto queue = briefkasten::BufferedMessageQueueBuilder<std::tuple<int, int>>()
+                     .with_buffer_type<int>()
+                     .with_merger(std::move(merger))
+                     .with_splitter(std::move(splitter))
+                     .build();
     queue.synchronous_mode();
 
     // communication
@@ -133,14 +130,14 @@ TEST(BufferedQueueTest, alltoall_indirect) {
     std::ranges::generate(data, [&]() { return distribution(generator); });
 
     // queue setup
-    briefkasten::IndirectionAdapter queue{
-        briefkasten::BufferedMessageQueueBuilder<int>()
-            // we have to use splitters and merges which encode receiver information and size,
-            // so that indirection works.
-            .with_merger(briefkasten::aggregation::EnvelopeSerializationMerger{})
-            .with_splitter(briefkasten::aggregation::EnvelopeSerializationSplitter<int>{})
-            .build(),
-        briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
+    auto [merger, splitter] = briefkasten::aggregation::make_envelope_merger_and_splitter<int>();
+    briefkasten::IndirectionAdapter queue{briefkasten::BufferedMessageQueueBuilder<int>()
+                                              // we have to use splitters and merges which encode receiver information
+                                              // and size, so that indirection works.
+                                              .with_merger(std::move(merger))
+                                              .with_splitter(std::move(splitter))
+                                              .build(),
+                                          briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
     queue.synchronous_mode();
 
     // communication
@@ -171,15 +168,15 @@ TEST(BufferedQueueTest, alltoall_indirect_tuple) {
     std::ranges::generate(data, [&]() { return std::tuple{distribution(generator), comm.rank_signed()}; });
 
     // queue setup
-    briefkasten::IndirectionAdapter queue{
-        briefkasten::BufferedMessageQueueBuilder<std::tuple<int, int>>()
-            .with_buffer_type<int>()
-            // we have to use splitters and merges which encode receiver information and size,
-            // so that indirection works.
-            .with_merger(briefkasten::aggregation::EnvelopeSerializationMerger{})
-            .with_splitter(briefkasten::aggregation::EnvelopeSerializationSplitter<std::tuple<int, int>>{})
-            .build(),
-        briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
+    auto [merger, splitter] = briefkasten::aggregation::make_envelope_merger_and_splitter<std::tuple<int, int>>();
+    briefkasten::IndirectionAdapter queue{briefkasten::BufferedMessageQueueBuilder<std::tuple<int, int>>()
+                                              .with_buffer_type<int>()
+                                              // we have to use splitters and merges which encode receiver
+                                              // information and size, so that indirection works.
+                                              .with_merger(std::move(merger))
+                                              .with_splitter(std::move(splitter))
+                                              .build(),
+                                          briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
     queue.synchronous_mode();
 
     // communication

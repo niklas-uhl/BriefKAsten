@@ -250,4 +250,13 @@ struct EnvelopeSerializationSplitter {
     }
 };
 
+template <typename MessageType,
+          typename metadata = EnvelopeMetadata<EnvelopeMetadataField::size, EnvelopeMetadataField::receiver>,
+          typename message_size = void>
+auto make_envelope_merger_and_splitter() -> std::pair<EnvelopeSerializationMerger<metadata, message_size>,
+                                             EnvelopeSerializationSplitter<MessageType, metadata, message_size>> {
+    return std::make_pair(EnvelopeSerializationMerger<metadata, message_size>{},
+                          EnvelopeSerializationSplitter<MessageType, metadata, message_size>{});
+}
+
 }  // namespace briefkasten::aggregation
