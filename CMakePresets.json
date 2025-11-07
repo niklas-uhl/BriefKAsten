@@ -1,28 +1,71 @@
 {
-    "version": 2,
-    "cmakeMinimumRequired": {
-        "major": 3,
-        "minor": 20,
-        "patch": 0
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "dev",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_FLAGS": "-Wall -Wextra -pedantic"
+      }
     },
-    "configurePresets": [{
-        "name": "debug",
-        "generator": "Ninja",
-        "binaryDir": "${sourceDir}/build",
-        "cacheVariables": {
-            "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-	    "CMAKE_BUILD_TYPE": "Debug",
-	    "CMAKE_CXX_FLAGS": "-fconcepts-diagnostics-depth=3 -Wall -Wextra -pedantic",
-	    "CMAKE_C_COMPILER": "gcc-15",
-	    "CMAKE_CXX_COMPILER": "g++-15"
-        }
-    }],
-    "buildPresets": [{
-        "name": "debug",
-        "configurePreset": "debug"
-    }],
-    "testPresets": [{
-	"name": "debug",
-	"configurePreset": "debug"
-    }]
+    {
+      "name": "cxx20",
+      "hidden": true,
+      "cacheVariables": {
+        "BRIEFKASTEN_USE_CXX23": "OFF"
+      }
+    },
+    {
+      "name": "ci",
+      "generator": "Unix Makefiles",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "-Wall -Wextra -pedantic",
+        "CMAKE_COMPILE_WARNING_AS_ERROR": "ON"
+      }
+    },
+    {
+      "name": "github-ci-build-dir",
+      "hidden": true,
+      "binaryDir": "$env{GITHUB_WORKSPACE}/build"
+    },
+    {
+      "name": "github-ci",
+      "inherits": ["ci", "github-ci-build-dir"]
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev"
+    },
+    {
+      "name": "github-ci",
+      "configurePreset": "github-ci"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev"
+    },
+    {
+      "name": "ci",
+      "hidden": true,
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "timeout": 120
+      }
+    },
+    { "name": "github-ci", "configurePreset": "github-ci", "inherits": ["ci"] }
+  ]
 }

@@ -1,0 +1,39 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "gnu-15",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc-15",
+        "CMAKE_CXX_COMPILER": "g++-15"
+      }
+    },
+    {
+      "name": "dev-macos",
+      "inherits": ["dev", "gnu-15"],
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "-fconcepts-diagnostics-depth=3 -Wall -Wextra -pedantic"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev-macos",
+      "configurePreset": "dev-macos",
+      "jobs": 4
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev-macos",
+      "configurePreset": "dev-macos"
+    }
+  ]
+}
