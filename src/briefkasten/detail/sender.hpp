@@ -73,13 +73,8 @@ public:
       int rank = 0;
       MPI_Comm_rank(comm_, &rank);
       if (rank == 0) {
-	auto in_transit = in_transit_messages_ | std::views::transform([](auto const& msg) {
-	  if(msg.has_value()) {
-	    return "foo";
-	  }
-	  return "bar";
-	});
-	std::cout << std::format("in_transit {}\n", in_transit);
+	auto in_transit = std::ranges::count_if(in_transit_messages_, [](auto const& msg) {return msg.has_value();});
+	std::cout << std::format("[R{}] in_transit {}\n", rank, in_transit);
 	
       }
         constexpr bool move_back_buffer = std::invocable<decltype(on_finished_sending), std::size_t, MessageContainer>;
