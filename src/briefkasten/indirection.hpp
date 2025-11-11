@@ -21,9 +21,9 @@
 
 #include <mpi.h>
 #include <kassert/kassert.hpp>
-#include "./buffered_queue.hpp"   // IWYU pragma: keep
 #include "./detail/concepts.hpp"  // IWYU pragma: keep
 #include "./detail/definitions.hpp"
+#include "./buffered_queue.hpp" // IWYU pragma: keep
 
 #include <kamping/measurements/timer.hpp>
 
@@ -178,19 +178,8 @@ private:
             KASSERT(envelope.receiver < this->size());
             bool should_redirect = indirection_.should_redirect(envelope.sender, envelope.receiver);
             if (should_redirect) {
-	      bool success = false;
-              while (!success) {
-                auto message = envelope.message;
-                try {
-                    post_message(std::move(message), envelope.receiver, envelope.sender, envelope.receiver,
-                                 envelope.tag);
-                } catch (std::runtime_error& e) {
-                    poll(std::forward<decltype(on_message)>(on_message));
-		    // fmt::print("message retained, retrying...\n");
-		    continue;
-                }
-		success = true;
-	      }
+                post_message_blocking(std::move(envelope.message), envelope.receiver, envelope.sender,
+                                      envelope.receiver, envelope.tag, std::forward<decltype(on_message)>(on_message));
             } else {
                 KASSERT(envelope.receiver == this->rank());
                 on_message(std::move(envelope));
