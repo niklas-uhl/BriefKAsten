@@ -31,6 +31,14 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(kamping kassert)
 
+FetchContent_Declare(fmt
+  GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+  GIT_TAG 10.1.1
+  GIT_SHALLOW ON
+  SYSTEM
+)
+FetchContent_MakeAvailable(fmt)
+
 set(try_compile_version 20)
 if(BRIEFKASTEN_USE_CXX23)
   set(try_compile_version 23)
@@ -44,7 +52,7 @@ add_library(BriefKAsten_BriefKAsten INTERFACE)
 target_sources(BriefKAsten_BriefKAsten INTERFACE FILE_SET HEADERS BASE_DIRS src)
 add_subdirectory(src/briefkasten/)
 target_link_libraries(BriefKAsten_BriefKAsten INTERFACE MPI::MPI_CXX
-                                                        kassert::kassert)
+                                                        kassert::kassert fmt::fmt)
 target_link_libraries(BriefKAsten_BriefKAsten INTERFACE kamping::kamping)
 
 if(BRIEFKASTEN_USE_CXX23)

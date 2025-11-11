@@ -134,21 +134,41 @@ public:
         return poll(on_message, [](std::size_t) {});
     }
 
+  bool verbose = false;
+
     auto poll(MessageHandler<T, MessageContainer> auto&& on_message,
               SendFinishedCallback<MessageContainer> auto&& on_finished_sending)
         -> std::optional<std::pair<bool, bool>> {
+        // receiver_.verbose = true;
         bool received_large_message = false;
         if (allow_large_messages_) {
             received_large_message =
                 large_message_receiver_.probe_for_one_message(std::forward<decltype(on_message)>(on_message));
         }
+	// bool receive_verbose_old = false;
+	// if (verbose) {
+	//   receive_verbose_old = receiver_.verbose;
+	//   receiver_.verbose = true;
+	// }
         bool received_something =
             receiver_.probe_for_messages(std::forward<decltype(on_message)>(on_message)) || received_large_message;
+	// if (verbose) {
+	//   receiver_.verbose = receive_verbose_old;
+	// }
         if (received_something) {
             reactivate();
         }
+	// sender_.verbose = true;
+	// bool sender_verbose_old = false;
+	// if (verbose) {
+	//   sender_verbose_old = sender_.verbose;
+	//   sender_.verbose = true;
+	// }
         bool send_finished_something =
             sender_.progress_sending(std::forward<decltype(on_finished_sending)>(on_finished_sending));
+	// if (verbose) {
+	//   sender_.verbose = sender_verbose_old;
+	// }
         if (send_finished_something || received_something) {
             return std::pair{send_finished_something, received_something};
         }
@@ -261,6 +281,14 @@ public:
     [[nodiscard]] bool has_send_capacity() const {
         return sender_.has_capacity();
     }
+
+  auto const& sender() const {
+    return sender_;
+  }
+
+  auto const& receiver() const {
+    return receiver_;
+  }
 
     [[nodiscard]] TerminationState termination_state() const {
         return termination_state_;

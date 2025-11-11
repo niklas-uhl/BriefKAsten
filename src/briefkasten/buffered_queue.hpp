@@ -30,6 +30,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+#include <unistd.h>
 
 #include "./aggregators.hpp"
 #include "./detail/concepts.hpp"
@@ -545,34 +546,63 @@ private:
         return false;
     }
 
+  int recursion_level = 0;
+
     void resolve_overflow_blocking(BufferMap::iterator current_buffer, MessageHandler<MessageType> auto&& on_message) {
+      recursion_level++;
         unsigned int poll_rounds = 0;
         bool infinite_loop = false;
+	bool old_verbose = false;
+
+	poll(std::forward<decltype(on_message)>(on_message));  // initial poll to kick things off
+	bool success = resolve_overflow(current_buffer);
+	if (success) {
+	  recursion_level--;
+	  return;
+	}
+	
         while (true) {
-            auto res = poll(std::forward<decltype(on_message)>(on_message));
+	    auto res = poll(std::forward<decltype(on_message)>(on_message));
 	    if (poll_rounds > 0 && poll_rounds % 10'000'000 == 0) {
-	      std::cout << "potential infinite loop while resolving overflow on rank " << rank() << "(iteration " << poll_rounds << ")\n";
+	      auto in_transit = queue_.sender().in_transit() | std::views::transform([](auto const& msg) {
+		return msg.has_value() ? fmt::format("{} to {}", msg->receipt, msg->destination) : std::string("empty");
+	      });
+	      auto active = queue_.receiver().active();
+	      auto pid = getpid();
+	      if (queue_.rank() < 5) {
+	      fmt::print("[R{}@{}] potential infinite loop while resolving overflow (iteration {})\n"
+			 "in-transit messages: {}\n"
+			 "active receives: {}\n"
+			 "recursion level: {}\n"
+			 , rank(), pid, poll_rounds, in_transit, active, recursion_level);
+	      }
 	      infinite_loop = true;
+	      // old_verbose = queue_.verbose;
+	      // queue_.verbose = true;
 	      // KASSERT(false);
 	    }
-	    if (res && infinite_loop) {
-	      std::cout << std::boolalpha << "res=(" << res->first << ", " << res->second << ")\n";
+	    success = resolve_overflow(current_buffer);
+	    if (success) {
+	      
+	      break;
 	    }
-
-            if (res && res->first) {  // finished some send
-	      if (infinite_loop) {
-	      std::cout << "resolved overflow after " << poll_rounds << " rounds\n";
-	      }
-                break;
-            }
+	    // if (res && infinite_loop) {
+	    //   std::cout << std::boolalpha << "res=(" << res->first << ", " << res->second << ")\n";
+	    // }
+	    
+            // if (res && res->first) {  // finished some send
+  	    //     // queue_.verbose = old_verbose;
+            //     break;
+            // }
 	    poll_rounds++;
         }
-        // now actually resolve the overflow
-        bool success = resolve_overflow(current_buffer);
-        if (success) {
-            return;
-        }
-        throw std::runtime_error("Failed to resolve overflow in post_message_blocking. This should not happen.");
+	recursion_level--;
+	// now actually resolve the overflow
+        // bool success = resolve_overflow(current_buffer);
+        // if (success) {
+        //     return;
+        // }
+        // throw std::runtime_error("Failed to resolve overflow in post_message_blocking. This should not happen.");
     }
     void resolve_overflow_blocking(MessageHandler<MessageType> auto&& on_message) {
         resolve_overflow_blocking(buffers_.end(), std::forward<decltype(on_message)>(on_message));

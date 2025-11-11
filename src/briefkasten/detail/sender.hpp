@@ -26,6 +26,11 @@
 #include <ranges>
 #include <format>
 
+#include <fmt/format.h>
+#include <fmt/ranges.h>
+
+
+
 #include <mpi.h>
 
 #include "./concepts.hpp"
@@ -49,7 +54,7 @@ public:
         flush_out_buffer();  // try to send as many as possible
 
         std::size_t receipt = next_receipt_id_;
-        BufferedMessage msg{.message = InTransitMessage{.receipt = receipt, .message = std::move(message)},
+        BufferedMessage msg{.message = InTransitMessage{.receipt = receipt, .message = std::move(message), .destination = destination},
                             .destination = destination,
                             .tag = tag};
 
@@ -69,14 +74,23 @@ public:
         return receipt;
     };
 
+  bool verbose = false;
+
+  auto const& in_transit() const {
+    return in_transit_messages_;
+  }
+
     auto progress_sending(SendFinishedCallback<MessageContainer> auto&& on_finished_sending) {
       int rank = 0;
       MPI_Comm_rank(comm_, &rank);
-      if (rank == 0) {
-	auto in_transit = std::ranges::count_if(in_transit_messages_, [](auto const& msg) {return msg.has_value();});
-	std::cout << std::format("[R{}] in_transit {}\n", rank, in_transit);
+      // if (verbose) {
+	// auto in_transit = in_transit_messages_ | std::views::transform([](auto const& msg) {
+	//   return msg.has_value() ? fmt::format("{} to {}", msg->receipt, msg->destination) : std::string("empty");
+	// });
+	//   // [](auto const& msg) {return msg.and_then([](auto const& val) {return val.receipt;});};
+	// std::cout << fmt::format("[R{}] in_transit {}\n", rank, in_transit);
 	
-      }
+      // }
         constexpr bool move_back_buffer = std::invocable<decltype(on_finished_sending), std::size_t, MessageContainer>;
         // check for finished sends and try starting new ones
         bool any_completed = request_pool_.test_any([&](int completed_request_index) {
@@ -117,6 +131,7 @@ private:
     struct InTransitMessage {
         std::size_t receipt;
         MessageContainer message;
+      PEID destination;
     };
     struct BufferedMessage {
         InTransitMessage message;

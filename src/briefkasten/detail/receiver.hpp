@@ -28,6 +28,9 @@
 #include <mpi.h>
 #include <kamping/mpi_datatype.hpp>
 
+#include <fmt/format.h>
+#include <fmt/ranges.h>
+
 #include "./concepts.hpp"
 #include "./termination_counter.hpp"
 
@@ -67,6 +70,7 @@ public:
         : comm_(comm),
           tag_(tag),
           receive_requests_(num_receive_slots, MPI_REQUEST_NULL),
+	  active_(num_receive_slots, false),
           receive_buffers_(num_receive_slots),
           statuses_(1, std::vector<MPI_Status>(num_receive_slots)),
           indices_(1, std::vector<int>(num_receive_slots)),
@@ -78,7 +82,7 @@ public:
 #else
         namespace views = std::views;
 #endif
-        for (auto [request, buffer] : views::zip(receive_requests_, receive_buffers_)) {
+        for (auto [request, active, buffer] : views::zip(receive_requests_, active_, receive_buffers_)) {
             buffer.resize(reserved_receive_buffer_size);
 #if MPI_VERSION >= 4
             MPI_Recv_init_c(buffer.data(),                        // buf
@@ -100,6 +104,7 @@ public:
             );
 #endif
             MPI_Start(&request);
+	    active = true;
         }
     }
 
@@ -159,7 +164,23 @@ public:
         return true;
     }
 
+  bool verbose = false;
+
+  auto const& active() const {
+    return active_;
+  }
+
     bool probe_for_messages(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
+      // if (probe_recursion_depth_ > 0) {
+      // 	return false;
+      // }
+      // if (verbose) {
+	// if (std::ranges::count(active_, true) == 0) {
+      // if (rank == 0) {
+	// std::cout << fmt::format("[R{}] active receives {} (depth={})\n", rank_, active_, probe_recursion_depth_);
+      // }
+	// }
+      // }
         // calling probe for messages recursively (i.e. via indirection), might lead to corruption of indices and
         // statuses buffers. Therefore we track the recursion depth and allocate more buffers if needed.
         // TODO: make this scope guarded
@@ -179,6 +200,9 @@ public:
             return false;
         }
         auto indices = std::span(indices_buf).first(num_completed);
+	for (auto idx : indices) {
+	  active_[idx] = false;
+	}
         auto statuses = std::span(statuses_buf).first(num_completed);
         auto buffers = indices | std::views::transform([&](int index) -> auto& { return receive_buffers_[index]; });
         auto requests = indices | std::views::transform([&](int index) -> auto& { return receive_requests_[index]; });
@@ -188,11 +212,13 @@ public:
 #else
         namespace views = std::views;
 #endif
-        for (auto [buffer, status, request] : views::zip(buffers, statuses, requests)) {
+        for (auto [idx, buffer, status, request] : views::zip(indices, buffers, statuses, requests)) {
+	  // active_[idx] = false;
             termination_->track_receive();
             auto envelope = internal::build_envelope(buffer, status, rank_);
             on_message(std::move(envelope));
             MPI_Start(&request);
+	    active_[idx] = true;
         }
         unstep_probe_recursion();
         return true;
@@ -251,6 +277,7 @@ private:
     MPI_Comm comm_;
     int tag_;
     std::vector<MPI_Request> receive_requests_;
+    std::vector<bool> active_;
     std::vector<ReceiveBufferContainer> receive_buffers_;
     std::vector<std::vector<MPI_Status>> statuses_;
     std::vector<std::vector<int>> indices_;
