@@ -126,7 +126,7 @@ public:
 
     [[nodiscard]] bool has_capacity() const {
         if (out_buffer_capacity_ == std::numeric_limits<std::size_t>::max()) {
-	    fmt::print("with bounded, would have returned {}", out_buffer_.size() < out_buffer_capacity_ || request_pool_.inactive_requests() > 0);
+	    // fmt::print("with bounded, would have returned {}", out_buffer_.size() < out_buffer_capacity_ || request_pool_.inactive_requests() > 0);
             return true;
         }
         return out_buffer_.size() < out_buffer_capacity_ || request_pool_.inactive_requests() > 0;
