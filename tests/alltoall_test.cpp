@@ -4,6 +4,7 @@
 #include <kamping/communicator.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <random>
 #include <iostream>
 
@@ -58,6 +59,8 @@ TEST(BufferedQueueTest, alltoall_indirect) {
     std::ranges::generate(data, [&]() { return distribution(generator); });
 
     // queue setup
+    briefkasten::Config config;
+    config.out_buffer_capacity = std::numeric_limits<std::size_t>::max();
     briefkasten::IndirectionAdapter queue{
         briefkasten::BufferedMessageQueueBuilder<int>()
             // we have to use splitters and merges which encode receiver information and size,
