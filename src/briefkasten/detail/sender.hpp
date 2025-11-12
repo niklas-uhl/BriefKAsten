@@ -52,10 +52,12 @@ public:
     ~Sender() {
         int rank = 0;
         MPI_Comm_rank(comm_, &rank);
-	if (out_buffer_.size() > 0) {
-            fmt::print("[R{}] out_buffer.size()={}\n", rank, out_buffer_.size());
-	}
+	// if (out_buffer_.size() > 0) {
+            fmt::print("[R{}] max out buffer size was {}\n", rank, max_out_buffer_size_);
+	// }
     }
+
+  std::size_t max_out_buffer_size_ = 0;
 
     std::optional<std::size_t> enqueue_for_sending(MessageContainer&& message, PEID destination, int tag) {
         flush_out_buffer();  // try to send as many as possible
@@ -74,6 +76,7 @@ public:
         } else if (out_buffer_.size() < out_buffer_capacity_) {
             // buffer the message
             out_buffer_.emplace_back(std::move(msg));
+	    max_out_buffer_size_ = std::max(max_out_buffer_size_, out_buffer_.size());
         } else {
             // no room for buffering or sending
             return std::nullopt;
