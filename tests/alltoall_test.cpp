@@ -62,7 +62,7 @@ TEST(BufferedQueueTest, alltoall_indirect) {
     briefkasten::Config config;
     config.out_buffer_capacity = std::numeric_limits<std::size_t>::max();
     briefkasten::IndirectionAdapter queue{
-        briefkasten::BufferedMessageQueueBuilder<int>()
+        briefkasten::BufferedMessageQueueBuilder<int>(config)
             // we have to use splitters and merges which encode receiver information and size,
             // so that indirection works.
             .with_merger(briefkasten::aggregation::EnvelopeSerializationMerger{})
