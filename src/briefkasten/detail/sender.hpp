@@ -52,7 +52,9 @@ public:
     ~Sender() {
         int rank = 0;
         MPI_Comm_rank(comm_, &rank);
-        fmt::print("[R{}] out_buffer.size()={}\n", rank, out_buffer_.size());
+	if (out_buffer_.size() > 0) {
+            fmt::print("[R{}] out_buffer.size()={}\n", rank, out_buffer_.size());
+	}
     }
 
     std::optional<std::size_t> enqueue_for_sending(MessageContainer&& message, PEID destination, int tag) {
@@ -124,6 +126,7 @@ public:
 
     [[nodiscard]] bool has_capacity() const {
         if (out_buffer_capacity_ == std::numeric_limits<std::size_t>::max()) {
+	    fmt::print("with bounded, would have returned {}", out_buffer_.size() < out_buffer_capacity_ || request_pool_.inactive_requests() > 0);
             return true;
         }
         return out_buffer_.size() < out_buffer_capacity_ || request_pool_.inactive_requests() > 0;
