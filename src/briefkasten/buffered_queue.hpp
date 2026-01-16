@@ -480,8 +480,6 @@ private:
                 flush_buffer_impl(it, it != current_buffer);  // we should not use `it` after that, in case we do
             if (current_flush_successful) {
                 flushed_something = true;
-                // it = new_it;
-                // current_flush_successful = true;
             } else {
                 if (break_when_flush_fails) {
                     return flushed_something;
