@@ -431,36 +431,37 @@ private:
             false);
     }
 
-    /// @return an iterator to the next buffer, or the input iterator if flushing failed
-    auto flush_buffer_impl(BufferMap::iterator buffer_it, bool erase = true) -> BufferMap::iterator {
+    /// @return an iterator to the next buffer (and true), or the input iterator (and false) if flushing failed
+    auto flush_buffer_impl(BufferMap::iterator buffer_it, bool erase = true)
+        -> std::pair<typename BufferMap::iterator, bool> {
         KASSERT(buffer_it != buffers_.end(), "Trying to flush non-existing buffer.");
         auto& [receiver, buffer] = *buffer_it;
         if (buffer.empty()) {
             if (erase) {
-                return buffers_.erase(buffer_it);
+                return {buffers_.erase(buffer_it), true};
             }
-            return ++buffer_it;
+            return {++buffer_it, true};
         }
         auto pre_cleanup_buffer_size = buffer.size();
         pre_send_cleanup(buffer, receiver);
         // we don't send if the cleanup has emptied the buffer
         if (buffer.empty()) {
             if (erase) {
-                return buffers_.erase(buffer_it);
+                return {buffers_.erase(buffer_it), true};
             }
-            return ++buffer_it;
+            return {++buffer_it, true};
         }
         if (!queue_.has_send_capacity()) {
-            return buffer_it;
+            return {buffer_it, false};
         }
         auto receipt = queue_.post_message(std::move(buffer_it->second), receiver);
         KASSERT(receipt.has_value(),
                 "We checked before that there is capacity, so posting the message should not fail.");
         global_buffer_size_ -= pre_cleanup_buffer_size;
         if (erase) {
-            return buffers_.erase(buffer_it);
+            return {buffers_.erase(buffer_it), true};
         }
-        return ++buffer_it;
+        return {++buffer_it, true};
     }
 
     /// if post_flush_hook return true, this breaks the loop
@@ -475,11 +476,12 @@ private:
         while (it != buffers_.end()) {
             pre_flush_hook();
             bool current_flush_successful = false;
-            auto new_it = flush_buffer_impl(it, it != current_buffer);
-            if (new_it != it) {
+            std::tie(it, current_flush_successful) =
+                flush_buffer_impl(it, it != current_buffer);  // we should not use `it` after that, in case we do
+            if (current_flush_successful) {
                 flushed_something = true;
-                it = new_it;
-                current_flush_successful = true;
+                // it = new_it;
+                // current_flush_successful = true;
             } else {
                 if (break_when_flush_fails) {
                     return flushed_something;
@@ -505,7 +507,7 @@ private:
         });
         if (largest_buffer != buffers_.end()) {
             auto it = flush_buffer_impl(largest_buffer, largest_buffer != current_buffer);
-            return it != largest_buffer;
+            return it.second;
         }
         return true;
     }
@@ -528,7 +530,7 @@ private:
         switch (flush_strategy_) {
             case FlushStrategy::local: {
                 auto ret = flush_buffer_impl(current_buffer, /*erase=*/false);
-                return ret != current_buffer;
+                return ret.second;
             }
             case FlushStrategy::global: {
                 return flush_all_buffers_impl(current_buffer, [] {}, [] { return false; });
