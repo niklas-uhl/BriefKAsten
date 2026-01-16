@@ -175,16 +175,17 @@ public:
 
     /// Flush buffer for \p receiver. If the buffer is empty, or does not exist, this is a no-op.
     /// \param receiver The rank of the receiver
-    /// \return true if the buffer had some data to flush, false otherwise
+    /// \return true if the buffer had some data to flush and succeeded, false otherwise
     bool flush_buffer(PEID receiver) {
         auto it = buffers_.find(receiver);
         if (it != buffers_.end()) {
-            bool buffer_was_empty = it->second.empty();
+            // bool buffer_was_empty = it->second.empty();
             auto new_it = flush_buffer_impl(it);
+	    return new_it.second;
             // if (new_it == it) {
             //   return false;
             // }
-            return buffer_was_empty;
+            // return buffer_was_empty;
         }
         return false;
     }
