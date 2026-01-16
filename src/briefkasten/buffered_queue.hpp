@@ -477,7 +477,7 @@ private:
             pre_flush_hook();
             bool current_flush_successful = false;
             std::tie(it, current_flush_successful) =
-                flush_buffer_impl(it, it != current_buffer);  // we should not use `it` after that, in case we do
+                flush_buffer_impl(it, it != current_buffer);  // iterator `it` is updated by std::tie; do not use its previous value after this call
             if (current_flush_successful) {
                 flushed_something = true;
             } else {
