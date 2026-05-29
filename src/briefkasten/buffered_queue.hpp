@@ -372,6 +372,7 @@ private:
         }
         KASSERT(!free_aggregation_buffers_.empty());
         auto buffer = std::move(free_aggregation_buffers_.back());
+	free_aggregation_buffers_.pop_back();
         return buffer;
     };
 
