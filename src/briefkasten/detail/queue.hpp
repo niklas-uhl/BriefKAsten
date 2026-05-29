@@ -92,10 +92,10 @@ public:
         comm_ = other.comm_;
         SMALL_MESSAGE_TAG = other.SMALL_MESSAGE_TAG;
         LARGE_MESSAGE_TAG = other.LARGE_MESSAGE_TAG;
-        termination_ = std::move(termination_);
+        termination_ = std::move(other.termination_);
         sender_ = std::move(other.sender_);
         receiver_ = std::move(other.receiver_);
-        large_message_receiver_ = std::move(large_message_receiver_);
+        large_message_receiver_ = std::move(other.large_message_receiver_);
         reserved_receive_buffer_size_ = other.reserved_receive_buffer_size_;
         rank_ = other.rank_;
         size_ = other.size_;
