@@ -448,8 +448,12 @@ private:
         pre_send_cleanup(buffer, receiver);
         // we don't send if the cleanup has emptied the buffer
         if (buffer.empty()) {
+            global_buffer_size_ -= pre_cleanup_buffer_size;
             if (erase) {
-                return {aggregation_buffers_.erase(buffer_it), true};
+                BufferContainer container = std::move(buffer_it->second);
+                auto next = aggregation_buffers_.erase(buffer_it);
+                free_aggregation_buffers_.emplace_back(std::move(container));
+                return {next, true};
             }
             return {++buffer_it, true};
         }
