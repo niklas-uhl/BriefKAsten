@@ -346,7 +346,7 @@ private:
     // NOLINTNEXTLINE(*-easily-swappable-parameters)
     void reserve_aggregation_buffers(std::size_t num_buffers, std::size_t buffer_size) {
         if (num_aggregation_buffers_ + num_buffers > max_num_aggregation_buffers_) {
-            throw std::runtime_error("Exceeded maximum number of send buffers.");
+            throw std::runtime_error("Exceeded maximum number of aggregation buffers.");
         }
         auto old_size = free_aggregation_buffers_.size();
         free_aggregation_buffers_.resize(old_size + num_buffers);
