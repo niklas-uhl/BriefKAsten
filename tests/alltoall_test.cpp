@@ -4,6 +4,7 @@
 #include <kamping/communicator.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <random>
 
 #include "briefkasten/aggregators.hpp"
@@ -38,6 +39,7 @@ TEST(BufferedQueueTest, alltoall) {
         queue.post_message_blocking(element, element, on_message);
     }
     std::ignore = queue.terminate(on_message);
+    std::cout << "num_allocated_buffers=" << queue.num_allocated_buffers() << "\n";
 
     // tests
     EXPECT_THAT(received_data, Each(Eq(comm.rank())));
@@ -57,8 +59,10 @@ TEST(BufferedQueueTest, alltoall_indirect) {
     std::ranges::generate(data, [&]() { return distribution(generator); });
 
     // queue setup
+    briefkasten::Config conf;
+    conf.max_num_aggregation_buffers = std::numeric_limits<std::size_t>::max();
     briefkasten::IndirectionAdapter queue{
-        briefkasten::BufferedMessageQueueBuilder<int>()
+        briefkasten::BufferedMessageQueueBuilder<int>(conf)
             // we have to use splitters and merges which encode receiver information and size,
             // so that indirection works.
             .with_merger(briefkasten::aggregation::EnvelopeSerializationMerger{})
@@ -76,6 +80,7 @@ TEST(BufferedQueueTest, alltoall_indirect) {
         queue.post_message_blocking(element, element, on_message);
     }
     std::ignore = queue.terminate(on_message);
+    std::cout << "num_allocated_buffers=" << queue.num_allocated_buffers() << "\n";
 
     // tests
     EXPECT_THAT(received_data, Each(Eq(comm.rank())));
