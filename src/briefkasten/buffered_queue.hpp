@@ -323,6 +323,10 @@ public:
         queue_.synchronous_mode(use_it);
     }
 
+  auto num_allocated_buffers() {
+    return num_aggregation_buffers_;
+  }
+
 private:
     using BufferMap = std::unordered_map<PEID, BufferContainer>;
     using BufferList = std::vector<BufferContainer>;
@@ -364,7 +368,7 @@ private:
                 // Heuristic: at quota with no free buffer → flush one.
                 // It won’t free capacity immediately, but once the send
                 // completes the buffer will be recycled via reclaim_aggregation_buffer
-                if (aggregation_buffers_.size() - 1 >= max_num_aggregation_buffers_ /* minus the buffer we try to create */) {
+                if (aggregation_buffers_.size() >= max_num_aggregation_buffers_) {
                     flush_largest_buffer();
                 }
                 return std::nullopt;
