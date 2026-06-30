@@ -181,7 +181,7 @@ public:
         if (it != aggregation_buffers_.end()) {
             // bool buffer_was_empty = it->second.empty();
             auto new_it = flush_buffer_impl(it);
-	    return new_it.second;
+            return new_it.second;
             // if (new_it == it) {
             //   return false;
             // }
@@ -211,7 +211,9 @@ public:
                         std::size_t poll_skip_threshold = DEFAULT_POLL_SKIP_THRESHOLD) {
         return queue_.poll_throttled(
             split_handler(on_message),
-            [&](std::size_t receipt, BufferContainer buffer) { reclaim_aggregation_buffer(receipt, std::move(buffer)); },
+            [&](std::size_t receipt, BufferContainer buffer) {
+                reclaim_aggregation_buffer(receipt, std::move(buffer));
+            },
             poll_skip_threshold);
     }
 
@@ -231,7 +233,9 @@ public:
         };
         bool ret = queue_.terminate(
             split_handler(on_message),
-            [&](std::size_t receipt, BufferContainer buffer) { reclaim_aggregation_buffer(receipt, std::move(buffer)); },
+            [&](std::size_t receipt, BufferContainer buffer) {
+                reclaim_aggregation_buffer(receipt, std::move(buffer));
+            },
             before_next_message_counting_round_hook, progress_hook);
         return ret;
     }
@@ -245,8 +249,9 @@ public:
     }
 
     bool progress_sending() {
-        return queue_.progress_sending(
-            [&](std::size_t receipt, BufferContainer buffer) { reclaim_aggregation_buffer(receipt, std::move(buffer)); });
+        return queue_.progress_sending([&](std::size_t receipt, BufferContainer buffer) {
+            reclaim_aggregation_buffer(receipt, std::move(buffer));
+        });
     }
 
     bool probe_for_messages(MessageHandler<MessageType> auto&& on_message) {
@@ -323,9 +328,9 @@ public:
         queue_.synchronous_mode(use_it);
     }
 
-  auto num_allocated_buffers() {
-    return num_aggregation_buffers_;
-  }
+    auto num_allocated_buffers() {
+        return num_aggregation_buffers_;
+    }
 
 private:
     using BufferMap = std::unordered_map<PEID, BufferContainer>;
@@ -354,7 +359,8 @@ private:
         }
         auto old_size = free_aggregation_buffers_.size();
         free_aggregation_buffers_.resize(old_size + num_buffers);
-        for (auto& buf : std::ranges::subrange(free_aggregation_buffers_.begin() + old_size, free_aggregation_buffers_.end())) {
+        for (auto& buf :
+             std::ranges::subrange(free_aggregation_buffers_.begin() + old_size, free_aggregation_buffers_.end())) {
             num_aggregation_buffers_++;
             buf.reserve(buffer_size);
         }
@@ -376,7 +382,7 @@ private:
         }
         KASSERT(!free_aggregation_buffers_.empty());
         auto buffer = std::move(free_aggregation_buffers_.back());
-	free_aggregation_buffers_.pop_back();
+        free_aggregation_buffers_.pop_back();
         return buffer;
     };
 
@@ -477,17 +483,19 @@ private:
     /// if post_flush_hook return true, this breaks the loop
     template <typename PreFlushHook, typename PostFlushHook>
         requires std::invocable<PreFlushHook> && (std::predicate<PostFlushHook> || std::predicate<PostFlushHook, bool>)
-    bool flush_all_aggregation_buffers_impl(BufferMap::iterator current_buffer,
-                                PreFlushHook&& pre_flush_hook,    // NOLINT(cppcoreguidelines-missing-std-forward)
-                                PostFlushHook&& post_flush_hook,  // NOLINT(cppcoreguidelines-missing-std-forward)
-                                bool break_when_flush_fails = true) {
+    bool flush_all_aggregation_buffers_impl(
+        BufferMap::iterator current_buffer,
+        PreFlushHook&& pre_flush_hook,    // NOLINT(cppcoreguidelines-missing-std-forward)
+        PostFlushHook&& post_flush_hook,  // NOLINT(cppcoreguidelines-missing-std-forward)
+        bool break_when_flush_fails = true) {
         auto it = aggregation_buffers_.begin();
         bool flushed_something = false;
         while (it != aggregation_buffers_.end()) {
             pre_flush_hook();
             bool current_flush_successful = false;
             std::tie(it, current_flush_successful) =
-                flush_buffer_impl(it, it != current_buffer);  // iterator `it` is updated by std::tie; do not use its previous value after this call
+                flush_buffer_impl(it, it != current_buffer);  // iterator `it` is updated by std::tie; do not use its
+                                                              // previous value after this call
             if (current_flush_successful) {
                 flushed_something = true;
             } else {
@@ -510,9 +518,9 @@ private:
     }
 
     [[nodiscard]] bool flush_largest_buffer_impl(BufferMap::iterator current_buffer) {
-        auto largest_buffer = std::max_element(aggregation_buffers_.begin(), aggregation_buffers_.end(), [](auto& lhs, auto& rhs) {
-            return lhs.second.size() < rhs.second.size();
-        });
+        auto largest_buffer =
+            std::max_element(aggregation_buffers_.begin(), aggregation_buffers_.end(),
+                             [](auto& lhs, auto& rhs) { return lhs.second.size() < rhs.second.size(); });
         if (largest_buffer != aggregation_buffers_.end()) {
             auto it = flush_buffer_impl(largest_buffer, largest_buffer != current_buffer);
             return it.second;

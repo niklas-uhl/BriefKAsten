@@ -21,9 +21,9 @@
 
 #include <mpi.h>
 #include <kassert/kassert.hpp>
+#include "./buffered_queue.hpp"   // IWYU pragma: keep
 #include "./detail/concepts.hpp"  // IWYU pragma: keep
 #include "./detail/definitions.hpp"
-#include "./buffered_queue.hpp" // IWYU pragma: keep
 
 #include <kamping/measurements/timer.hpp>
 
@@ -35,14 +35,16 @@ concept IndirectionScheme = requires(T scheme, MPI_Comm comm, PEID sender, PEID 
 };
 
 template <IndirectionScheme Indirector, typename BufferedQueueType>
-class IndirectionAdapter : public BufferedQueueType {
+class IndirectionAdapter {
 private:
     using queue_type = BufferedQueueType;
     using MessageType = typename queue_type::message_type;
 
+    queue_type queue_;
+
 public:
     IndirectionAdapter(BufferedQueueType queue, Indirector indirector)
-        : BufferedQueueType(std::move(queue)), indirection_(std::move(indirector)) {}
+        : queue_(std::move(queue)), indirection_(std::move(indirector)) {}
 
     auto& indirection_scheme() {
         return indirection_;
@@ -62,8 +64,8 @@ public:
         if (!direct_send) {
             next_hop = indirection_.next_hop(envelope_sender, envelope_receiver);
         }
-        return queue_type::post_message(std::forward<decltype(message)>(message), next_hop, envelope_sender,
-                                        envelope_receiver, tag);
+        return queue_.post_message(std::forward<decltype(message)>(message), next_hop, envelope_sender,
+                                   envelope_receiver, tag);
     }
 
     /// Note: messages have to be passed as rvalues. If you want to send static
@@ -93,9 +95,9 @@ public:
         if (!direct_send) {
             next_hop = indirection_.next_hop(envelope_sender, envelope_receiver);
         }
-        return queue_type::post_message_blocking(std::forward<decltype(message)>(message), next_hop, envelope_sender,
-                                                 envelope_receiver, tag,
-                                                 redirection_handler(std::forward<decltype(on_message)>(on_message)));
+        return queue_.post_message_blocking(std::forward<decltype(message)>(message), next_hop, envelope_sender,
+                                            envelope_receiver, tag,
+                                            redirection_handler(std::forward<decltype(on_message)>(on_message)));
     }
 
     /// Note: messages have to be passed as rvalues. If you want to send static
@@ -124,13 +126,13 @@ public:
     /// called.
     auto poll(MessageHandler<typename queue_type::message_type> auto&& on_message)
         -> std::optional<std::pair<bool, bool>> {
-        return queue_type::poll(redirection_handler(std::forward<decltype(on_message)>(on_message)));
+        return queue_.poll(redirection_handler(std::forward<decltype(on_message)>(on_message)));
     }
 
     auto poll_throttled(MessageHandler<MessageType> auto&& on_message,
                         std::size_t poll_skip_threshold = DEFAULT_POLL_SKIP_THRESHOLD) {
-        return queue_type::poll_throttled(redirection_handler(std::forward<decltype(on_message)>(on_message)),
-                                          poll_skip_threshold);
+        return queue_.poll_throttled(redirection_handler(std::forward<decltype(on_message)>(on_message)),
+                                     poll_skip_threshold);
     }
 
     /// Note: Message handlers take a MessageEnvelope as single argument. The Envelope
@@ -145,31 +147,48 @@ public:
     /// called.
     [[nodiscard]] bool terminate(MessageHandler<typename queue_type::message_type> auto&& on_message,
                                  std::invocable<> auto&& progress_hook) {
-        return queue_type::terminate(redirection_handler(std::forward<decltype(on_message)>(on_message)),
-                                     progress_hook);
+        return queue_.terminate(redirection_handler(std::forward<decltype(on_message)>(on_message)), progress_hook);
     }
 
     bool probe_for_messages(MessageHandler<typename queue_type::message_type> auto&& on_message) {
-        return queue_type::probe_for_messages(redirection_handler(std::forward<decltype(on_message)>(on_message)));
+        return queue_.probe_for_messages(redirection_handler(std::forward<decltype(on_message)>(on_message)));
     }
 
     bool probe_for_one_message(MessageHandler<typename queue_type::message_type> auto&& on_message,
                                PEID source = MPI_ANY_SOURCE,
                                int tag = MPI_ANY_TAG) {
-        return queue_type::probe_for_one_message(redirection_handler(std::forward<decltype(on_message)>(on_message)),
-                                                 source, tag);
+        return queue_.probe_for_one_message(redirection_handler(std::forward<decltype(on_message)>(on_message)), source,
+                                            tag);
     }
 
     void global_threshold_bytes(std::size_t new_threshold,
                                 MessageHandler<typename queue_type::message_type> auto&& on_message) {
-        queue_type::global_threshold_bytes(new_threshold,
-                                           redirection_handler(std::forward<decltype(on_message)>(on_message)));
+        queue_.global_threshold_bytes(new_threshold,
+                                      redirection_handler(std::forward<decltype(on_message)>(on_message)));
     }
 
     void local_threshold_bytes(std::size_t new_threshold,
                                MessageHandler<typename queue_type::message_type> auto&& on_message) {
-        queue_type::local_threshold_bytes(new_threshold,
-                                          redirection_handler(std::forward<decltype(on_message)>(on_message)));
+        queue_.local_threshold_bytes(new_threshold,
+                                     redirection_handler(std::forward<decltype(on_message)>(on_message)));
+    }
+
+    [[nodiscard]] PEID rank() const {
+        return queue_.rank();
+    }
+
+    [[nodiscard]] PEID size() const {
+        return queue_.size();
+    }
+
+    /// if this mode is active, no incoming messages will cancel the termination process
+    /// this allows using the queue as a somewhat async sparse-all-to-all
+    void synchronous_mode(bool use_it = true) {
+        queue_.synchronous_mode(use_it);
+    }
+
+    auto num_allocated_buffers() {
+        return queue_.num_allocated_buffers();
     }
 
 private:
