@@ -214,7 +214,7 @@ public:
             MPI_Test_cancelled(&status, &cancelled);
             if (!cancelled) {
                 termination_->track_receive();
-                auto envelope = build_envelope(buffer, status);
+                auto envelope = build_envelope(buffer, status, rank_);
                 on_message(std::move(envelope));
             }
             MPI_Request_free(&request);
@@ -254,7 +254,7 @@ private:
     std::vector<ReceiveBufferContainer> receive_buffers_;
     std::vector<std::vector<MPI_Status>> statuses_;
     std::vector<std::vector<int>> indices_;
-    int probe_recursion_depth_ = 0;
+    int probe_recursion_depth_ = 0;  // FIXME step_probe_recursion increments before use, so statuses_[0]/indices_[0] are never accessed
     internal::TerminationCounter* termination_;
     int rank_ = 0;
 };

@@ -46,12 +46,16 @@ public:
         return receiver != rank();
     }
 
+    /// Number of column-groups, i.e. the first-hop fan-out: a rank sends to one proxy per column within its row.
     [[nodiscard]] auto num_groups() const -> std::size_t {
         return grid_size_;
     }
 
+    /// Size of a column-group (number of rows), i.e. the second-hop fan-out: a proxy forwards within a column to every
+    /// final receiver in it. For a non-square grid this exceeds num_groups by up to one, and it is >= both hops'
+    /// fan-out, so callers can use it as a single conservative bound for sizing both hop queues.
     [[nodiscard]] auto group_size() const -> std::size_t {
-        return grid_size_;
+        return (static_cast<std::size_t>(my_size_) + grid_size_ - 1) / grid_size_;
     }
 
 private:

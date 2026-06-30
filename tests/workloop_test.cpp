@@ -32,7 +32,9 @@ TEST(BufferedQueueTest, workloop) {
         std::vector<int> task{ttl_distribution(generator), 0};
         tasks.push_back(std::move(task));
     }
-    auto queue = briefkasten::BufferedMessageQueueBuilder<int>()
+    briefkasten::Config conf;
+    // conf.max_num_aggregation_buffers = std::numeric_limits<std::size_t>::max();
+    auto queue = briefkasten::BufferedMessageQueueBuilder<int>(conf)
                      .with_merger(briefkasten::aggregation::SentinelMerger<int>(-1))
                      .with_splitter(briefkasten::aggregation::SentinelSplitter<int>(-1))
                      .build();
@@ -51,7 +53,7 @@ TEST(BufferedQueueTest, workloop) {
                 task.push_back(comm.rank_signed());  // Append rank to task
                 int branching_factor = distribution(generator);
                 for (int i = 0; i < branching_factor; ++i) {
-                    briefkasten::PEID receiver = comm.rank_signed();
+                    briefkasten::PEID receiver = rank_distribution(generator);
                     queue.post_message_blocking(std::ranges::ref_view(task), receiver, on_message);
                 }
             } else {
@@ -61,6 +63,7 @@ TEST(BufferedQueueTest, workloop) {
             queue.poll_throttled(on_message);
         }
     } while (!queue.terminate(on_message));
+    comm.barrier();
 }
 
 TEST(BufferedQueueTest, workloop_indirect) {
@@ -81,8 +84,11 @@ TEST(BufferedQueueTest, workloop_indirect) {
         std::vector<int> task{ttl_distribution(generator), 0};
         tasks.push_back(std::move(task));
     }
+
+    briefkasten::Config conf;
+    // bounded aggregation buffers (default): the two-queue indirection must work without the unbounded workaround.
     briefkasten::IndirectionAdapter queue{
-        briefkasten::BufferedMessageQueueBuilder<int>()
+        briefkasten::BufferedMessageQueueBuilder<int>(conf)
             .with_merger(briefkasten::aggregation::EnvelopeSerializationMerger{})
             .with_splitter(briefkasten::aggregation::EnvelopeSerializationSplitter<int>{})
             .build(),
@@ -102,7 +108,7 @@ TEST(BufferedQueueTest, workloop_indirect) {
                 task.push_back(comm.rank_signed());  // Append rank to task
                 int branching_factor = distribution(generator);
                 for (int i = 0; i < branching_factor; ++i) {
-                    briefkasten::PEID receiver = comm.rank_signed();
+                    briefkasten::PEID receiver = rank_distribution(generator);
                     queue.post_message_blocking(std::ranges::ref_view(task), receiver, on_message);
                 }
             } else {
@@ -112,5 +118,6 @@ TEST(BufferedQueueTest, workloop_indirect) {
             queue.poll_throttled(on_message);
         }
     } while (!queue.terminate(on_message));
+    comm.barrier();
 }
 // NOLINTEND(*-magic-numbers)

@@ -15,8 +15,16 @@
       }
     },
     {
+      "name": "gnu-16",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc-16",
+        "CMAKE_CXX_COMPILER": "g++-16"
+      }
+    },
+    {
       "name": "dev-macos",
-      "inherits": ["dev", "gnu-15"],
+      "inherits": ["dev", "gnu-16"],
       "generator": "Ninja",
       "cacheVariables": {
         "CMAKE_CXX_FLAGS": "-fconcepts-diagnostics-depth=3 -Wall -Wextra -pedantic"

@@ -49,11 +49,11 @@ public:
     MessageQueue(MPI_Comm comm,
                  size_t num_request_slots,
                  size_t reserved_receive_buffer_size,  // NOLINT(*-easily-swappable-parameters)
-                 size_t out_buffer_capacity = 0)
+                 size_t send_backlog_capacity = 0)
 
         : comm_(comm),
           termination_(comm),
-          sender_(comm, num_request_slots, out_buffer_capacity),
+          sender_(comm, num_request_slots, send_backlog_capacity),
           receiver_(comm, SMALL_MESSAGE_TAG, termination_, num_request_slots, reserved_receive_buffer_size),
           large_message_receiver_(comm, LARGE_MESSAGE_TAG, termination_),
           reserved_receive_buffer_size_(reserved_receive_buffer_size) {
@@ -92,10 +92,10 @@ public:
         comm_ = other.comm_;
         SMALL_MESSAGE_TAG = other.SMALL_MESSAGE_TAG;
         LARGE_MESSAGE_TAG = other.LARGE_MESSAGE_TAG;
-        termination_ = std::move(termination_);
+        termination_ = std::move(other.termination_);
         sender_ = std::move(other.sender_);
         receiver_ = std::move(other.receiver_);
-        large_message_receiver_ = std::move(large_message_receiver_);
+        large_message_receiver_ = std::move(other.large_message_receiver_);
         reserved_receive_buffer_size_ = other.reserved_receive_buffer_size_;
         rank_ = other.rank_;
         size_ = other.size_;
@@ -183,20 +183,23 @@ public:
     [[nodiscard]] bool terminate(MessageHandler<T, MessageContainer> auto&& on_message,
                                  SendFinishedCallback<MessageContainer> auto&& on_finished_sending,
                                  std::invocable<> auto&& before_next_message_counting_round_hook,
-                                 std::invocable<> auto&& progress_hook) {
+                                 std::invocable<> auto&& progress_hook,
+                                 std::invocable<> auto&& additional_counts) {
         termination_state_ = TerminationState::trying_termination;
         while (true) {
             before_next_message_counting_round_hook();
             if (termination_state_ == TerminationState::active) {
                 return false;
             }
-            poll_until_message_box_empty(std::forward<decltype(on_message)>(on_message),
-                                         std::forward<decltype(on_finished_sending)>(on_finished_sending),
-                                         [&] { return termination_state_ == TerminationState::active; });
+            poll_until_no_outstanding_sends(std::forward<decltype(on_message)>(on_message),
+                                            std::forward<decltype(on_finished_sending)>(on_finished_sending),
+                                            [&] { return termination_state_ == TerminationState::active; });
             if (termination_state_ == TerminationState::active) {
                 return false;
             }
-            termination_.start_message_counting();
+            // additional_counts() folds in a sibling queue's send/receive counts so that termination of a multi-hop
+            // setup is decided by a single allreduce over the whole system (see IndirectionAdapter).
+            termination_.start_message_counting(additional_counts());
             // poll at least once, so we don't miss any messages
             // if the the message box is empty upon calling this function
             // we never get to poll if message counting finishes instantly
@@ -220,7 +223,7 @@ public:
         return terminate(
             std::forward<decltype(on_message)>(on_message), [](std::size_t) {},
             std::forward<decltype(before_next_message_counting_round_hook)>(before_next_message_counting_round_hook),
-            []() {});
+            []() {}, []() { return internal::MessageCounter{.send = 0, .receive = 0}; });
     }
 
     bool terminate(MessageHandler<T, MessageContainer> auto&& on_message) {
@@ -262,16 +265,25 @@ public:
         return sender_.has_capacity();
     }
 
+    void set_send_backlog_capacity(std::size_t send_backlog_capacity) {
+        sender_.set_send_backlog_capacity(send_backlog_capacity);
+    }
+
     [[nodiscard]] TerminationState termination_state() const {
         return termination_state_;
     }
 
+    /// Snapshot of the locally tracked send/receive counts, for folding into a joint termination round.
+    [[nodiscard]] internal::MessageCounter message_counts() const {
+        return termination_.local_counts();
+    }
+
 private:
-    void poll_until_message_box_empty(
+    void poll_until_no_outstanding_sends(
         MessageHandler<T, MessageContainer> auto&& on_message,
         SendFinishedCallback<MessageContainer> auto&& on_finished_sending,
         std::predicate<> auto&& should_stop_polling = [] { return false; }) {
-        while (sender_.pending_messages() > 0) {
+        while (sender_.outstanding_sends() > 0) {
             poll(std::forward<decltype(on_message)>(on_message),
                  std::forward<decltype(on_finished_sending)>(on_finished_sending));
             if (should_stop_polling()) {

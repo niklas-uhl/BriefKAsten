@@ -44,11 +44,11 @@ enum class FlushStrategy : std::uint8_t { local, global, random, largest };
 
 struct Config {
     size_t num_request_slots = DEFAULT_NUM_REQUEST_SLOTS;
-    size_t max_num_send_buffers = 2 * DEFAULT_NUM_REQUEST_SLOTS;
+    size_t max_num_aggregation_buffers = 2 * DEFAULT_NUM_REQUEST_SLOTS;
     FlushStrategy flush_strategy = FlushStrategy::local;
     size_t global_threshold_bytes = std::numeric_limits<size_t>::max();
     std::size_t local_threshold_bytes = DEFAULT_BUFFER_THRESHOLD;
-    std::size_t out_buffer_capacity = 0;
+    std::size_t send_backlog_capacity = 0;
 };
 
 template <typename MessageType,
@@ -68,19 +68,20 @@ public:
     using buffer_cleaner_type = BufferCleaner;
 
     BufferedMessageQueue(MPI_Comm comm,
-                         Config const config,
+                         Config const& config,
                          Merger merger = Merger{},
                          Splitter splitter = Splitter{},
                          BufferCleaner cleaner = BufferCleaner{})
-        : queue_(comm, config.num_request_slots, compute_buffer_size(config), config.out_buffer_capacity),
-          local_threshold_bytes_(config.local_threshold_bytes),
-          global_threshold_bytes_(config.global_threshold_bytes),
-          max_num_send_buffers_(config.max_num_send_buffers),
+        : config_(config),
+          queue_(comm, config_.num_request_slots, compute_buffer_size(config_), config_.send_backlog_capacity),
+          local_threshold_bytes_(config_.local_threshold_bytes),
+          global_threshold_bytes_(config_.global_threshold_bytes),
+          max_num_aggregation_buffers_(config_.max_num_aggregation_buffers),
           merge(std::move(merger)),
           split(std::move(splitter)),
           pre_send_cleanup(std::move(cleaner)),
-          flush_strategy_(config.flush_strategy) {
-        reserve_send_buffers(config.num_request_slots);
+          flush_strategy_(config_.flush_strategy) {
+        reserve_aggregation_buffers(config_.num_request_slots);
     }
 
     ~BufferedMessageQueue() = default;
@@ -91,29 +92,46 @@ public:
 
     /// Post a message to the queue. This operation never fails, but this requires to busily wait for completion of
     /// other send/receives until slots or buffers become available. Therefore, you also have to pass a message handler.
+    ///
+    /// The optional \p progress_hook is invoked on every iteration of the busy-wait loops. It allows the caller to
+    /// drive progress on resources outside of this queue (e.g. a sibling queue in an indirection setup) while we are
+    /// blocked waiting for one of our own sends to complete. Without this, two interdependent queues can deadlock,
+    /// each spinning on its own sends while starving the other's receiver.
+    bool post_message_blocking(InputMessageRange<MessageType> auto&& message,
+                               PEID receiver,
+                               PEID envelope_sender,
+                               PEID envelope_receiver,
+                               int tag,
+                               MessageHandler<MessageType> auto&& on_message,
+                               std::invocable<> auto&& progress_hook) {
+        auto ret = post_message_impl(
+            std::forward<decltype(message)>(message), receiver, envelope_sender, envelope_receiver, tag,
+
+            [&](auto it) {  // handle_overflow
+                resolve_overflow_blocking(it, on_message, progress_hook);
+            },
+            [&] {  // get_new_buffer
+                while (true) {
+                    // try to get a free buffer and poll until one becomes available
+                    auto buf = acquire_buffer();
+                    if (buf.has_value()) {
+                        return std::move(*buf);
+                    }
+                    poll(on_message);
+                    progress_hook();
+                }
+            });
+        return ret;
+    }
+
     bool post_message_blocking(InputMessageRange<MessageType> auto&& message,
                                PEID receiver,
                                PEID envelope_sender,
                                PEID envelope_receiver,
                                int tag,
                                MessageHandler<MessageType> auto&& on_message) {
-        auto ret = post_message_impl(
-            std::forward<decltype(message)>(message), receiver, envelope_sender, envelope_receiver, tag,
-
-            [&](auto it) {  // handle_overflow
-                resolve_overflow_blocking(it, on_message);
-            },
-            [&] {  // get_new_buffer
-                while (true) {
-                    // try to get a free buffer and poll until one becomes available
-                    auto buf = get_some_free_buffer();
-                    if (buf.has_value()) {
-                        return std::move(*buf);
-                    }
-                    poll(on_message);
-                }
-            });
-        return ret;
+        return post_message_blocking(std::forward<decltype(message)>(message), receiver, envelope_sender,
+                                     envelope_receiver, tag, std::forward<decltype(on_message)>(on_message), [] {});
     }
 
     /// Note: messages have to be passed as rvalues. If you want to send static
@@ -153,7 +171,7 @@ public:
                 }
             },
             [&] {
-                auto buf = get_some_free_buffer();
+                auto buf = acquire_buffer();
                 if (!buf.has_value()) {
                     throw std::runtime_error("Failed to resolve overflow, because no free buffer was available.");
                 }
@@ -177,11 +195,11 @@ public:
     /// \param receiver The rank of the receiver
     /// \return true if the buffer had some data to flush and succeeded, false otherwise
     bool flush_buffer(PEID receiver) {
-        auto it = buffers_.find(receiver);
-        if (it != buffers_.end()) {
+        auto it = aggregation_buffers_.find(receiver);
+        if (it != aggregation_buffers_.end()) {
             // bool buffer_was_empty = it->second.empty();
             auto new_it = flush_buffer_impl(it);
-	    return new_it.second;
+            return new_it.second;
             // if (new_it == it) {
             //   return false;
             // }
@@ -191,11 +209,11 @@ public:
     }
 
     void flush_all_buffers() {
-        flush_all_buffers_impl(buffers_.end(), [] {}, [] { return false; });
+        flush_all_aggregation_buffers_impl(aggregation_buffers_.end(), [] {}, [] { return false; });
     }
 
     void flush_largest_buffer() {
-        std::ignore = flush_largest_buffer_impl(buffers_.end());
+        std::ignore = flush_largest_buffer_impl(aggregation_buffers_.end());
     }
 
     /// Note: Message handlers take a MessageEnvelope as single argument. The
@@ -203,7 +221,7 @@ public:
     /// when called.
     auto poll(MessageHandler<MessageType> auto&& on_message) -> std::optional<std::pair<bool, bool>> {
         return queue_.poll(split_handler(on_message), [&](std::size_t receipt, BufferContainer buffer) {
-            recover_buffer(receipt, std::move(buffer));
+            reclaim_aggregation_buffer(receipt, std::move(buffer));
         });
     }
 
@@ -211,7 +229,9 @@ public:
                         std::size_t poll_skip_threshold = DEFAULT_POLL_SKIP_THRESHOLD) {
         return queue_.poll_throttled(
             split_handler(on_message),
-            [&](std::size_t receipt, BufferContainer buffer) { recover_buffer(receipt, std::move(buffer)); },
+            [&](std::size_t receipt, BufferContainer buffer) {
+                reclaim_aggregation_buffer(receipt, std::move(buffer));
+            },
             poll_skip_threshold);
     }
 
@@ -226,14 +246,65 @@ public:
     /// (not necessarily the underlying data) is moved to the handler when
     /// called.
     [[nodiscard]] bool terminate(MessageHandler<MessageType> auto&& on_message, std::invocable<> auto&& progress_hook) {
+        return terminate(
+            std::forward<decltype(on_message)>(on_message), std::forward<decltype(progress_hook)>(progress_hook),
+            [] { return internal::MessageCounter{.send = 0, .receive = 0}; }, [] {});
+    }
+
+    /// Termination variant that participates in a joint, multi-hop termination protocol.
+    ///
+    /// \p additional_counts contributes a sibling queue's send/receive counts to this queue's counting round, so a
+    /// single allreduce decides termination for the whole system. \p extra_round_prepare runs once per counting round
+    /// (right after flushing our own buffers, before the counts are snapshotted) and is where the sibling's buffers
+    /// must be flushed so no buffered message stays invisible to the count.
+    [[nodiscard]] bool terminate(MessageHandler<MessageType> auto&& on_message,
+                                 std::invocable<> auto&& progress_hook,
+                                 std::invocable<> auto&& additional_counts,
+                                 std::invocable<> auto&& extra_round_prepare) {
         auto before_next_message_counting_round_hook = [&] {
-            flush_all_buffers_and_poll_until_reactivated(on_message);
+            flush_all_buffers_blocking(on_message, [&] { return termination_state() == TerminationState::active; });
+            extra_round_prepare();
         };
         bool ret = queue_.terminate(
             split_handler(on_message),
-            [&](std::size_t receipt, BufferContainer buffer) { recover_buffer(receipt, std::move(buffer)); },
-            before_next_message_counting_round_hook, progress_hook);
+            [&](std::size_t receipt, BufferContainer buffer) {
+                reclaim_aggregation_buffer(receipt, std::move(buffer));
+            },
+            before_next_message_counting_round_hook, progress_hook, additional_counts);
         return ret;
+    }
+
+    [[nodiscard]] internal::MessageCounter message_counts() const {
+        return queue_.message_counts();
+    }
+
+    /// Flush every aggregation buffer, blocking only while send slots are actually exhausted.
+    ///
+    /// Unlike a wait-for-send-completion drain, this makes progress even when there are no outstanding sends, so it
+    /// cannot deadlock on bounded buffer capacities when a buffer holds freshly aggregated, not-yet-sent data (e.g. a
+    /// just-redirected message with a free send slot but nothing in flight).
+    ///
+    /// Each iteration first polls (non-blocking) so that incoming messages are observed: this both progresses sends
+    /// and lets \p should_stop fire as soon as new work arrives, so we stop force-flushing not-yet-full buffers (which
+    /// would defeat aggregation) once the termination attempt is going to be cancelled anyway.
+    void flush_all_buffers_blocking(MessageHandler<MessageType> auto&& on_message,
+                                    std::predicate auto&& should_stop) {
+        auto it = aggregation_buffers_.begin();
+        while (it != aggregation_buffers_.end()) {
+            poll(on_message);  // observe arrivals (may flip should_stop) and progress sends
+            if (should_stop()) {
+                return;
+            }
+            while (!queue_.has_send_capacity()) {
+                poll(on_message);  // only block when slots are exhausted; polling frees them as peers receive
+                if (should_stop()) {
+                    return;
+                }
+            }
+            bool flushed = false;
+            std::tie(it, flushed) = flush_buffer_impl(it, /*erase=*/true);
+            KASSERT(flushed, "Flush must succeed once send capacity is ensured.");
+        }
     }
 
     void reactivate() {
@@ -245,8 +316,9 @@ public:
     }
 
     bool progress_sending() {
-        return queue_.progress_sending(
-            [&](std::size_t receipt, BufferContainer buffer) { recover_buffer(receipt, std::move(buffer)); });
+        return queue_.progress_sending([&](std::size_t receipt, BufferContainer buffer) {
+            reclaim_aggregation_buffer(receipt, std::move(buffer));
+        });
     }
 
     bool probe_for_messages(MessageHandler<MessageType> auto&& on_message) {
@@ -271,7 +343,7 @@ public:
         if (check_for_global_buffer_overflow(0)) {
             // it's fine to send out message here, since we only grow buffers
             // so this will fit into buffer on even we resizing is not synchronized
-            resolve_overflow_blocking(on_message);
+            resolve_overflow_blocking(on_message, [] {});
         }
         auto new_buffer_size = compute_buffer_size(config);
         if (new_buffer_size > queue_.reserved_receive_buffer_size()) {
@@ -286,9 +358,9 @@ public:
         Config config;
         config.local_threshold_bytes = new_threshold;
         local_threshold_bytes_ = new_threshold;
-        for (auto current = buffers_.begin(); current != buffers_.end(); current++) {
+        for (auto current = aggregation_buffers_.begin(); current != aggregation_buffers_.end(); current++) {
             if (check_for_local_buffer_overflow(current->second, 0)) {
-                resolve_overflow_blocking(current, on_message);
+                resolve_overflow_blocking(current, on_message, [] {});
             }
         }
         auto new_buffer_size = compute_buffer_size(config);
@@ -299,6 +371,31 @@ public:
 
     [[nodiscard]] size_t local_threshold_bytes() const {
         return local_threshold_bytes_;
+    }
+
+    [[nodiscard]] Config const& config() const {
+        return config_;
+    }
+
+    /// Raise (or lower) the cap on concurrently held aggregation buffers. The cap only bounds lazy growth in
+    /// acquire_buffer(), so adjusting it after construction is safe; already-allocated buffers are untouched.
+    void max_num_aggregation_buffers(std::size_t new_max) {
+        max_num_aggregation_buffers_ = new_max;
+        config_.max_num_aggregation_buffers = new_max;
+    }
+
+    [[nodiscard]] std::size_t max_num_aggregation_buffers() const {
+        return max_num_aggregation_buffers_;
+    }
+
+    /// Adjust the underlying send backlog capacity at runtime (see Sender::set_send_backlog_capacity).
+    void send_backlog_capacity(std::size_t new_capacity) {
+        config_.send_backlog_capacity = new_capacity;
+        queue_.set_send_backlog_capacity(new_capacity);
+    }
+
+    [[nodiscard]] std::size_t send_backlog_capacity() const {
+        return config_.send_backlog_capacity;
     }
 
     [[nodiscard]] PEID rank() const {
@@ -323,6 +420,10 @@ public:
         queue_.synchronous_mode(use_it);
     }
 
+    auto num_allocated_buffers() {
+        return num_aggregation_buffers_;
+    }
+
 private:
     using BufferMap = std::unordered_map<PEID, BufferContainer>;
     using BufferList = std::vector<BufferContainer>;
@@ -338,40 +439,42 @@ private:
         return (bytes_per_buffer + sizeof(BufferType) - 1) / sizeof(BufferType);
     }
 
-    void reserve_send_buffers(std::size_t num_buffers) {
+    void reserve_aggregation_buffers(std::size_t num_buffers) {
         auto buffer_size = queue_.reserved_receive_buffer_size();
-        reserve_send_buffers(num_buffers, buffer_size);
+        reserve_aggregation_buffers(num_buffers, buffer_size);
     }
 
     // NOLINTNEXTLINE(*-easily-swappable-parameters)
-    void reserve_send_buffers(std::size_t num_buffers, std::size_t buffer_size) {
-        if (num_send_buffers_ + num_buffers > max_num_send_buffers_) {
-            throw std::runtime_error("Exceeded maximum number of send buffers.");
+    void reserve_aggregation_buffers(std::size_t num_buffers, std::size_t buffer_size) {
+        if (num_aggregation_buffers_ + num_buffers > max_num_aggregation_buffers_) {
+            throw std::runtime_error("Exceeded maximum number of aggregation buffers.");
         }
-        auto old_size = buffer_free_list_.size();
-        buffer_free_list_.resize(old_size + num_buffers);
-        for (auto& buf : std::ranges::subrange(buffer_free_list_.begin() + old_size, buffer_free_list_.end())) {
-            num_send_buffers_++;
+        auto old_size = free_aggregation_buffers_.size();
+        free_aggregation_buffers_.resize(old_size + num_buffers);
+        for (auto& buf :
+             std::ranges::subrange(free_aggregation_buffers_.begin() + old_size, free_aggregation_buffers_.end())) {
+            num_aggregation_buffers_++;
             buf.reserve(buffer_size);
         }
     }
 
-    auto get_some_free_buffer() -> std::optional<BufferContainer> {
-        if (buffer_free_list_.empty()) {
-            if (num_send_buffers_ < max_num_send_buffers_) {
-                reserve_send_buffers(1);
+    auto acquire_buffer() -> std::optional<BufferContainer> {
+        if (free_aggregation_buffers_.empty()) {
+            if (num_aggregation_buffers_ < max_num_aggregation_buffers_) {
+                reserve_aggregation_buffers(1);
             } else {
                 // Heuristic: at quota with no free buffer → flush one.
                 // It won’t free capacity immediately, but once the send
-                // completes the buffer will be recycled via recover_buffer
-                if (buffers_.size() - 1 >= max_num_send_buffers_ /* minus the buffer we try to create */) {
+                // completes the buffer will be recycled via reclaim_aggregation_buffer
+                if (aggregation_buffers_.size() >= max_num_aggregation_buffers_) {
                     flush_largest_buffer();
                 }
                 return std::nullopt;
             }
         }
-        KASSERT(!buffer_free_list_.empty());
-        auto buffer = std::move(buffer_free_list_.back());
+        KASSERT(!free_aggregation_buffers_.empty());
+        auto buffer = std::move(free_aggregation_buffers_.back());
+        free_aggregation_buffers_.pop_back();
         return buffer;
     };
 
@@ -384,10 +487,10 @@ private:
                            int tag,
                            OverflowHandler<BufferMap> auto&& handle_overflow,
                            BufferProvider<BufferContainer> auto&& get_new_buffer) {
-        auto it = buffers_.find(receiver);
-        if (it == buffers_.end()) {
+        auto it = aggregation_buffers_.find(receiver);
+        if (it == aggregation_buffers_.end()) {
             auto buffer = get_new_buffer();
-            std::tie(it, std::ignore) = buffers_.emplace(receiver, std::move(buffer));
+            std::tie(it, std::ignore) = aggregation_buffers_.emplace(receiver, std::move(buffer));
         }
 
         auto& buffer = it->second;
@@ -412,34 +515,14 @@ private:
         return overflow;
     }
 
-    void flush_all_buffers_and_poll_until_reactivated(MessageHandler<MessageType> auto&& on_message) {
-        flush_all_buffers_impl(
-            buffers_.end(),
-            [&] {  // pre_flush_hook
-                while (true) {
-                    auto res = poll(std::forward<decltype(on_message)>(on_message));
-                    if (res && res->first) {
-                        break;
-                    }
-                }
-            },
-            [&](bool current_flush_successful) {  // post flush_hook
-                if (!current_flush_successful) {
-                    poll(std::forward<decltype(on_message)>(on_message));
-                }
-                return termination_state() == TerminationState::active;
-            },
-            false);
-    }
-
     /// @return an iterator to the next buffer (and true), or the input iterator (and false) if flushing failed
     auto flush_buffer_impl(BufferMap::iterator buffer_it, bool erase = true)
         -> std::pair<typename BufferMap::iterator, bool> {
-        KASSERT(buffer_it != buffers_.end(), "Trying to flush non-existing buffer.");
+        KASSERT(buffer_it != aggregation_buffers_.end(), "Trying to flush non-existing buffer.");
         auto& [receiver, buffer] = *buffer_it;
         if (buffer.empty()) {
             if (erase) {
-                return {buffers_.erase(buffer_it), true};
+                return {aggregation_buffers_.erase(buffer_it), true};
             }
             return {++buffer_it, true};
         }
@@ -447,8 +530,12 @@ private:
         pre_send_cleanup(buffer, receiver);
         // we don't send if the cleanup has emptied the buffer
         if (buffer.empty()) {
+            global_buffer_size_ -= pre_cleanup_buffer_size;
             if (erase) {
-                return {buffers_.erase(buffer_it), true};
+                BufferContainer container = std::move(buffer_it->second);
+                auto next = aggregation_buffers_.erase(buffer_it);
+                free_aggregation_buffers_.emplace_back(std::move(container));
+                return {next, true};
             }
             return {++buffer_it, true};
         }
@@ -460,7 +547,7 @@ private:
                 "We checked before that there is capacity, so posting the message should not fail.");
         global_buffer_size_ -= pre_cleanup_buffer_size;
         if (erase) {
-            return {buffers_.erase(buffer_it), true};
+            return {aggregation_buffers_.erase(buffer_it), true};
         }
         return {++buffer_it, true};
     }
@@ -468,17 +555,19 @@ private:
     /// if post_flush_hook return true, this breaks the loop
     template <typename PreFlushHook, typename PostFlushHook>
         requires std::invocable<PreFlushHook> && (std::predicate<PostFlushHook> || std::predicate<PostFlushHook, bool>)
-    bool flush_all_buffers_impl(BufferMap::iterator current_buffer,
-                                PreFlushHook&& pre_flush_hook,    // NOLINT(cppcoreguidelines-missing-std-forward)
-                                PostFlushHook&& post_flush_hook,  // NOLINT(cppcoreguidelines-missing-std-forward)
-                                bool break_when_flush_fails = true) {
-        auto it = buffers_.begin();
+    bool flush_all_aggregation_buffers_impl(
+        BufferMap::iterator current_buffer,
+        PreFlushHook&& pre_flush_hook,    // NOLINT(cppcoreguidelines-missing-std-forward)
+        PostFlushHook&& post_flush_hook,  // NOLINT(cppcoreguidelines-missing-std-forward)
+        bool break_when_flush_fails = true) {
+        auto it = aggregation_buffers_.begin();
         bool flushed_something = false;
-        while (it != buffers_.end()) {
+        while (it != aggregation_buffers_.end()) {
             pre_flush_hook();
             bool current_flush_successful = false;
             std::tie(it, current_flush_successful) =
-                flush_buffer_impl(it, it != current_buffer);  // iterator `it` is updated by std::tie; do not use its previous value after this call
+                flush_buffer_impl(it, it != current_buffer);  // iterator `it` is updated by std::tie; do not use its
+                                                              // previous value after this call
             if (current_flush_successful) {
                 flushed_something = true;
             } else {
@@ -501,10 +590,10 @@ private:
     }
 
     [[nodiscard]] bool flush_largest_buffer_impl(BufferMap::iterator current_buffer) {
-        auto largest_buffer = std::max_element(buffers_.begin(), buffers_.end(), [](auto& lhs, auto& rhs) {
-            return lhs.second.size() < rhs.second.size();
-        });
-        if (largest_buffer != buffers_.end()) {
+        auto largest_buffer =
+            std::max_element(aggregation_buffers_.begin(), aggregation_buffers_.end(),
+                             [](auto& lhs, auto& rhs) { return lhs.second.size() < rhs.second.size(); });
+        if (largest_buffer != aggregation_buffers_.end()) {
             auto it = flush_buffer_impl(largest_buffer, largest_buffer != current_buffer);
             return it.second;
         }
@@ -519,9 +608,9 @@ private:
         };
     }
 
-    auto recover_buffer(std::size_t /*receipt*/, BufferContainer&& buffer) {
+    auto reclaim_aggregation_buffer(std::size_t /*receipt*/, BufferContainer&& buffer) {
         buffer.resize(0);  // this does not reduce the capacity
-        buffer_free_list_.emplace_back(std::move(buffer));
+        free_aggregation_buffers_.emplace_back(std::move(buffer));
     }
 
     /// @return returns false iff resolve failed
@@ -532,7 +621,7 @@ private:
                 return ret.second;
             }
             case FlushStrategy::global: {
-                return flush_all_buffers_impl(current_buffer, [] {}, [] { return false; });
+                return flush_all_aggregation_buffers_impl(current_buffer, [] {}, [] { return false; });
             }
             case FlushStrategy::random: {
                 throw std::runtime_error("Random flush strategy not implemented");
@@ -546,12 +635,15 @@ private:
         return false;
     }
 
-    void resolve_overflow_blocking(BufferMap::iterator current_buffer, MessageHandler<MessageType> auto&& on_message) {
+    void resolve_overflow_blocking(BufferMap::iterator current_buffer,
+                                   MessageHandler<MessageType> auto&& on_message,
+                                   std::invocable<> auto&& progress_hook) {
         while (true) {
             auto res = poll(std::forward<decltype(on_message)>(on_message));
             if (res && res->first) {  // finished some send
                 break;
             }
+            progress_hook();
         }
         // now actually resolve the overflow
         bool success = resolve_overflow(current_buffer);
@@ -560,8 +652,10 @@ private:
         }
         throw std::runtime_error("Failed to resolve overflow in post_message_blocking. This should not happen.");
     }
-    void resolve_overflow_blocking(MessageHandler<MessageType> auto&& on_message) {
-        resolve_overflow_blocking(buffers_.end(), std::forward<decltype(on_message)>(on_message));
+    void resolve_overflow_blocking(MessageHandler<MessageType> auto&& on_message,
+                                   std::invocable<> auto&& progress_hook) {
+        resolve_overflow_blocking(aggregation_buffers_.end(), std::forward<decltype(on_message)>(on_message),
+                                  std::forward<decltype(progress_hook)>(progress_hook));
     }
 
     [[nodiscard]] bool check_for_global_buffer_overflow(std::uint64_t buffer_size_delta) const {
@@ -584,14 +678,15 @@ private:
                check_for_local_buffer_overflow(buffer, buffer_size_delta);
     }
 
+    Config config_;
     MessageQueue<BufferType, BufferContainer, ReceiveBufferContainer> queue_;
-    BufferMap buffers_;
-    BufferList buffer_free_list_;
+    BufferMap aggregation_buffers_;
+    BufferList free_aggregation_buffers_;
     size_t local_threshold_bytes_;
     size_t global_threshold_bytes_;
-    std::size_t max_num_send_buffers_;
+    std::size_t max_num_aggregation_buffers_;
 
-    std::size_t num_send_buffers_ = 0;
+    std::size_t num_aggregation_buffers_ = 0;
 
     Merger merge;
     Splitter split;
