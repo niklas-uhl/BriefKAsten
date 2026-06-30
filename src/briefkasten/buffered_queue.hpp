@@ -92,17 +92,23 @@ public:
 
     /// Post a message to the queue. This operation never fails, but this requires to busily wait for completion of
     /// other send/receives until slots or buffers become available. Therefore, you also have to pass a message handler.
+    ///
+    /// The optional \p progress_hook is invoked on every iteration of the busy-wait loops. It allows the caller to
+    /// drive progress on resources outside of this queue (e.g. a sibling queue in an indirection setup) while we are
+    /// blocked waiting for one of our own sends to complete. Without this, two interdependent queues can deadlock,
+    /// each spinning on its own sends while starving the other's receiver.
     bool post_message_blocking(InputMessageRange<MessageType> auto&& message,
                                PEID receiver,
                                PEID envelope_sender,
                                PEID envelope_receiver,
                                int tag,
-                               MessageHandler<MessageType> auto&& on_message) {
+                               MessageHandler<MessageType> auto&& on_message,
+                               std::invocable<> auto&& progress_hook) {
         auto ret = post_message_impl(
             std::forward<decltype(message)>(message), receiver, envelope_sender, envelope_receiver, tag,
 
             [&](auto it) {  // handle_overflow
-                resolve_overflow_blocking(it, on_message);
+                resolve_overflow_blocking(it, on_message, progress_hook);
             },
             [&] {  // get_new_buffer
                 while (true) {
@@ -112,9 +118,20 @@ public:
                         return std::move(*buf);
                     }
                     poll(on_message);
+                    progress_hook();
                 }
             });
         return ret;
+    }
+
+    bool post_message_blocking(InputMessageRange<MessageType> auto&& message,
+                               PEID receiver,
+                               PEID envelope_sender,
+                               PEID envelope_receiver,
+                               int tag,
+                               MessageHandler<MessageType> auto&& on_message) {
+        return post_message_blocking(std::forward<decltype(message)>(message), receiver, envelope_sender,
+                                     envelope_receiver, tag, std::forward<decltype(on_message)>(on_message), [] {});
     }
 
     /// Note: messages have to be passed as rvalues. If you want to send static
@@ -229,16 +246,65 @@ public:
     /// (not necessarily the underlying data) is moved to the handler when
     /// called.
     [[nodiscard]] bool terminate(MessageHandler<MessageType> auto&& on_message, std::invocable<> auto&& progress_hook) {
+        return terminate(
+            std::forward<decltype(on_message)>(on_message), std::forward<decltype(progress_hook)>(progress_hook),
+            [] { return internal::MessageCounter{.send = 0, .receive = 0}; }, [] {});
+    }
+
+    /// Termination variant that participates in a joint, multi-hop termination protocol.
+    ///
+    /// \p additional_counts contributes a sibling queue's send/receive counts to this queue's counting round, so a
+    /// single allreduce decides termination for the whole system. \p extra_round_prepare runs once per counting round
+    /// (right after flushing our own buffers, before the counts are snapshotted) and is where the sibling's buffers
+    /// must be flushed so no buffered message stays invisible to the count.
+    [[nodiscard]] bool terminate(MessageHandler<MessageType> auto&& on_message,
+                                 std::invocable<> auto&& progress_hook,
+                                 std::invocable<> auto&& additional_counts,
+                                 std::invocable<> auto&& extra_round_prepare) {
         auto before_next_message_counting_round_hook = [&] {
-            flush_all_aggregation_buffers_and_poll_until_reactivated(on_message);
+            flush_all_buffers_blocking(on_message, [&] { return termination_state() == TerminationState::active; });
+            extra_round_prepare();
         };
         bool ret = queue_.terminate(
             split_handler(on_message),
             [&](std::size_t receipt, BufferContainer buffer) {
                 reclaim_aggregation_buffer(receipt, std::move(buffer));
             },
-            before_next_message_counting_round_hook, progress_hook);
+            before_next_message_counting_round_hook, progress_hook, additional_counts);
         return ret;
+    }
+
+    [[nodiscard]] internal::MessageCounter message_counts() const {
+        return queue_.message_counts();
+    }
+
+    /// Flush every aggregation buffer, blocking only while send slots are actually exhausted.
+    ///
+    /// Unlike a wait-for-send-completion drain, this makes progress even when there are no outstanding sends, so it
+    /// cannot deadlock on bounded buffer capacities when a buffer holds freshly aggregated, not-yet-sent data (e.g. a
+    /// just-redirected message with a free send slot but nothing in flight).
+    ///
+    /// Each iteration first polls (non-blocking) so that incoming messages are observed: this both progresses sends
+    /// and lets \p should_stop fire as soon as new work arrives, so we stop force-flushing not-yet-full buffers (which
+    /// would defeat aggregation) once the termination attempt is going to be cancelled anyway.
+    void flush_all_buffers_blocking(MessageHandler<MessageType> auto&& on_message,
+                                    std::predicate auto&& should_stop) {
+        auto it = aggregation_buffers_.begin();
+        while (it != aggregation_buffers_.end()) {
+            poll(on_message);  // observe arrivals (may flip should_stop) and progress sends
+            if (should_stop()) {
+                return;
+            }
+            while (!queue_.has_send_capacity()) {
+                poll(on_message);  // only block when slots are exhausted; polling frees them as peers receive
+                if (should_stop()) {
+                    return;
+                }
+            }
+            bool flushed = false;
+            std::tie(it, flushed) = flush_buffer_impl(it, /*erase=*/true);
+            KASSERT(flushed, "Flush must succeed once send capacity is ensured.");
+        }
     }
 
     void reactivate() {
@@ -277,7 +343,7 @@ public:
         if (check_for_global_buffer_overflow(0)) {
             // it's fine to send out message here, since we only grow buffers
             // so this will fit into buffer on even we resizing is not synchronized
-            resolve_overflow_blocking(on_message);
+            resolve_overflow_blocking(on_message, [] {});
         }
         auto new_buffer_size = compute_buffer_size(config);
         if (new_buffer_size > queue_.reserved_receive_buffer_size()) {
@@ -294,7 +360,7 @@ public:
         local_threshold_bytes_ = new_threshold;
         for (auto current = aggregation_buffers_.begin(); current != aggregation_buffers_.end(); current++) {
             if (check_for_local_buffer_overflow(current->second, 0)) {
-                resolve_overflow_blocking(current, on_message);
+                resolve_overflow_blocking(current, on_message, [] {});
             }
         }
         auto new_buffer_size = compute_buffer_size(config);
@@ -428,26 +494,6 @@ private:
         return overflow;
     }
 
-    void flush_all_aggregation_buffers_and_poll_until_reactivated(MessageHandler<MessageType> auto&& on_message) {
-        flush_all_aggregation_buffers_impl(
-            aggregation_buffers_.end(),
-            [&] {  // pre_flush_hook
-                while (true) {
-                    auto res = poll(std::forward<decltype(on_message)>(on_message));
-                    if (res && res->first) {
-                        break;
-                    }
-                }
-            },
-            [&](bool current_flush_successful) {  // post flush_hook
-                if (!current_flush_successful) {
-                    poll(std::forward<decltype(on_message)>(on_message));
-                }
-                return termination_state() == TerminationState::active;
-            },
-            false);
-    }
-
     /// @return an iterator to the next buffer (and true), or the input iterator (and false) if flushing failed
     auto flush_buffer_impl(BufferMap::iterator buffer_it, bool erase = true)
         -> std::pair<typename BufferMap::iterator, bool> {
@@ -568,12 +614,15 @@ private:
         return false;
     }
 
-    void resolve_overflow_blocking(BufferMap::iterator current_buffer, MessageHandler<MessageType> auto&& on_message) {
+    void resolve_overflow_blocking(BufferMap::iterator current_buffer,
+                                   MessageHandler<MessageType> auto&& on_message,
+                                   std::invocable<> auto&& progress_hook) {
         while (true) {
             auto res = poll(std::forward<decltype(on_message)>(on_message));
             if (res && res->first) {  // finished some send
                 break;
             }
+            progress_hook();
         }
         // now actually resolve the overflow
         bool success = resolve_overflow(current_buffer);
@@ -582,8 +631,10 @@ private:
         }
         throw std::runtime_error("Failed to resolve overflow in post_message_blocking. This should not happen.");
     }
-    void resolve_overflow_blocking(MessageHandler<MessageType> auto&& on_message) {
-        resolve_overflow_blocking(aggregation_buffers_.end(), std::forward<decltype(on_message)>(on_message));
+    void resolve_overflow_blocking(MessageHandler<MessageType> auto&& on_message,
+                                   std::invocable<> auto&& progress_hook) {
+        resolve_overflow_blocking(aggregation_buffers_.end(), std::forward<decltype(on_message)>(on_message),
+                                  std::forward<decltype(progress_hook)>(progress_hook));
     }
 
     [[nodiscard]] bool check_for_global_buffer_overflow(std::uint64_t buffer_size_delta) const {

@@ -44,9 +44,15 @@ public:
         local_.receive++;
     }
 
-    void start_message_counting() {
+    /// Snapshot of the locally tracked send/receive counts. Used to fold a sibling queue's counts into a single
+    /// joint termination round (see IndirectionAdapter), so the whole multi-hop system is counted in one allreduce.
+    [[nodiscard]] MessageCounter local_counts() const {
+        return local_;
+    }
+
+    void start_message_counting(MessageCounter additional = {.send = 0, .receive = 0}) {
         if (reduce_req_ == MPI_REQUEST_NULL) {
-            global_ = local_;
+            global_ = {.send = local_.send + additional.send, .receive = local_.receive + additional.receive};
             MPI_Iallreduce(MPI_IN_PLACE, &global_, 2, kamping::mpi_datatype<std::size_t>(), MPI_SUM, comm_,
                            &reduce_req_);
         }

@@ -86,7 +86,7 @@ TEST(BufferedQueueTest, workloop_indirect) {
     }
 
     briefkasten::Config conf;
-    conf.max_num_aggregation_buffers = std::numeric_limits<std::size_t>::max();
+    // bounded aggregation buffers (default): the two-queue indirection must work without the unbounded workaround.
     briefkasten::IndirectionAdapter queue{
         briefkasten::BufferedMessageQueueBuilder<int>(conf)
             .with_merger(briefkasten::aggregation::EnvelopeSerializationMerger{})

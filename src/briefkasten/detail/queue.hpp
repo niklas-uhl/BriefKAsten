@@ -183,7 +183,8 @@ public:
     [[nodiscard]] bool terminate(MessageHandler<T, MessageContainer> auto&& on_message,
                                  SendFinishedCallback<MessageContainer> auto&& on_finished_sending,
                                  std::invocable<> auto&& before_next_message_counting_round_hook,
-                                 std::invocable<> auto&& progress_hook) {
+                                 std::invocable<> auto&& progress_hook,
+                                 std::invocable<> auto&& additional_counts) {
         termination_state_ = TerminationState::trying_termination;
         while (true) {
             before_next_message_counting_round_hook();
@@ -196,7 +197,9 @@ public:
             if (termination_state_ == TerminationState::active) {
                 return false;
             }
-            termination_.start_message_counting();
+            // additional_counts() folds in a sibling queue's send/receive counts so that termination of a multi-hop
+            // setup is decided by a single allreduce over the whole system (see IndirectionAdapter).
+            termination_.start_message_counting(additional_counts());
             // poll at least once, so we don't miss any messages
             // if the the message box is empty upon calling this function
             // we never get to poll if message counting finishes instantly
@@ -220,7 +223,7 @@ public:
         return terminate(
             std::forward<decltype(on_message)>(on_message), [](std::size_t) {},
             std::forward<decltype(before_next_message_counting_round_hook)>(before_next_message_counting_round_hook),
-            []() {});
+            []() {}, []() { return internal::MessageCounter{.send = 0, .receive = 0}; });
     }
 
     bool terminate(MessageHandler<T, MessageContainer> auto&& on_message) {
@@ -264,6 +267,11 @@ public:
 
     [[nodiscard]] TerminationState termination_state() const {
         return termination_state_;
+    }
+
+    /// Snapshot of the locally tracked send/receive counts, for folding into a joint termination round.
+    [[nodiscard]] internal::MessageCounter message_counts() const {
+        return termination_.local_counts();
     }
 
 private:
