@@ -94,6 +94,12 @@ public:
         return any_completed;
     };
 
+    /// Adjust the send backlog capacity at runtime. Only ever grown by the indirection adapter; shrinking below the
+    /// current backlog size is harmless (no further messages are buffered until it drains below the new cap).
+    void set_send_backlog_capacity(std::size_t send_backlog_capacity) {
+        send_backlog_capacity_ = send_backlog_capacity;
+    }
+
     [[nodiscard]] bool has_capacity() const {
         if (send_backlog_capacity_ == std::numeric_limits<std::size_t>::max()) {
             return true;

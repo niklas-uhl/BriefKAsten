@@ -377,6 +377,27 @@ public:
         return config_;
     }
 
+    /// Raise (or lower) the cap on concurrently held aggregation buffers. The cap only bounds lazy growth in
+    /// acquire_buffer(), so adjusting it after construction is safe; already-allocated buffers are untouched.
+    void max_num_aggregation_buffers(std::size_t new_max) {
+        max_num_aggregation_buffers_ = new_max;
+        config_.max_num_aggregation_buffers = new_max;
+    }
+
+    [[nodiscard]] std::size_t max_num_aggregation_buffers() const {
+        return max_num_aggregation_buffers_;
+    }
+
+    /// Adjust the underlying send backlog capacity at runtime (see Sender::set_send_backlog_capacity).
+    void send_backlog_capacity(std::size_t new_capacity) {
+        config_.send_backlog_capacity = new_capacity;
+        queue_.set_send_backlog_capacity(new_capacity);
+    }
+
+    [[nodiscard]] std::size_t send_backlog_capacity() const {
+        return config_.send_backlog_capacity;
+    }
+
     [[nodiscard]] PEID rank() const {
         return queue_.rank();
     }

@@ -265,6 +265,10 @@ public:
         return sender_.has_capacity();
     }
 
+    void set_send_backlog_capacity(std::size_t send_backlog_capacity) {
+        sender_.set_send_backlog_capacity(send_backlog_capacity);
+    }
+
     [[nodiscard]] TerminationState termination_state() const {
         return termination_state_;
     }

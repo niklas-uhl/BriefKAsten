@@ -33,6 +33,11 @@ template <typename T>
 concept IndirectionScheme = requires(T scheme, MPI_Comm comm, PEID sender, PEID receiver) {
     { scheme.next_hop(sender, receiver) } -> std::same_as<PEID>;
     { scheme.should_redirect(sender, receiver) } -> std::same_as<bool>;
+    // The grouping the scheme routes over: messages within a group go directly, cross-group messages go via one proxy
+    // per group. `group_size` is the number of ranks per group, `num_groups` the number of groups. Together they bound
+    // each hop's fan-out and drive the buffering defaults (see first_hop_fan_out / second_hop_fan_out below).
+    { scheme.group_size() } -> std::convertible_to<std::size_t>;
+    { scheme.num_groups() } -> std::convertible_to<std::size_t>;
 };
 
 template <IndirectionScheme Indirector, typename BufferedQueueType>
@@ -51,8 +56,16 @@ public:
         : first_hop_queue_comm_(queue.communicator(), false),
           first_hop_queue_(std::move(queue)),
           second_hop_queue_comm_(first_hop_queue_comm_),
-          second_hop_queue_(second_hop_queue_comm_.mpi_communicator(), first_hop_queue_.config()),
-          indirection_(std::move(indirector)) {}
+          second_hop_queue_(second_hop_queue_comm_.mpi_communicator(),
+                            derive_indirection_config(first_hop_queue_.config(), second_hop_fan_out(indirector))),
+          indirection_(std::move(indirector)) {
+        // Size each hop to its own fan-out (the first hop is larger: it also carries intra-group direct traffic). The
+        // first-hop queue was built and moved in by the caller, so its send backlog is already baked into its sender;
+        // reconfigure it here to the first-hop defaults.
+        auto first_cfg = derive_indirection_config(first_hop_queue_.config(), first_hop_fan_out(indirection_));
+        first_hop_queue_.max_num_aggregation_buffers(first_cfg.max_num_aggregation_buffers);
+        first_hop_queue_.send_backlog_capacity(first_cfg.send_backlog_capacity);
+    }
 
     auto& indirection_scheme() {
         return indirection_;
@@ -255,6 +268,37 @@ public:
     }
 
 private:
+    /// Distinct next-hop destinations the first-hop queue aggregates to. Every user message enters the first hop;
+    /// same-group receivers are reached directly (group_size), cross-group receivers go via one proxy per other group
+    /// (num_groups). Upper-bounded by their sum.
+    static std::size_t first_hop_fan_out(Indirector const& indirector) {
+        return static_cast<std::size_t>(indirector.group_size()) + static_cast<std::size_t>(indirector.num_groups());
+    }
+
+    /// Distinct final receivers a proxy forwards to on the second hop: the members of its own group (group_size).
+    static std::size_t second_hop_fan_out(Indirector const& indirector) {
+        return static_cast<std::size_t>(indirector.group_size());
+    }
+
+    /// Derive topology-aware buffering defaults for one hop from that hop's fan-out, leaving any field the caller set
+    /// explicitly (i.e. that differs from the library default) untouched.
+    ///
+    /// Indirection bounds a hop's distinct destinations to `fan_out`, so unlike the un-indirected case we can afford a
+    /// buffer per destination. We size for double buffering: one buffer per destination filling while its predecessor
+    /// drains. That second buffer only materializes if the send pipeline is deep enough to hold `fan_out` sends
+    /// outstanding, which is why the backlog is set to `fan_out`:
+    ///   max_num_aggregation_buffers = fan_out (filling) + fan_out (backlog) + num_request_slots (in flight).
+    static Config derive_indirection_config(Config config, std::size_t fan_out) {
+        Config const defaults;
+        if (config.send_backlog_capacity == defaults.send_backlog_capacity) {
+            config.send_backlog_capacity = fan_out;
+        }
+        if (config.max_num_aggregation_buffers == defaults.max_num_aggregation_buffers) {
+            config.max_num_aggregation_buffers = (2 * fan_out) + config.num_request_slots;
+        }
+        return config;
+    }
+
     auto redirection_handler(MessageHandler<typename queue_type::message_type> auto&& on_message) {
         return [&](Envelope<typename queue_type::message_type> auto envelope) {
             KASSERT(envelope.receiver < this->size());
