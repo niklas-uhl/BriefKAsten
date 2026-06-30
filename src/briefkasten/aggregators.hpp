@@ -19,13 +19,70 @@
 
 #pragma once
 
+#include <concepts>
+#include <cstdint>
 #include <iterator>
+#include <limits>
 #include <ranges>
 #include <span>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 #include "./detail/concepts.hpp"
 #include "./detail/view_adaptors.hpp"
 
 namespace briefkasten::aggregation {
+
+/// @brief Concept for fixed-size tuple-like message types (e.g. \c std::tuple, \c std::pair)
+/// whose elements convert to/from the buffer's scalar value type.
+template <typename T>
+concept TupleLike = requires { std::tuple_size_v<std::remove_cvref_t<T>>; } &&
+                    (std::tuple_size_v<std::remove_cvref_t<T>> > 0);
+
+/// @brief True iff every value of integer type \p From is representable in integer type \p To.
+/// Equivalent to "casting From -> To never narrows": \p To must be able to hold negative values when
+/// \p From is signed, and have at least as many value bits.
+template <typename From, typename To>
+concept LosslesslyRepresentable = std::integral<From> && std::integral<To> &&
+                                  (std::is_signed_v<To> || std::is_unsigned_v<From>) &&
+                                  (std::numeric_limits<To>::digits >= std::numeric_limits<From>::digits);
+
+/// @brief True unless converting integer \p From to integer \p To would narrow. Non-integer operands are
+/// deliberately accepted, leaving floating-point (or otherwise convertible) payloads to the aggregator's own
+/// constraints; only the silent integer-narrowing footgun is rejected.
+template <typename From, typename To>
+inline constexpr bool no_integer_narrowing_v =
+    !(std::integral<From> && std::integral<To>) || LosslesslyRepresentable<From, To>;
+
+/// @brief True iff every *non-negative* value of integer type \p From is representable in integer type \p To,
+/// i.e. \p To has at least as many magnitude (value) bits. Unlike \ref LosslesslyRepresentable this ignores
+/// signedness, so a signed source fits an unsigned target. Used for framing quantities that are never
+/// negative (a \ref PEID rank), which therefore round-trip through an unsigned buffer.
+template <typename From, typename To>
+concept MagnitudeRepresentable = std::integral<From> && std::integral<To> &&
+                                 (std::numeric_limits<To>::digits >= std::numeric_limits<From>::digits);
+
+/// @brief True iff a (non-negative) \ref PEID rank round-trips through buffer element type \p To. Lenient for
+/// non-integer buffers, which are governed by the aggregator's own convertibility constraints.
+template <typename To>
+inline constexpr bool buffer_holds_rank_v = !std::integral<To> || MagnitudeRepresentable<PEID, To>;
+
+/// @brief True iff the embedded receiver (a \ref PEID) and every field of tuple-like \p Tuple fit into the
+/// scalar buffer element type \p BufferType. Fields must round-trip losslessly; the non-negative receiver only
+/// needs its magnitude represented (so an unsigned buffer is fine for unsigned-integer messages). Used to
+/// reject too-narrow buffers at compile time instead of silently truncating in \ref TupleMerger / \ref TupleSplitter.
+template <TupleLike Tuple, typename BufferType>
+inline constexpr bool tuple_fits_buffer_v =
+    buffer_holds_rank_v<BufferType> && []<std::size_t... I>(std::index_sequence<I...>) {
+        return (LosslesslyRepresentable<std::tuple_element_t<I, std::remove_cvref_t<Tuple>>, BufferType> && ...);
+    }(std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<Tuple>>>{});
+
+// Unsigned messages need an unsigned buffer; the non-negative receiver rank still round-trips through it.
+static_assert(tuple_fits_buffer_v<std::tuple<std::uint64_t, std::uint64_t>, std::uint64_t>);
+// ...but a signed buffer cannot hold the top half of an unsigned field's range.
+static_assert(!tuple_fits_buffer_v<std::tuple<std::uint64_t>, std::int64_t>);
+// A narrower buffer that cannot hold the rank magnitude is rejected even when the field would fit.
+static_assert(!tuple_fits_buffer_v<std::tuple<std::int16_t>, std::int16_t>);
 
 struct AppendMerger {
     template <MPIBuffer BufferContainer>
@@ -115,6 +172,10 @@ struct EnvelopeSerializationMerger {
     void operator()(BufferContainer& buffer, PEID /* buffer_destination */, PEID /* my_rank */, EnvType envelope) {
         using env_type = EnvType::message_value_type;
         using buffer_type = std::ranges::range_value_t<BufferContainer>;
+        static_assert(no_integer_narrowing_v<env_type, buffer_type> && buffer_holds_rank_v<buffer_type>,
+                      "EnvelopeSerializationMerger: a message element (or the receiver PEID) would be narrowed by the "
+                      "buffer element type. Widen the scalar buffer, e.g. with_buffer_type<int64_t>() (or an unsigned "
+                      "buffer for unsigned messages).");
         std::vector<buffer_type> combined(envelope.message.size() + 2);  // extra space for receiver and size
         combined[0] = static_cast<buffer_type>(envelope.receiver);
         combined[1] = static_cast<buffer_type>(envelope.message.size());
@@ -139,6 +200,11 @@ template <typename MessageType>
 struct EnvelopeSerializationSplitter {
     template <MPIBuffer BufferContainer>
     auto operator()(BufferContainer const& buffer, PEID /* buffer_origin */, PEID /* my_rank */) const {
+        using buffer_type = std::ranges::range_value_t<BufferContainer>;
+        static_assert(no_integer_narrowing_v<MessageType, buffer_type> && buffer_holds_rank_v<buffer_type>,
+                      "EnvelopeSerializationSplitter: a message element (or the receiver PEID) would be narrowed by the "
+                      "buffer element type. Widen the scalar buffer, e.g. with_buffer_type<int64_t>() (or an unsigned "
+                      "buffer for unsigned messages).");
         return buffer | chunk_by_embedded_size(1) | std::views::transform([](auto chunk) {
                    PEID receiver = static_cast<PEID>(chunk[0]);
                    auto message = chunk | std::views::drop(2) |
@@ -147,6 +213,73 @@ struct EnvelopeSerializationSplitter {
                });
     }
 };
+
+/// @brief Merger that serializes fixed-size tuple-like messages (\c std::tuple, \c std::pair, ...)
+/// into a flat scalar buffer, prepending each message's final receiver as the first slot of its
+/// fixed-width record:
+///   [ receiver, field_0, field_1, ..., field_{N-1} ]
+/// Because the receiver survives serialization, this merger (paired with \ref TupleSplitter) supports
+/// routing indirection: an intermediate hop can recover the final destination after splitting and
+/// forward accordingly. Pair it with a scalar buffer type (e.g. \c with_buffer_type<int64_t>()) that
+/// every tuple field converts to.
+struct TupleMerger {
+    template <MPIBuffer BufferContainer, Envelope EnvType>
+        requires TupleLike<typename EnvType::message_value_type>
+    void operator()(BufferContainer& buffer, PEID /* buffer_destination */, PEID /* my_rank */, EnvType envelope) const {
+        using buffer_type = std::ranges::range_value_t<BufferContainer>;
+        static_assert(tuple_fits_buffer_v<typename EnvType::message_value_type, buffer_type>,
+                      "TupleMerger: a message field (or the receiver PEID) does not fit losslessly into the buffer "
+                      "element type. Widen the scalar buffer, e.g. with_buffer_type<int64_t>().");
+        for (auto const& message : envelope.message) {
+            buffer.push_back(static_cast<buffer_type>(envelope.receiver));
+            std::apply([&](auto const&... fields) { (buffer.push_back(static_cast<buffer_type>(fields)), ...); },
+                       message);
+        }
+    }
+
+    template <MPIBuffer BufferContainer, Envelope EnvType>
+        requires TupleLike<typename EnvType::message_value_type>
+    [[nodiscard]] std::size_t estimate_new_buffer_size(BufferContainer const& buffer,
+                                                       PEID /* buffer_destination */,
+                                                       PEID /* my_rank */,
+                                                       EnvType const& envelope) const {
+        constexpr std::size_t record_width = 1 + std::tuple_size_v<typename EnvType::message_value_type>;
+        return buffer.size() + (envelope.message.size() * record_width);
+    }
+};
+static_assert(Merger<TupleMerger, std::pair<int, int>, std::vector<int>>);
+static_assert(EstimatingMerger<TupleMerger, std::pair<int, int>, std::vector<int>>);
+static_assert(Merger<TupleMerger, std::tuple<int, int, int>, std::vector<int>>);
+static_assert(EstimatingMerger<TupleMerger, std::tuple<int, int, int>, std::vector<int>>);
+
+/// @brief Splitter counterpart to \ref TupleMerger. Reconstructs fixed-size tuple-like messages from a
+/// flat scalar buffer and reports each message's embedded receiver in the envelope, so the indirection
+/// adapter can re-route messages that have not yet reached their final destination.
+template <TupleLike Message>
+struct TupleSplitter {
+    static constexpr std::size_t arity = std::tuple_size_v<Message>;
+    static constexpr std::size_t record_width = 1 + arity;
+
+    auto operator()(MPIBuffer auto const& buffer, PEID /* buffer_origin */, PEID /* my_rank */) const {
+        using buffer_type = std::ranges::range_value_t<std::remove_cvref_t<decltype(buffer)>>;
+        static_assert(tuple_fits_buffer_v<Message, buffer_type>,
+                      "TupleSplitter: a message field (or the receiver PEID) does not fit losslessly into the buffer "
+                      "element type. Widen the scalar buffer, e.g. with_buffer_type<int64_t>().");
+        auto first = std::ranges::begin(buffer);
+        std::size_t const num_records = std::ranges::size(buffer) / record_width;
+        return std::views::iota(std::size_t{0}, num_records) | std::views::transform([first](std::size_t record) {
+                   auto const base = static_cast<std::ptrdiff_t>(record * record_width);
+                   auto receiver = static_cast<PEID>(first[base]);
+                   Message message = [&]<std::size_t... I>(std::index_sequence<I...>) {
+                       return Message{static_cast<std::tuple_element_t<I, Message>>(
+                           first[base + 1 + static_cast<std::ptrdiff_t>(I)])...};
+                   }(std::make_index_sequence<arity>{});
+                   return MessageEnvelope{std::ranges::single_view{std::move(message)}, PEID{0}, receiver, 0};
+               });
+    }
+};
+static_assert(Splitter<TupleSplitter<std::pair<int, int>>, std::pair<int, int>, std::vector<int>>);
+static_assert(Splitter<TupleSplitter<std::tuple<int, int, int>>, std::tuple<int, int, int>, std::vector<int>>);
 
 struct NoOpCleaner {
     template <typename BufferContainer>
