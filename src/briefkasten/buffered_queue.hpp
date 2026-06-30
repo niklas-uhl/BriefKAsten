@@ -68,19 +68,20 @@ public:
     using buffer_cleaner_type = BufferCleaner;
 
     BufferedMessageQueue(MPI_Comm comm,
-                         Config const config,
+                         Config const& config,
                          Merger merger = Merger{},
                          Splitter splitter = Splitter{},
                          BufferCleaner cleaner = BufferCleaner{})
-        : queue_(comm, config.num_request_slots, compute_buffer_size(config), config.send_backlog_capacity),
-          local_threshold_bytes_(config.local_threshold_bytes),
-          global_threshold_bytes_(config.global_threshold_bytes),
-          max_num_aggregation_buffers_(config.max_num_aggregation_buffers),
+        : config_(config),
+          queue_(comm, config_.num_request_slots, compute_buffer_size(config_), config_.send_backlog_capacity),
+          local_threshold_bytes_(config_.local_threshold_bytes),
+          global_threshold_bytes_(config_.global_threshold_bytes),
+          max_num_aggregation_buffers_(config_.max_num_aggregation_buffers),
           merge(std::move(merger)),
           split(std::move(splitter)),
           pre_send_cleanup(std::move(cleaner)),
-          flush_strategy_(config.flush_strategy) {
-        reserve_aggregation_buffers(config.num_request_slots);
+          flush_strategy_(config_.flush_strategy) {
+        reserve_aggregation_buffers(config_.num_request_slots);
     }
 
     ~BufferedMessageQueue() = default;
@@ -304,6 +305,10 @@ public:
 
     [[nodiscard]] size_t local_threshold_bytes() const {
         return local_threshold_bytes_;
+    }
+
+    [[nodiscard]] Config const& config() const {
+        return config_;
     }
 
     [[nodiscard]] PEID rank() const {
@@ -601,6 +606,7 @@ private:
                check_for_local_buffer_overflow(buffer, buffer_size_delta);
     }
 
+    Config config_;
     MessageQueue<BufferType, BufferContainer, ReceiveBufferContainer> queue_;
     BufferMap aggregation_buffers_;
     BufferList free_aggregation_buffers_;
