@@ -55,7 +55,12 @@ public:
             global_ = {.send = local_.send + additional.send, .receive = local_.receive + additional.receive};
             MPI_Iallreduce(MPI_IN_PLACE, &global_, 2, kamping::mpi_datatype<std::size_t>(), MPI_SUM, comm_,
                            &reduce_req_);
+            num_termination_rounds_++;
         }
+    }
+
+    [[nodiscard]] std::size_t num_termination_rounds() const {
+        return num_termination_rounds_;
     }
 
     [[nodiscard]] bool message_counting_finished() {
@@ -81,6 +86,7 @@ private:
     MPI_Comm comm_;
     MPI_Request reduce_req_ = MPI_REQUEST_NULL;
     MessageCounter local_{.send = 0, .receive = 0};
+    std::size_t num_termination_rounds_ = 0;
     MessageCounter global_{.send = 0, .receive = 0};
     MessageCounter previous_global_{.send = std::numeric_limits<std::size_t>::max(),
                                     .receive = std::numeric_limits<std::size_t>::max() - 1};

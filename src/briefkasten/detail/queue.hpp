@@ -81,7 +81,8 @@ public:
           size_(other.size_),
           allow_large_messages_(other.allow_large_messages_),
           termination_state_(other.termination_state_),
-          synchronous_mode_(other.synchronous_mode_) {
+          synchronous_mode_(other.synchronous_mode_),
+          poll_count_(other.poll_count_) {
         receiver_.rebind_termination_counter(termination_);
         large_message_receiver_.rebind_termination_counter(termination_);
     }
@@ -102,6 +103,7 @@ public:
         allow_large_messages_ = other.allow_large_messages_;
         termination_state_ = other.termination_state_;
         synchronous_mode_ = other.synchronous_mode_;
+        poll_count_ = other.poll_count_;
         receiver_.rebind_termination_counter(termination_);
         large_message_receiver_.rebind_termination_counter(termination_);
     }
@@ -159,9 +161,7 @@ public:
                         SendFinishedCallback<MessageContainer> auto&& on_finished_sending,
                         std::size_t poll_skip_threshold = DEFAULT_POLL_SKIP_THRESHOLD)
         -> std::optional<std::pair<bool, bool>> {
-        static std::size_t poll_count = 0;
-        if (poll_count % poll_skip_threshold == 0) {
-            poll_count++;
+        if (poll_count_++ % poll_skip_threshold == 0) {
             return poll(std::forward<decltype(on_message)>(on_message),
                         std::forward<decltype(on_finished_sending)>(on_finished_sending));
         }
@@ -278,6 +278,10 @@ public:
         return termination_.local_counts();
     }
 
+    [[nodiscard]] std::size_t num_termination_rounds() const {
+        return termination_.num_termination_rounds();
+    }
+
 private:
     void poll_until_no_outstanding_sends(
         MessageHandler<T, MessageContainer> auto&& on_message,
@@ -305,6 +309,7 @@ private:
     bool allow_large_messages_ = false;
     TerminationState termination_state_ = TerminationState::active;
     bool synchronous_mode_ = false;
+    std::size_t poll_count_ = 0;
 };
 
 }  // namespace briefkasten

@@ -424,6 +424,28 @@ public:
         return num_aggregation_buffers_;
     }
 
+    [[nodiscard]] std::size_t num_overflows() const {
+        return num_overflows_;
+    }
+
+    [[nodiscard]] std::size_t num_elements_flushed() const {
+        return num_elements_flushed_;
+    }
+
+    [[nodiscard]] std::size_t num_buffer_stalls() const {
+        return num_buffer_stalls_;
+    }
+
+    [[nodiscard]] std::size_t num_termination_rounds() const {
+        return queue_.num_termination_rounds();
+    }
+
+    void reset_stats() {
+        num_overflows_ = 0;
+        num_elements_flushed_ = 0;
+        num_buffer_stalls_ = 0;
+    }
+
 private:
     using BufferMap = std::unordered_map<PEID, BufferContainer>;
     using BufferList = std::vector<BufferContainer>;
@@ -469,6 +491,7 @@ private:
                 if (aggregation_buffers_.size() >= max_num_aggregation_buffers_) {
                     flush_largest_buffer();
                 }
+                num_buffer_stalls_++;
                 return std::nullopt;
             }
         }
@@ -506,8 +529,10 @@ private:
         bool overflow = false;
         if (check_for_buffer_overflow(buffer, estimated_new_buffer_size - old_buffer_size)) {
             overflow = true;
+            num_overflows_++;
             handle_overflow(it);  // customization point
             buffer = get_new_buffer();
+            old_buffer_size = buffer.size();  // fresh buffer; flush already adjusted global_buffer_size_
         }
         merge(buffer, receiver, queue_.rank(), std::move(envelope));
         auto new_buffer_size = buffer.size();
@@ -542,6 +567,7 @@ private:
         if (!queue_.has_send_capacity()) {
             return {buffer_it, false};
         }
+        num_elements_flushed_ += buffer_it->second.size();
         auto receipt = queue_.post_message(std::move(buffer_it->second), receiver);
         KASSERT(receipt.has_value(),
                 "We checked before that there is capacity, so posting the message should not fail.");
@@ -687,6 +713,9 @@ private:
     std::size_t max_num_aggregation_buffers_;
 
     std::size_t num_aggregation_buffers_ = 0;
+    std::size_t num_overflows_ = 0;
+    std::size_t num_elements_flushed_ = 0;
+    std::size_t num_buffer_stalls_ = 0;
 
     Merger merge;
     Splitter split;

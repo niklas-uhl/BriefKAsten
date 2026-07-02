@@ -267,6 +267,18 @@ public:
         return first_hop_queue_.num_allocated_buffers();
     }
 
+    [[nodiscard]] std::size_t num_termination_rounds() const {
+        return first_hop_queue_.num_termination_rounds();
+    }
+
+    [[nodiscard]] queue_type const& first_hop_queue() const {
+        return first_hop_queue_;
+    }
+
+    [[nodiscard]] queue_type const& second_hop_queue() const {
+        return second_hop_queue_;
+    }
+
 private:
     /// Distinct next-hop destinations the first-hop queue aggregates to. Every user message enters the first hop;
     /// same-group receivers are reached directly (group_size), cross-group receivers go via one proxy per other group
