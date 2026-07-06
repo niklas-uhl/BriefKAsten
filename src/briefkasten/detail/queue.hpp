@@ -43,7 +43,8 @@ enum class TerminationState : std::uint8_t { active, trying_termination, termina
 
 template <MPIType T,
           MPIBuffer<T> MessageContainer = std::vector<T>,
-          MPIBuffer<T> ReceiveBufferContainer = std::vector<T>>
+          MPIBuffer<T> ReceiveBufferContainer = std::vector<T>,
+          template <typename> typename Receiver = PersistentReceiver>
 class MessageQueue {
 public:
     MessageQueue(MPI_Comm comm,
@@ -301,7 +302,7 @@ private:
     int LARGE_MESSAGE_TAG = kamping::Environment<>::tag_upper_bound() - 2;
     internal::TerminationCounter termination_;
     Sender<MessageContainer> sender_;
-    PersistentReceiver<ReceiveBufferContainer> receiver_;
+    Receiver<ReceiveBufferContainer> receiver_;
     AllocatingProbeReceiver<ReceiveBufferContainer> large_message_receiver_;
     size_t reserved_receive_buffer_size_;
     PEID rank_ = 0;

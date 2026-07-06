@@ -80,7 +80,8 @@ template <typename MessageType,
           MPIBuffer<BufferType> ReceiveBufferContainer = std::vector<BufferType>,
           aggregation::Merger<MessageType, BufferContainer> Merger = aggregation::AppendMerger,
           aggregation::Splitter<MessageType, BufferContainer> Splitter = aggregation::NoSplitter,
-          aggregation::BufferCleaner<BufferContainer> BufferCleaner = aggregation::NoOpCleaner>
+          aggregation::BufferCleaner<BufferContainer> BufferCleaner = aggregation::NoOpCleaner,
+          template <typename> typename Receiver = PersistentReceiver>
 class BufferedMessageQueue {
 public:
     using message_type = MessageType;
@@ -738,7 +739,7 @@ private:
 
     Config user_config_;
     Config effective_config_;
-    MessageQueue<BufferType, BufferContainer, ReceiveBufferContainer> queue_;
+    MessageQueue<BufferType, BufferContainer, ReceiveBufferContainer, Receiver> queue_;
     BufferMap aggregation_buffers_;
     BufferList free_aggregation_buffers_;
     size_t local_threshold_bytes_;

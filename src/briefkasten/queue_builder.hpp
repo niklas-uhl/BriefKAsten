@@ -32,7 +32,8 @@ template <typename MessageType,
           typename ReceiveBufferContainer = std::vector<BufferType>,
           typename Merger = aggregation::AppendMerger,
           typename Splitter = aggregation::NoSplitter,
-          typename BufferCleaner = aggregation::NoOpCleaner>
+          typename BufferCleaner = aggregation::NoOpCleaner,
+          template <typename> typename Receiver = PersistentReceiver>
 class BufferedMessageQueueBuilder {
 private:
     BufferedMessageQueueBuilder(MPI_Comm comm, Config config, Merger merger, Splitter splitter, BufferCleaner cleaner)
@@ -49,7 +50,8 @@ private:
               typename ReceiveBufferContainer_,
               typename Merger_,
               typename Splitter_,
-              typename BufferCleaner_>
+              typename BufferCleaner_,
+              template <typename> typename Receiver_>
     friend class BufferedMessageQueueBuilder;  // Allow chaining of builder methods
 
 public:
@@ -61,36 +63,42 @@ public:
         requires aggregation::Merger<Merger_, MessageType, BufferContainer>
     [[nodiscard]] auto with_merger(Merger_ merger) {
         return BufferedMessageQueueBuilder<MessageType, BufferType, BufferContainer, ReceiveBufferContainer, Merger_,
-                                           Splitter, BufferCleaner>{comm_, config_, std::move(merger),
-                                                                    std::move(splitter_), std::move(cleaner_)};
+                                           Splitter, BufferCleaner, Receiver>{comm_, config_, std::move(merger),
+                                                                              std::move(splitter_), std::move(cleaner_)};
     }
     template <typename Splitter_>
         requires aggregation::Splitter<Splitter_, MessageType, BufferContainer>
     [[nodiscard]] auto with_splitter(Splitter_ splitter) {
         return BufferedMessageQueueBuilder<MessageType, BufferType, BufferContainer, ReceiveBufferContainer, Merger,
-                                           Splitter_, BufferCleaner>{comm_, config_, std::move(merger_),
-                                                                     std::move(splitter), std::move(cleaner_)};
+                                           Splitter_, BufferCleaner, Receiver>{comm_, config_, std::move(merger_),
+                                                                               std::move(splitter), std::move(cleaner_)};
     }
     template <typename BufferCleaner_>
         requires aggregation::BufferCleaner<BufferCleaner_, BufferContainer>
     [[nodiscard]] auto with_buffer_cleaner(BufferCleaner_ cleaner) {
         return BufferedMessageQueueBuilder<MessageType, BufferType, BufferContainer, ReceiveBufferContainer, Merger,
-                                           Splitter, BufferCleaner_>{comm_, config_, std::move(merger_),
-                                                                     std::move(splitter_), std::move(cleaner)};
+                                           Splitter, BufferCleaner_, Receiver>{comm_, config_, std::move(merger_),
+                                                                               std::move(splitter_), std::move(cleaner)};
     }
     template <MPIType BufferType_,
               MPIBuffer<BufferType_> BufferContainer_ = std::vector<BufferType_>,
               MPIBuffer<BufferType_> ReceiveBufferContainer_ = std::vector<BufferType_>>
     [[nodiscard]] auto with_buffer_type() {
         return BufferedMessageQueueBuilder<MessageType, BufferType_, BufferContainer_, ReceiveBufferContainer_, Merger,
-                                           Splitter, BufferCleaner>{comm_, config_, std::move(merger_),
-                                                                    std::move(splitter_), std::move(cleaner_)};
+                                           Splitter, BufferCleaner, Receiver>{comm_, config_, std::move(merger_),
+                                                                              std::move(splitter_), std::move(cleaner_)};
+    }
+    template <template <typename> typename Receiver_>
+    [[nodiscard]] auto with_receiver() {
+        return BufferedMessageQueueBuilder<MessageType, BufferType, BufferContainer, ReceiveBufferContainer, Merger,
+                                           Splitter, BufferCleaner, Receiver_>{comm_, config_, std::move(merger_),
+                                                                               std::move(splitter_), std::move(cleaner_)};
     }
 
     [[nodiscard]] auto build() {
         return BufferedMessageQueue<MessageType, BufferType, BufferContainer, ReceiveBufferContainer, Merger, Splitter,
-                                    BufferCleaner>(comm_, config_, std::move(merger_), std::move(splitter_),
-                                                   std::move(cleaner_));
+                                    BufferCleaner, Receiver>(comm_, config_, std::move(merger_), std::move(splitter_),
+                                                             std::move(cleaner_));
     }
 
 private:
