@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <kassert/kassert.hpp>
 #include <limits>
+#include <optional>
 #include <ranges>
 #include <tuple>
 #include <unordered_map>
@@ -44,12 +45,34 @@ enum class FlushStrategy : std::uint8_t { local, global, random, largest };
 
 struct Config {
     size_t num_request_slots = DEFAULT_NUM_REQUEST_SLOTS;
-    size_t max_num_aggregation_buffers = 2 * DEFAULT_NUM_REQUEST_SLOTS;
+    std::optional<std::size_t> max_num_aggregation_buffers = std::nullopt;
     FlushStrategy flush_strategy = FlushStrategy::local;
     size_t global_threshold_bytes = std::numeric_limits<size_t>::max();
     std::size_t local_threshold_bytes = DEFAULT_BUFFER_THRESHOLD;
-    std::size_t send_backlog_capacity = 0;
+    std::optional<std::size_t> send_backlog_capacity = std::nullopt;
 };
+
+/// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
+/// destinations, leaving any field that was set explicitly (i.e. differs from Config{}) untouched.
+///
+/// Sizes for double buffering so a destination never stalls on a premature flush:
+///   send_backlog_capacity       = fan_out   (absorbs up to fan_out concurrent flushes without blocking)
+///   max_num_aggregation_buffers = 2*fan_out + num_request_slots
+///                               = fan_out (filling) + fan_out (backlog) + num_request_slots (in flight)
+///
+/// Buffers are allocated lazily, so sparse workloads pay only for their active destinations.
+/// For large fan_out, startup overhead (MPI connection setup, NIC resources) grows with the number
+/// of distinct partners — buffer sizing cannot address that. Use IndirectionAdapter to reduce live
+/// partners to O(sqrt(p)) when startup overhead dominates.
+inline Config apply_fan_out_defaults(Config config, std::size_t fan_out) {
+    if (!config.send_backlog_capacity) {
+        config.send_backlog_capacity = fan_out;
+    }
+    if (!config.max_num_aggregation_buffers) {
+        config.max_num_aggregation_buffers = (2 * fan_out) + config.num_request_slots;
+    }
+    return config;
+}
 
 template <typename MessageType,
           MPIType BufferType = MessageType,
@@ -73,10 +96,12 @@ public:
                          Splitter splitter = Splitter{},
                          BufferCleaner cleaner = BufferCleaner{})
         : config_(config),
-          queue_(comm, config_.num_request_slots, compute_buffer_size(config_), config_.send_backlog_capacity),
+          queue_(comm, config_.num_request_slots, compute_buffer_size(config_),
+                 apply_comm_size_defaults(comm, config_).send_backlog_capacity.value()),
           local_threshold_bytes_(config_.local_threshold_bytes),
           global_threshold_bytes_(config_.global_threshold_bytes),
-          max_num_aggregation_buffers_(config_.max_num_aggregation_buffers),
+          max_num_aggregation_buffers_(apply_comm_size_defaults(comm, config_).max_num_aggregation_buffers.value()),
+          send_backlog_capacity_(apply_comm_size_defaults(comm, config_).send_backlog_capacity.value()),
           merge(std::move(merger)),
           split(std::move(splitter)),
           pre_send_cleanup(std::move(cleaner)),
@@ -390,12 +415,13 @@ public:
 
     /// Adjust the underlying send backlog capacity at runtime (see Sender::set_send_backlog_capacity).
     void send_backlog_capacity(std::size_t new_capacity) {
+        send_backlog_capacity_ = new_capacity;
         config_.send_backlog_capacity = new_capacity;
         queue_.set_send_backlog_capacity(new_capacity);
     }
 
     [[nodiscard]] std::size_t send_backlog_capacity() const {
-        return config_.send_backlog_capacity;
+        return send_backlog_capacity_;
     }
 
     [[nodiscard]] PEID rank() const {
@@ -449,6 +475,13 @@ public:
 private:
     using BufferMap = std::unordered_map<PEID, BufferContainer>;
     using BufferList = std::vector<BufferContainer>;
+
+    // Fan-out for the direct case is p: every rank is a potential destination.
+    static Config apply_comm_size_defaults(MPI_Comm comm, Config config) {
+        int size;
+        MPI_Comm_size(comm, &size);
+        return apply_fan_out_defaults(std::move(config), static_cast<std::size_t>(size));
+    }
 
     static std::size_t compute_buffer_size(Config const& config) {
         if (config.local_threshold_bytes != std::numeric_limits<std::size_t>::max()) {
@@ -711,6 +744,7 @@ private:
     size_t local_threshold_bytes_;
     size_t global_threshold_bytes_;
     std::size_t max_num_aggregation_buffers_;
+    std::size_t send_backlog_capacity_;
 
     std::size_t num_aggregation_buffers_ = 0;
     std::size_t num_overflows_ = 0;

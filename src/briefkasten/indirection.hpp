@@ -63,8 +63,8 @@ public:
         // first-hop queue was built and moved in by the caller, so its send backlog is already baked into its sender;
         // reconfigure it here to the first-hop defaults.
         auto first_cfg = derive_indirection_config(first_hop_queue_.config(), first_hop_fan_out(indirection_));
-        first_hop_queue_.max_num_aggregation_buffers(first_cfg.max_num_aggregation_buffers);
-        first_hop_queue_.send_backlog_capacity(first_cfg.send_backlog_capacity);
+        first_hop_queue_.max_num_aggregation_buffers(first_cfg.max_num_aggregation_buffers.value());
+        first_hop_queue_.send_backlog_capacity(first_cfg.send_backlog_capacity.value());
     }
 
     auto& indirection_scheme() {
@@ -292,23 +292,12 @@ private:
         return static_cast<std::size_t>(indirector.group_size());
     }
 
-    /// Derive topology-aware buffering defaults for one hop from that hop's fan-out, leaving any field the caller set
-    /// explicitly (i.e. that differs from the library default) untouched.
-    ///
-    /// Indirection bounds a hop's distinct destinations to `fan_out`, so unlike the un-indirected case we can afford a
-    /// buffer per destination. We size for double buffering: one buffer per destination filling while its predecessor
-    /// drains. That second buffer only materializes if the send pipeline is deep enough to hold `fan_out` sends
-    /// outstanding, which is why the backlog is set to `fan_out`:
-    ///   max_num_aggregation_buffers = fan_out (filling) + fan_out (backlog) + num_request_slots (in flight).
+    /// Derive topology-aware buffering defaults for one hop from that hop's fan-out.
+    /// Indirection bounds a hop's distinct destinations to `fan_out`, which is O(sqrt(p)) for a
+    /// square grid — this is what keeps startup overhead (live MPI partners) tractable at scale.
+    /// Delegates to apply_fan_out_defaults for the actual sizing (see its doc for the formula).
     static Config derive_indirection_config(Config config, std::size_t fan_out) {
-        Config const defaults;
-        if (config.send_backlog_capacity == defaults.send_backlog_capacity) {
-            config.send_backlog_capacity = fan_out;
-        }
-        if (config.max_num_aggregation_buffers == defaults.max_num_aggregation_buffers) {
-            config.max_num_aggregation_buffers = (2 * fan_out) + config.num_request_slots;
-        }
-        return config;
+        return apply_fan_out_defaults(std::move(config), fan_out);
     }
 
     auto redirection_handler(MessageHandler<typename queue_type::message_type> auto&& on_message) {
