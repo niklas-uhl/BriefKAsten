@@ -209,7 +209,7 @@ public:
 #else
         namespace views = std::views;
 #endif
-        for (auto& [buffer, request, status] : views::zip(receive_buffers_, receive_requests_, statuses)) {
+        for (auto&& [buffer, request, status] : views::zip(receive_buffers_, receive_requests_, statuses)) {
             int cancelled = 0;
             MPI_Test_cancelled(&status, &cancelled);
             if (!cancelled) {
@@ -325,7 +325,7 @@ public:
 #else
             namespace views = std::views;
 #endif
-            for (auto& [buffer, status] : views::zip(buffers, statuses_)) {
+            for (auto&& [buffer, status] : views::zip(buffers, statuses_)) {
                 termination_->track_receive();
                 auto envelope = internal::build_envelope(buffer, status, rank_);
                 on_message(std::move(envelope));
@@ -336,7 +336,7 @@ public:
         while (probe_successful && round < max_receives) {
             MPI_Improbe(MPI_ANY_SOURCE, tag_, comm_, &probe_successful, &message, &status);
             if (!probe_successful) {
-                continue;
+                break;
             }
             auto& buffer = receive_buffers_[num_recvs];
             auto& request = receive_requests_[num_recvs];
@@ -349,7 +349,7 @@ public:
             round++;
         }
         receive_all();
-        return round == 0;  // No messages available
+        return round != 0;
     }
 
     void resize_buffers(std::size_t new_size, MessageHandler<value_type, std::span<value_type>> auto&& /*on_message*/) {
