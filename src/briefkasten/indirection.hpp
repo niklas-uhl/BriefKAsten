@@ -201,8 +201,14 @@ public:
         // one while peers are still in the first, mismatching the per-communicator allreduces. Instead we fold the
         // second hop into the first hop's counting round (additional_counts), drain the second hop every round
         // (progress + extra_round_prepare), and treat any second-hop delivery as activity that aborts the attempt.
+        // Tracks whether a second-hop delivery (real BFS work) arrived during extra_round_prepare.
+        // Distinct from first-hop reactivation, which is relay forwarding traffic and must not
+        // abort the second-hop buffer drain — the relay needs to flush its forwarding backlog
+        // regardless of how busy the first hop is.
+        bool second_hop_delivered = false;
         auto second_hop_handler = [&](Envelope<typename queue_type::message_type> auto envelope) {
             first_hop_queue_.reactivate();  // a final delivery means the system is not quiescent -> abort and retry
+            second_hop_delivered = true;
             on_message(std::move(envelope));
         };
         return first_hop_queue_.terminate(
@@ -213,11 +219,13 @@ public:
             },
             [&] { return second_hop_queue_.message_counts(); },
             [&] {
-                // Stop as soon as new work arrives (first-hop receive, or a second-hop delivery which
-                // second_hop_handler funnels into first_hop_queue_.reactivate()): the attempt will abort anyway, so
-                // don't force out small, not-yet-full second-hop buffers.
+                // Stop only when a second-hop delivery (new BFS work) arrives — not when the first hop
+                // is merely busy with relay forwarding traffic. Stopping on first-hop reactivation alone
+                // leaves the second-hop buffer undrained, which prevents termination from ever succeeding
+                // on RMAT-style graphs where the first hop stays continuously active (livelock).
+                second_hop_delivered = false;
                 second_hop_queue_.flush_all_buffers_blocking(second_hop_handler, [&] {
-                    return first_hop_queue_.termination_state() == TerminationState::active;
+                    return second_hop_delivered;
                 });
             });
     }
