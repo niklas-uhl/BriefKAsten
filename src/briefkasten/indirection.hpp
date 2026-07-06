@@ -295,7 +295,7 @@ private:
     /// Derive topology-aware buffering defaults for one hop from that hop's fan-out.
     /// Indirection bounds a hop's distinct destinations to `fan_out`, which is O(sqrt(p)) for a
     /// square grid — this is what keeps startup overhead (live MPI partners) tractable at scale.
-    /// Delegates to apply_fan_out_defaults for the actual sizing (see its doc for the formula).
+    /// Delegates to apply_fan_out_defaults, which respects any values the user explicitly set.
     static Config derive_indirection_config(Config config, std::size_t fan_out) {
         return apply_fan_out_defaults(std::move(config), fan_out);
     }

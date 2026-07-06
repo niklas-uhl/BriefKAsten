@@ -95,18 +95,18 @@ public:
                          Merger merger = Merger{},
                          Splitter splitter = Splitter{},
                          BufferCleaner cleaner = BufferCleaner{})
-        : config_(config),
-          queue_(comm, config_.num_request_slots, compute_buffer_size(config_),
-                 apply_comm_size_defaults(comm, config_).send_backlog_capacity.value()),
-          local_threshold_bytes_(config_.local_threshold_bytes),
-          global_threshold_bytes_(config_.global_threshold_bytes),
-          max_num_aggregation_buffers_(apply_comm_size_defaults(comm, config_).max_num_aggregation_buffers.value()),
-          send_backlog_capacity_(apply_comm_size_defaults(comm, config_).send_backlog_capacity.value()),
+        : user_config_(config),
+          effective_config_(apply_comm_size_defaults(comm, user_config_)),
+          queue_(comm, effective_config_.num_request_slots, compute_buffer_size(effective_config_),
+                 effective_config_.send_backlog_capacity.value()),
+          local_threshold_bytes_(effective_config_.local_threshold_bytes),
+          global_threshold_bytes_(effective_config_.global_threshold_bytes),
+          max_num_aggregation_buffers_(effective_config_.max_num_aggregation_buffers.value()),
           merge(std::move(merger)),
           split(std::move(splitter)),
           pre_send_cleanup(std::move(cleaner)),
-          flush_strategy_(config_.flush_strategy) {
-        reserve_aggregation_buffers(config_.num_request_slots);
+          flush_strategy_(effective_config_.flush_strategy) {
+        reserve_aggregation_buffers(effective_config_.num_request_slots);
     }
 
     ~BufferedMessageQueue() = default;
@@ -399,14 +399,14 @@ public:
     }
 
     [[nodiscard]] Config const& config() const {
-        return config_;
+        return user_config_;
     }
 
     /// Raise (or lower) the cap on concurrently held aggregation buffers. The cap only bounds lazy growth in
     /// acquire_buffer(), so adjusting it after construction is safe; already-allocated buffers are untouched.
     void max_num_aggregation_buffers(std::size_t new_max) {
         max_num_aggregation_buffers_ = new_max;
-        config_.max_num_aggregation_buffers = new_max;
+        effective_config_.max_num_aggregation_buffers = new_max;
     }
 
     [[nodiscard]] std::size_t max_num_aggregation_buffers() const {
@@ -415,13 +415,12 @@ public:
 
     /// Adjust the underlying send backlog capacity at runtime (see Sender::set_send_backlog_capacity).
     void send_backlog_capacity(std::size_t new_capacity) {
-        send_backlog_capacity_ = new_capacity;
-        config_.send_backlog_capacity = new_capacity;
+        effective_config_.send_backlog_capacity = new_capacity;
         queue_.set_send_backlog_capacity(new_capacity);
     }
 
     [[nodiscard]] std::size_t send_backlog_capacity() const {
-        return send_backlog_capacity_;
+        return effective_config_.send_backlog_capacity.value();
     }
 
     [[nodiscard]] PEID rank() const {
@@ -737,14 +736,14 @@ private:
                check_for_local_buffer_overflow(buffer, buffer_size_delta);
     }
 
-    Config config_;
+    Config user_config_;
+    Config effective_config_;
     MessageQueue<BufferType, BufferContainer, ReceiveBufferContainer> queue_;
     BufferMap aggregation_buffers_;
     BufferList free_aggregation_buffers_;
     size_t local_threshold_bytes_;
     size_t global_threshold_bytes_;
     std::size_t max_num_aggregation_buffers_;
-    std::size_t send_backlog_capacity_;
 
     std::size_t num_aggregation_buffers_ = 0;
     std::size_t num_overflows_ = 0;
