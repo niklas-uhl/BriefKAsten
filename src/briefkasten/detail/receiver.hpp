@@ -287,6 +287,9 @@ public:
     }
 
     bool probe_for_one_message(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
+        if (slots_in_use_ >= receive_buffers_.size()) {
+            return false;
+        }
         MPI_Message message = MPI_MESSAGE_NULL;
         MPI_Status status;
         int probe_successful = 0;
@@ -294,11 +297,15 @@ public:
         if (!probe_successful) {
             return false;
         }
-        auto& buffer = receive_buffers_.front();
+        // Reserve the slot before calling on_message. handle_overflow inside on_message fires before merge() reads the
+        // buffer (see post_message_impl), so without this, a recursive probe call would overwrite our slot.
+        std::size_t my_slot = slots_in_use_++;
+        auto& buffer = receive_buffers_[my_slot];
         MPI_Mrecv_c(buffer.data(), buffer.size(), kamping::mpi_datatype<value_type>(), &message, &status);
         termination_->track_receive();
         auto envelope = internal::build_envelope(buffer, status, rank_);
         on_message(std::move(envelope));
+        slots_in_use_--;
         return true;
     }
 
@@ -308,7 +315,11 @@ public:
 
     bool probe_for_messages(MessageHandler<value_type, std::span<value_type>> auto&& on_message,
                             std::size_t max_receives) {
-        // TODO check if this works when called recursively
+        if (slots_in_use_ >= receive_buffers_.size()) {
+            return false;
+        }
+        std::size_t start = slots_in_use_;
+        std::size_t limit = std::min(max_receives, receive_buffers_.size() - start);
         MPI_Message message = MPI_MESSAGE_NULL;
         MPI_Status status;
         int probe_successful = 1;
@@ -318,32 +329,28 @@ public:
             if (num_recvs == 0) {
                 return;
             }
-            MPI_Waitall(num_recvs, receive_requests_.data(), statuses_.data());
-            auto buffers = std::span(receive_buffers_).first(num_recvs);
-#ifdef BRIEFKASTEN_CXX20
-            namespace views = ranges::views;
-#else
-            namespace views = std::views;
-#endif
-            for (auto&& [buffer, status] : views::zip(buffers, statuses_)) {
+            MPI_Waitall(num_recvs, receive_requests_.data() + start, statuses_.data() + start);
+            // Mark all slots occupied before any on_message call. handle_overflow inside on_message fires before
+            // merge() reads the buffer (see post_message_impl line ordering), so a recursive probe triggered by the
+            // progress_hook would otherwise overwrite a slot still needed by a later on_message call.
+            slots_in_use_ += num_recvs;
+            for (std::size_t i = 0; i < num_recvs; i++) {
                 termination_->track_receive();
-                auto envelope = internal::build_envelope(buffer, status, rank_);
+                auto envelope = internal::build_envelope(receive_buffers_[start + i], statuses_[start + i], rank_);
                 on_message(std::move(envelope));
             }
-
+            slots_in_use_ -= num_recvs;
             num_recvs = 0;
         };
-        while (probe_successful && round < max_receives) {
+        while (probe_successful && round < limit) {
             MPI_Improbe(MPI_ANY_SOURCE, tag_, comm_, &probe_successful, &message, &status);
             if (!probe_successful) {
                 break;
             }
-            auto& buffer = receive_buffers_[num_recvs];
-            auto& request = receive_requests_[num_recvs];
-
-            MPI_Imrecv_c(buffer.data(), buffer.size(), kamping::mpi_datatype<value_type>(), &message, &request);
+            MPI_Imrecv_c(receive_buffers_[start + num_recvs].data(), receive_buffers_[start + num_recvs].size(),
+                         kamping::mpi_datatype<value_type>(), &message, &receive_requests_[start + num_recvs]);
             num_recvs++;
-            if (num_recvs == receive_buffers_.size()) {
+            if (start + num_recvs == receive_buffers_.size()) {
                 receive_all();
             }
             round++;
@@ -366,6 +373,9 @@ private:
     std::vector<MPI_Status> statuses_;
     internal::TerminationCounter* termination_;
     int rank_ = 0;
+    // Number of slots currently held by an active probe call. Prevents recursive probes (via the progress_hook inside
+    // handle_overflow) from reusing slots whose buffers are still referenced by a span in an outer on_message call.
+    std::size_t slots_in_use_ = 0;
 };
 
 template <MPIBuffer ReceiveBufferContainer>
