@@ -697,14 +697,19 @@ private:
     void resolve_overflow_blocking(BufferMap::iterator current_buffer,
                                    MessageHandler<MessageType> auto&& on_message,
                                    std::invocable<> auto&& progress_hook) {
-        while (true) {
-            auto res = poll(std::forward<decltype(on_message)>(on_message));
-            if (res && res->first) {  // finished some send
-                break;
-            }
+        // Block only while send slots are actually exhausted; polling frees them as peers receive.
+        // Gate on send *capacity* (what the flush needs), not on a send *completion* event: if this queue
+        // has no outstanding send, no completion will ever fire, so waiting for one deadlocks even though a
+        // slot is already free and the flush could proceed immediately. This also matters because a receiver
+        // that stops draining while blocked (e.g. ProbeReceiver, once its recursion guard has consumed every
+        // receive slot) removes the incoming traffic whose receipt is what lets remote sends — and thus our
+        // awaited local completion — make progress; PersistentReceiver masks this by never refusing to receive.
+        // Mirrors flush_all_buffers_blocking.
+        while (!queue_.has_send_capacity()) {
+            poll(std::forward<decltype(on_message)>(on_message));
             progress_hook();
         }
-        // now actually resolve the overflow
+        // capacity is ensured, so the flush must succeed
         bool success = resolve_overflow(current_buffer);
         if (success) {
             return;

@@ -213,12 +213,14 @@ public:
             },
             [&] { return second_hop_queue_.message_counts(); },
             [&] {
-                // Stop as soon as new work arrives (first-hop receive, or a second-hop delivery which
-                // second_hop_handler funnels into first_hop_queue_.reactivate()): the attempt will abort anyway, so
-                // don't force out small, not-yet-full second-hop buffers.
-                second_hop_queue_.flush_all_buffers_blocking(second_hop_handler, [&] {
-                    return first_hop_queue_.termination_state() == TerminationState::active;
-                });
+                // Drain all second-hop send buffers unconditionally. Any activity-based stop predicate
+                // fails here because relay PEs are also destinations: an incoming delivery fires the
+                // predicate on the very first poll, leaving the relay's forwarding backlog permanently
+                // undrained — the allreduce never sees a balanced send/receive count → livelock.
+                // Unlike the old single-queue design (where redirected messages re-entered the same
+                // queue, amplifying work), the two-queue split means flushing second_hop_queue_ only
+                // delivers messages to final destinations; there is no feedback that grows this queue.
+                second_hop_queue_.flush_all_buffers_blocking(second_hop_handler, [] { return false; });
             });
     }
 
