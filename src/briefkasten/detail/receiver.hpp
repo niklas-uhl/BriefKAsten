@@ -219,6 +219,7 @@ public:
             }
             MPI_Request_free(&request);
             buffer.resize(new_size);
+#if MPI_VERSION >= 4
             MPI_Recv_init_c(buffer.data(),                        // buf
                             buffer.size(),                        // count
                             kamping::mpi_datatype<value_type>(),  // datatype
@@ -227,6 +228,16 @@ public:
                             comm_,                                // comm
                             &request                              // request
             );
+#else
+            MPI_Recv_init(buffer.data(),                        // buf
+                          static_cast<int>(buffer.size()),      // count
+                          kamping::mpi_datatype<value_type>(),  // datatype
+                          MPI_ANY_SOURCE,                       // source
+                          tag_,                                 // tag
+                          comm_,                                // comm
+                          &request                              // request
+            );
+#endif
         }
     }
 
@@ -490,7 +501,12 @@ public:
         // buffer (see post_message_impl), so without this, a recursive probe call would overwrite our slot.
         std::size_t my_slot = slots_in_use_++;
         auto& buffer = receive_buffers_[my_slot];
+#if MPI_VERSION >= 4
         MPI_Mrecv_c(buffer.data(), buffer.size(), kamping::mpi_datatype<value_type>(), &message, &status);
+#else
+        MPI_Mrecv(buffer.data(), static_cast<int>(buffer.size()), kamping::mpi_datatype<value_type>(), &message,
+                  &status);
+#endif
         termination_->track_receive();
         auto envelope = internal::build_envelope(buffer, status, rank_);
         on_message(std::move(envelope));
@@ -599,12 +615,22 @@ public:
             if (!probe_successful) {
                 continue;
             }
+#if MPI_VERSION >= 4
             MPI_Count count = 0;
             MPI_Get_count_c(&status, kamping::mpi_datatype<value_type>(), &count);
+#else
+            int count = 0;
+            MPI_Get_count(&status, kamping::mpi_datatype<value_type>(), &count);
+#endif
             auto& buffer = receive_buffers_.emplace_back(count);
             auto& request = receive_requests_.emplace_back(MPI_REQUEST_NULL);
 
+#if MPI_VERSION >= 4
             MPI_Imrecv_c(buffer.data(), buffer.size(), kamping::mpi_datatype<value_type>(), &message, &request);
+#else
+            MPI_Imrecv(buffer.data(), static_cast<int>(buffer.size()), kamping::mpi_datatype<value_type>(), &message,
+                       &request);
+#endif
             round++;
         }
         if (round == 0) {
