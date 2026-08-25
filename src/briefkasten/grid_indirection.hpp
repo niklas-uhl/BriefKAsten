@@ -58,7 +58,21 @@ public:
         return (static_cast<std::size_t>(my_size_) + grid_size_ - 1) / grid_size_;
     }
 
+    /// Constructs a scheme with an explicit (rank, size) pair instead of deriving them from a live MPI communicator.
+    /// This lets tests exercise the routing logic (`next_hop`) for arbitrary, in particular non-square,
+    /// `comm_size` values without actually running under MPI with that many ranks. `comm_` is left null; nothing in
+    /// this class dereferences it after construction. Not part of the `IndirectionScheme` concept.
+    [[nodiscard]] static GridIndirectionScheme for_testing(PEID rank, PEID comm_size) {
+        GridIndirectionScheme scheme;
+        scheme.my_rank_ = rank;
+        scheme.my_size_ = comm_size;
+        scheme.grid_size_ = static_cast<int>(std::round(std::sqrt(comm_size)));
+        return scheme;
+    }
+
 private:
+    GridIndirectionScheme() = default;
+
     [[nodiscard]] int rank() const {
         return my_rank_;
     }
@@ -90,13 +104,22 @@ private:
         if (grid_position_to_rank(proxy) >= size()) {
             proxy = {.row = from_pos.column, .column = to_pos.column};
         }
-        if (proxy == from_pos) {
+        // The column-swapped fallback above reuses `from`'s column as a row index. Nothing here algebraically
+        // guarantees that position is populated either: with `grid_size_ = round(sqrt(size()))` one can show
+        // `group_size() >= grid_size_` always holds, which happens to make this particular fallback provably safe
+        // today -- but that's a non-obvious numeric fact tied to the exact sizing formula above, not something
+        // visible from this function in isolation, and it would silently stop holding if that formula ever changed.
+        // Validate explicitly instead of leaning on it (or on the KASSERT below, which is compiled out under
+        // NDEBUG): if the fallback is still out of range, or degenerates to `from_pos`, drop all the way back to
+        // `to_pos`, which is always in range because `to` is a real rank passed in by the caller.
+        if (proxy == from_pos || grid_position_to_rank(proxy) >= size()) {
             proxy = to_pos;
         }
         KASSERT(grid_position_to_rank(proxy) < size());
         return grid_position_to_rank(proxy);
     }
-    MPI_Comm comm_;
+
+    MPI_Comm comm_ = MPI_COMM_NULL;
     PEID grid_size_ = 0;
     int my_rank_ = 0;
     int my_size_ = 0;

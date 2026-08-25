@@ -22,3 +22,8 @@ add_executable(view_adaptor_test view_adaptor_test.cpp)
 target_link_libraries(view_adaptor_test PRIVATE BriefKAsten::BriefKAsten)
 target_link_libraries(view_adaptor_test PRIVATE GTest::gtest_main GTest::gmock)
 gtest_discover_tests(view_adaptor_test)
+
+add_executable(grid_indirection_test grid_indirection_test.cpp)
+target_link_libraries(grid_indirection_test PRIVATE BriefKAsten::BriefKAsten)
+target_link_libraries(grid_indirection_test PRIVATE GTest::gtest_main GTest::gmock)
+gtest_discover_tests(grid_indirection_test)
