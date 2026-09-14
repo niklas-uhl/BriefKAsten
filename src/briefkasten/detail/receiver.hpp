@@ -52,10 +52,35 @@ auto build_envelope(MPIBuffer auto const& buffer, MPI_Status& status, int rank)
     auto envelope = MessageEnvelope<std::span<const T>>{std::move(message), status.MPI_SOURCE, rank, status.MPI_TAG};
     return envelope;
 }
+
+/// @brief Counts how often this receiver (re-)posts a receive to MPI, over the receiver's whole lifetime.
+///
+/// This is the quantity that drives per-transport receive-descriptor accounting: on PSM2/IntelMPI every
+/// `MPI_Start` on a persistent request allocates an MQ irecv descriptor that is not released until
+/// `MPI_Request_free`, so a long-running `PersistentReceiver` accumulates them against
+/// `PSM2_MQ_RECVREQS_MAX` while a `ProbeReceiver` (which frees on completion) does not. The count is
+/// deliberately *not* reset by `reset_counters()`: the resource it tracks is not reset either, and the
+/// interesting signal is the running total since MPI_Init, not the per-phase delta. Callers that want a
+/// per-phase figure take differences themselves.
+class ReceiveArmCounter {
+public:
+    [[nodiscard]] std::size_t num_receive_arms() const {
+        return num_receive_arms_;
+    }
+
+protected:
+    /// One integer increment on a path that already performs an MPI call, so the cost is not measurable.
+    void count_receive_arm() {
+        num_receive_arms_++;
+    }
+
+private:
+    std::size_t num_receive_arms_ = 0;
+};
 }  // namespace internal
 
 template <MPIBuffer ReceiveBufferContainer>
-class PersistentReceiver {
+class PersistentReceiver : public internal::ReceiveArmCounter {
 public:
     using value_type = std::ranges::range_value_t<ReceiveBufferContainer>;
     // NOLINTBEGIN(*-easily-swappable-parameters)
@@ -100,6 +125,7 @@ public:
             );
 #endif
             MPI_Start(&request);
+            count_receive_arm();
         }
     }
 
@@ -155,6 +181,7 @@ public:
         auto envelope = build_envelope(buffer, status, rank_);
         on_message(std::move(envelope));
         MPI_Start(&receive_requests_[index]);
+        count_receive_arm();
         unstep_probe_recursion();
         return true;
     }
@@ -193,6 +220,7 @@ public:
             auto envelope = internal::build_envelope(buffer, status, rank_);
             on_message(std::move(envelope));
             MPI_Start(&request);
+            count_receive_arm();
         }
         unstep_probe_recursion();
         return true;
@@ -279,7 +307,7 @@ private:
 // created and freed each cycle, so nothing accumulates. Memory and back-pressure are identical to PersistentReceiver
 // (bounded at num_receive_slots buffers).
 template <MPIBuffer ReceiveBufferContainer>
-class PrepostingReceiver {
+class PrepostingReceiver : public internal::ReceiveArmCounter {
 public:
     using value_type = std::ranges::range_value_t<ReceiveBufferContainer>;
     // NOLINTBEGIN(*-easily-swappable-parameters)
@@ -435,6 +463,7 @@ private:
                   &request                              // request
         );
 #endif
+        count_receive_arm();
     }
 
     auto step_probe_recursion() -> std::tuple<std::vector<MPI_Status>&, std::vector<int>&> {
@@ -462,7 +491,7 @@ private:
 };
 
 template <MPIBuffer ReceiveBufferContainer>
-class ProbeReceiver {
+class ProbeReceiver : public internal::ReceiveArmCounter {
 public:
     using value_type = std::ranges::range_value_t<ReceiveBufferContainer>;
     // NOLINTBEGIN(*-easily-swappable-parameters)
@@ -507,6 +536,7 @@ public:
         MPI_Mrecv(buffer.data(), static_cast<int>(buffer.size()), kamping::mpi_datatype<value_type>(), &message,
                   &status);
 #endif
+        count_receive_arm();
         termination_->track_receive();
         auto envelope = internal::build_envelope(buffer, status, rank_);
         on_message(std::move(envelope));
@@ -556,7 +586,7 @@ private:
 };
 
 template <MPIBuffer ReceiveBufferContainer>
-class AllocatingProbeReceiver {
+class AllocatingProbeReceiver : public internal::ReceiveArmCounter {
 public:
     using value_type = std::ranges::range_value_t<ReceiveBufferContainer>;
     // NOLINTBEGIN(*-easily-swappable-parameters)
@@ -597,6 +627,7 @@ public:
         MPI_Mrecv(buffer.data(), static_cast<int>(buffer.size()), kamping::mpi_datatype<value_type>(), &message,
                   &status);
 #endif
+        count_receive_arm();
         termination_->track_receive();
         auto envelope =
             MessageEnvelope<ReceiveBufferContainer>{std::move(buffer), status.MPI_SOURCE, rank_, status.MPI_TAG};
@@ -631,6 +662,7 @@ public:
             MPI_Imrecv(buffer.data(), static_cast<int>(buffer.size()), kamping::mpi_datatype<value_type>(), &message,
                        &request);
 #endif
+            count_receive_arm();
             round++;
         }
         if (round == 0) {

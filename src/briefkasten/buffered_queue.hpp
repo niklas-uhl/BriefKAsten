@@ -322,6 +322,7 @@ public:
                 return;
             }
             while (!queue_.has_send_capacity()) {
+                num_send_capacity_waits_++;
                 poll(on_message);  // only block when slots are exhausted; polling frees them as peers receive
                 if (should_stop()) {
                     return;
@@ -466,10 +467,48 @@ public:
         return queue_.num_termination_rounds();
     }
 
+    /// Iterations spent spinning in \ref flush_all_buffers_blocking because the sender had neither a free
+    /// request slot nor backlog room. Complements \ref num_buffer_stalls, which only covers exhaustion of the
+    /// *aggregation* buffer pool and stays at zero when the request pool is the bottleneck.
+    [[nodiscard]] std::size_t num_send_capacity_waits() const {
+        return num_send_capacity_waits_;
+    }
+
+    [[nodiscard]] std::size_t num_polls() const {
+        return queue_.num_polls();
+    }
+
+    [[nodiscard]] std::size_t num_unproductive_polls() const {
+        return queue_.num_unproductive_polls();
+    }
+
+    /// Receive (re-)arms issued over the underlying queue's lifetime; not reset by \ref reset_stats.
+    [[nodiscard]] std::size_t num_receive_arms() const {
+        return queue_.num_receive_arms();
+    }
+
+    [[nodiscard]] std::size_t num_immediate_sends() const {
+        return queue_.num_immediate_sends();
+    }
+
+    [[nodiscard]] std::size_t num_backlogged_sends() const {
+        return queue_.num_backlogged_sends();
+    }
+
+    [[nodiscard]] std::size_t num_send_capacity_misses() const {
+        return queue_.num_send_capacity_misses();
+    }
+
+    [[nodiscard]] std::size_t peak_send_backlog() const {
+        return queue_.peak_send_backlog();
+    }
+
     void reset_stats() {
         num_overflows_ = 0;
         num_elements_flushed_ = 0;
         num_buffer_stalls_ = 0;
+        num_send_capacity_waits_ = 0;
+        queue_.reset_counters();
     }
 
 private:
@@ -755,6 +794,7 @@ private:
     std::size_t num_overflows_ = 0;
     std::size_t num_elements_flushed_ = 0;
     std::size_t num_buffer_stalls_ = 0;
+    std::size_t num_send_capacity_waits_ = 0;
 
     Merger merge;
     Splitter split;

@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <deque>
 #include <kamping/mpi_datatype.hpp>
 #include <limits>
@@ -57,11 +58,15 @@ public:
             auto request = request_pool_.get_some_inactive_request();
             KASSERT(request.has_value(), "There should be inactive requests.");
             start_send(std::move(msg), request->second, request->first);
+            num_immediate_sends_++;
         } else if (send_backlog_.size() < send_backlog_capacity_) {
             // buffer the message
             send_backlog_.emplace_back(std::move(msg));
+            num_backlogged_sends_++;
+            peak_send_backlog_ = std::max(peak_send_backlog_, send_backlog_.size());
         } else {
             // no room for buffering or sending
+            num_send_capacity_misses_++;
             return std::nullopt;
         }
         next_receipt_id_++;
@@ -111,6 +116,36 @@ public:
         return send_backlog_.size() + request_pool_.active_requests();
     }
 
+    /// Sends that found a free request slot and went straight to MPI.
+    [[nodiscard]] std::size_t num_immediate_sends() const {
+        return num_immediate_sends_;
+    }
+
+    /// Sends that had to queue behind a busy request pool. A high ratio against \ref num_immediate_sends means
+    /// `num_request_slots` (default 8) is the binding constraint, not the aggregation buffers.
+    [[nodiscard]] std::size_t num_backlogged_sends() const {
+        return num_backlogged_sends_;
+    }
+
+    /// Sends rejected outright because neither a request slot nor backlog room was available. The caller then
+    /// spins in a poll loop (see \c BufferedMessageQueue::flush_all_buffers_blocking), which until now was
+    /// invisible: \c num_buffer_stalls only covers aggregation-buffer exhaustion.
+    [[nodiscard]] std::size_t num_send_capacity_misses() const {
+        return num_send_capacity_misses_;
+    }
+
+    /// High-water mark of the backlog deque, to compare against `send_backlog_capacity`.
+    [[nodiscard]] std::size_t peak_send_backlog() const {
+        return peak_send_backlog_;
+    }
+
+    void reset_counters() {
+        num_immediate_sends_ = 0;
+        num_backlogged_sends_ = 0;
+        num_send_capacity_misses_ = 0;
+        peak_send_backlog_ = 0;
+    }
+
 private:
     struct ActiveSend {
         std::size_t receipt;
@@ -151,5 +186,9 @@ private:
     std::deque<PendingSend> send_backlog_;
     std::size_t send_backlog_capacity_;
     int next_receipt_id_ = 0;
+    std::size_t num_immediate_sends_ = 0;
+    std::size_t num_backlogged_sends_ = 0;
+    std::size_t num_send_capacity_misses_ = 0;
+    std::size_t peak_send_backlog_ = 0;
 };
 }  // namespace briefkasten

@@ -83,7 +83,9 @@ public:
           allow_large_messages_(other.allow_large_messages_),
           termination_state_(other.termination_state_),
           synchronous_mode_(other.synchronous_mode_),
-          poll_count_(other.poll_count_) {
+          poll_count_(other.poll_count_),
+          num_polls_(other.num_polls_),
+          num_unproductive_polls_(other.num_unproductive_polls_) {
         receiver_.rebind_termination_counter(termination_);
         large_message_receiver_.rebind_termination_counter(termination_);
     }
@@ -105,6 +107,8 @@ public:
         termination_state_ = other.termination_state_;
         synchronous_mode_ = other.synchronous_mode_;
         poll_count_ = other.poll_count_;
+        num_polls_ = other.num_polls_;
+        num_unproductive_polls_ = other.num_unproductive_polls_;
         receiver_.rebind_termination_counter(termination_);
         large_message_receiver_.rebind_termination_counter(termination_);
     }
@@ -140,6 +144,7 @@ public:
     auto poll(MessageHandler<T, MessageContainer> auto&& on_message,
               SendFinishedCallback<MessageContainer> auto&& on_finished_sending)
         -> std::optional<std::pair<bool, bool>> {
+        num_polls_++;
         bool received_large_message = false;
         if (allow_large_messages_) {
             received_large_message =
@@ -155,6 +160,7 @@ public:
         if (send_finished_something || received_something) {
             return std::pair{send_finished_something, received_something};
         }
+        num_unproductive_polls_++;
         return std::nullopt;
     }
 
@@ -279,6 +285,47 @@ public:
         return termination_.local_counts();
     }
 
+    /// Calls to \ref poll, and the subset of them that neither received a message nor completed a send.
+    /// A slow phase whose work counters are unchanged but whose unproductive-poll count has risen was spent
+    /// waiting on the transport, not doing more work.
+    [[nodiscard]] std::size_t num_polls() const {
+        return num_polls_;
+    }
+
+    [[nodiscard]] std::size_t num_unproductive_polls() const {
+        return num_unproductive_polls_;
+    }
+
+    /// Receive (re-)arms issued by the small-message receiver over its lifetime; see \ref
+    /// internal::ReceiveArmCounter. Not reset by \ref reset_counters.
+    [[nodiscard]] std::size_t num_receive_arms() const {
+        return receiver_.num_receive_arms();
+    }
+
+    [[nodiscard]] std::size_t num_immediate_sends() const {
+        return sender_.num_immediate_sends();
+    }
+
+    [[nodiscard]] std::size_t num_backlogged_sends() const {
+        return sender_.num_backlogged_sends();
+    }
+
+    [[nodiscard]] std::size_t num_send_capacity_misses() const {
+        return sender_.num_send_capacity_misses();
+    }
+
+    [[nodiscard]] std::size_t peak_send_backlog() const {
+        return sender_.peak_send_backlog();
+    }
+
+    /// Resets the per-phase counters. \ref num_receive_arms is deliberately excluded: it tracks a
+    /// transport-side resource that is itself never reset.
+    void reset_counters() {
+        num_polls_ = 0;
+        num_unproductive_polls_ = 0;
+        sender_.reset_counters();
+    }
+
     [[nodiscard]] std::size_t num_termination_rounds() const {
         return termination_.num_termination_rounds();
     }
@@ -311,6 +358,8 @@ private:
     TerminationState termination_state_ = TerminationState::active;
     bool synchronous_mode_ = false;
     std::size_t poll_count_ = 0;
+    std::size_t num_polls_ = 0;
+    std::size_t num_unproductive_polls_ = 0;
 };
 
 }  // namespace briefkasten
