@@ -519,6 +519,17 @@ public:
         return queue_.num_termination_rounds();
     }
 
+    /// See MessageQueue::num_terminate_calls / num_termination_drains. Under IndirectionAdapter only the
+    /// FIRST hop's queue reports these: terminate() is delegated to it, and the second hop is drained from
+    /// inside its hook, so the second hop's counts stay at zero by construction.
+    [[nodiscard]] std::size_t num_terminate_calls() const {
+        return queue_.num_terminate_calls();
+    }
+
+    [[nodiscard]] std::size_t num_termination_drains() const {
+        return queue_.num_termination_drains();
+    }
+
     /// Iterations spent spinning because the sender had neither a free request slot nor backlog room,
     /// summed over both blocking sites. Complements \ref num_buffer_stalls, which only covers exhaustion
     /// of the *aggregation* buffer pool and stays at zero when the request pool is the bottleneck.

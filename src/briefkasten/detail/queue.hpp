@@ -192,8 +192,14 @@ public:
                                  std::invocable<> auto&& before_next_message_counting_round_hook,
                                  std::invocable<> auto&& progress_hook,
                                  std::invocable<> auto&& additional_counts) {
+        num_terminate_calls_++;
         termination_state_ = TerminationState::trying_termination;
         while (true) {
+            // Counted here rather than at start_message_counting: this loop can abort (below) before
+            // ever launching an allreduce, and the hook has ALREADY run by then. Under IndirectionAdapter
+            // the hook is what drains the sibling hop's buffers, so this -- not num_termination_rounds --
+            // is the number that multiplies the relay's forced flushes.
+            num_termination_drains_++;
             before_next_message_counting_round_hook();
             if (termination_state_ == TerminationState::active) {
                 return false;
@@ -323,11 +329,31 @@ public:
     void reset_counters() {
         num_polls_ = 0;
         num_unproductive_polls_ = 0;
+        num_terminate_calls_ = 0;
+        num_termination_drains_ = 0;
         sender_.reset_counters();
     }
 
     [[nodiscard]] std::size_t num_termination_rounds() const {
         return termination_.num_termination_rounds();
+    }
+
+    /// Times the *application* called \ref terminate. Each call that returns false is a termination
+    /// attempt aborted by an arriving message, and the caller then does more work and tries again.
+    [[nodiscard]] std::size_t num_terminate_calls() const {
+        return num_terminate_calls_;
+    }
+
+    /// Iterations of terminate's counting loop, i.e. how often \p before_next_message_counting_round_hook
+    /// ran. Strictly >= \ref num_termination_rounds, which only counts rounds that got as far as
+    /// launching an allreduce -- an attempt aborted by an arriving message runs the hook and returns
+    /// without ever counting a round.
+    ///
+    /// This gap is the point of the counter. Under IndirectionAdapter the hook force-flushes every
+    /// second-hop buffer at whatever fill it has, so a phase reporting num_termination_rounds = 3 can
+    /// still have drained the relay's buffers a thousand times. See notes/takeover_relay_backpressure.md.
+    [[nodiscard]] std::size_t num_termination_drains() const {
+        return num_termination_drains_;
     }
 
 private:
@@ -358,6 +384,8 @@ private:
     TerminationState termination_state_ = TerminationState::active;
     bool synchronous_mode_ = false;
     std::size_t poll_count_ = 0;
+    std::size_t num_terminate_calls_ = 0;
+    std::size_t num_termination_drains_ = 0;
     std::size_t num_polls_ = 0;
     std::size_t num_unproductive_polls_ = 0;
 };
