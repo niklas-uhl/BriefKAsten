@@ -78,6 +78,15 @@ public:
         return relay_drains_first_hop_;
     }
 
+    /// Enable the selective termination drain on BOTH hops; see
+    /// BufferedMessageQueue::flush_all_buffers_blocking. The second hop is the one that matters --
+    /// it is where the forced flushes concentrate (64% of relay packets at p=608) -- but the first
+    /// hop's drain is the same loop and benefits identically.
+    void selective_drain(bool enable) {
+        first_hop_queue_.selective_drain(enable);
+        second_hop_queue_.selective_drain(enable);
+    }
+
     auto& indirection_scheme() {
         return indirection_;
     }

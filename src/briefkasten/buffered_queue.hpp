@@ -383,15 +383,61 @@ public:
                     return;
                 }
             }
+            // Selective drain: skip a buffer that GREW since the last drain. Such a buffer is
+            // actively filling and will reach its threshold on its own, so forcing it out now only
+            // fragments the traffic -- the measured cost is 64% of relay packets at 5% fill at
+            // p=608. A buffer that has stopped growing is the tail and must be forced, or nothing
+            // ever empties it.
+            //
+            // Safe only because termination no longer depends on this loop emptying anything: the
+            // `pending` term in the counting round refuses while any payload is buffered, so
+            // skipping can delay termination but cannot let it fire with data undelivered. Before
+            // that term existed this would have been a silent-data-loss bug.
+            //
+            // Progress: a buffer that keeps growing hits the local threshold and flushes itself; a
+            // buffer that stops growing is stale by the next drain. So every buffer empties, and an
+            // unseen buffer costs at most one extra drain (it is recorded as grown on first sight).
+            if (selective_drain_) {
+                auto& last_seen = last_drain_size_[it->first];
+                auto current = it->second.size();
+                if (current > last_seen) {
+                    last_seen = current;
+                    num_drain_skips_++;
+                    ++it;
+                    continue;
+                }
+            }
             bool flushed = false;
             // Everything this loop flushes is FORCED: it goes out at whatever fill it happens to have,
             // because termination needs the buffer empty, not full. Attributed so the aggregation cost of
             // the termination protocol is measurable rather than inferred from (sends - overflows).
             forced_flush_ = true;
+            if (selective_drain_) {
+                last_drain_size_.erase(it->first);
+            }
             std::tie(it, flushed) = flush_buffer_impl(it, /*erase=*/true);
             forced_flush_ = false;
             KASSERT(flushed, "Flush must succeed once send capacity is ensured.");
         }
+    }
+
+    /// Skip actively-filling buffers when draining for termination; see flush_all_buffers_blocking.
+    /// Requires the `pending` term in the termination round (MessageCounter::pending) -- without it
+    /// this trades aggregation for silent data loss. Off by default.
+    void selective_drain(bool enable) {
+        selective_drain_ = enable;
+        if (!enable) {
+            last_drain_size_.clear();
+        }
+    }
+
+    [[nodiscard]] bool selective_drain() const {
+        return selective_drain_;
+    }
+
+    /// Buffers the selective drain declined to force out because they were still filling.
+    [[nodiscard]] std::size_t num_drain_skips() const {
+        return num_drain_skips_;
     }
 
     /// \overload for callers with no sibling queue to drive. Not a defaulted parameter: a default argument
@@ -651,6 +697,7 @@ public:
         num_overflow_capacity_waits_ = 0;
         num_forced_flushes_ = 0;
         num_forced_flush_elements_ = 0;
+        num_drain_skips_ = 0;
         queue_.reset_counters();
     }
 
@@ -947,6 +994,11 @@ private:
     std::size_t terminate_call_count_ = 0;
     std::size_t num_forced_flushes_ = 0;
     std::size_t num_forced_flush_elements_ = 0;
+    std::size_t num_drain_skips_ = 0;
+    bool selective_drain_ = false;
+    /// Buffer size seen at the previous drain, per destination. An unseen destination reads 0, so a
+    /// non-empty buffer counts as "grew" on first sight and is skipped once.
+    std::unordered_map<PEID, std::size_t> last_drain_size_;
     // Set only around flush_all_buffers_blocking's own flush call. Safe as a plain flag rather than a
     // counter: that loop's poll() hands messages to a handler which never posts back into THIS queue
     // (the first hop's handler relays into the second hop's queue, a different object; the second hop's
