@@ -352,7 +352,12 @@ public:
                 }
             }
             bool flushed = false;
+            // Everything this loop flushes is FORCED: it goes out at whatever fill it happens to have,
+            // because termination needs the buffer empty, not full. Attributed so the aggregation cost of
+            // the termination protocol is measurable rather than inferred from (sends - overflows).
+            forced_flush_ = true;
             std::tie(it, flushed) = flush_buffer_impl(it, /*erase=*/true);
+            forced_flush_ = false;
             KASSERT(flushed, "Flush must succeed once send capacity is ensured.");
         }
     }
@@ -493,6 +498,23 @@ public:
         return num_buffer_stalls_;
     }
 
+    /// Sends issued by \ref flush_all_buffers_blocking, i.e. by the termination protocol rather than by a
+    /// buffer reaching its threshold. These go out at whatever fill they happen to have, so they are the
+    /// aggregation tax of terminating. Compare \ref num_forced_flush_elements against these to get their
+    /// average fill, and against \ref num_elements_flushed for their share of the traffic.
+    ///
+    /// Motivation: on rmat the *relay* hop packs its packets to 64-77% of threshold while the originating
+    /// hop packs to 99%, and the excess sends on the busiest proxies are not overflows. This counter tells
+    /// us directly whether the termination drain is where they come from. See
+    /// notes/takeover_relay_backpressure.md.
+    [[nodiscard]] std::size_t num_forced_flushes() const {
+        return num_forced_flushes_;
+    }
+
+    [[nodiscard]] std::size_t num_forced_flush_elements() const {
+        return num_forced_flush_elements_;
+    }
+
     [[nodiscard]] std::size_t num_termination_rounds() const {
         return queue_.num_termination_rounds();
     }
@@ -560,6 +582,8 @@ public:
         num_buffer_stalls_ = 0;
         num_drain_capacity_waits_ = 0;
         num_overflow_capacity_waits_ = 0;
+        num_forced_flushes_ = 0;
+        num_forced_flush_elements_ = 0;
         queue_.reset_counters();
     }
 
@@ -692,6 +716,10 @@ private:
             return {buffer_it, false};
         }
         num_elements_flushed_ += buffer_it->second.size();
+        if (forced_flush_) {
+            num_forced_flushes_++;
+            num_forced_flush_elements_ += buffer_it->second.size();
+        }
         auto receipt = queue_.post_message(std::move(buffer_it->second), receiver);
         KASSERT(receipt.has_value(),
                 "We checked before that there is capacity, so posting the message should not fail.");
@@ -849,6 +877,13 @@ private:
     std::size_t num_buffer_stalls_ = 0;
     std::size_t num_drain_capacity_waits_ = 0;
     std::size_t num_overflow_capacity_waits_ = 0;
+    std::size_t num_forced_flushes_ = 0;
+    std::size_t num_forced_flush_elements_ = 0;
+    // Set only around flush_all_buffers_blocking's own flush call. Safe as a plain flag rather than a
+    // counter: that loop's poll() hands messages to a handler which never posts back into THIS queue
+    // (the first hop's handler relays into the second hop's queue, a different object; the second hop's
+    // is terminal), so flush_buffer_impl cannot re-enter while it is set.
+    bool forced_flush_ = false;
 
     Merger merge;
     Splitter split;
