@@ -245,11 +245,33 @@ public:
                 // fails here because relay PEs are also destinations: an incoming delivery fires the
                 // predicate on the very first poll, leaving the relay's forwarding backlog permanently
                 // undrained — the allreduce never sees a balanced send/receive count → livelock.
+                //
+                // REANALYSED 2026-09-15, conclusion: leave it. should_stop exists to stop wasting
+                // aggregation on an attempt that is going to be cancelled anyway, and since this
+                // prepare was fused with additional_counts it only runs on attempts that reach
+                // start_message_counting -- 3 per rank per iteration on rmat n18 p128, down from
+                // 8,381. Expected forced flushes fall from 13,883 per rank per iteration to ~5. There
+                // is essentially nothing left for a stop predicate to save, so the livelock above is
+                // no longer worth trading against. Re-open only if measurements show the drain count
+                // climbing back toward the terminate() call count.
                 // Unlike the old single-queue design (where redirected messages re-entered the same
                 // queue, amplifying work), the two-queue split means flushing second_hop_queue_ only
                 // delivers messages to final destinations; there is no feedback that grows this queue.
                 second_hop_queue_.flush_all_buffers_blocking(second_hop_handler, [] { return false; });
             });
+    }
+
+    /// \copydoc BufferedMessageQueue::terminate_throttled
+    ///
+    /// The skipped path goes through this adapter's own \ref poll, so it drives BOTH hops. Routing it to
+    /// a single hop would starve the other of progress for skip_threshold calls at a stretch.
+    [[nodiscard]] bool terminate_throttled(MessageHandler<typename queue_type::message_type> auto&& on_message,
+                                           std::size_t skip_threshold = 1) {
+        if (skip_threshold > 1 && (terminate_call_count_++ % skip_threshold) != 0) {
+            poll(on_message);
+            return false;
+        }
+        return terminate(std::forward<decltype(on_message)>(on_message));
     }
 
     // bool probe_for_messages(MessageHandler<typename queue_type::message_type> auto&& on_message) {
@@ -345,6 +367,7 @@ private:
         };
     }
     Indirector indirection_;
+    std::size_t terminate_call_count_ = 0;
     bool relay_drains_first_hop_ = true;
 };
 

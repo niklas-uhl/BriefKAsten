@@ -385,6 +385,30 @@ public:
                                    std::forward<decltype(should_stop)>(should_stop), [] {});
     }
 
+    /// Attempt termination only every \p skip_threshold-th call; otherwise poll and report "not done".
+    ///
+    /// Mirrors \ref poll_throttled, and for the same reason: the caller's loop is
+    /// `do { while (work) ...; } while (!terminate());`, so terminate() is invoked every time the local
+    /// work queue happens to empty -- which under an async traversal is constantly. Measured on rmat n18
+    /// p128: 8,379 calls per rank per iteration against 3 that reached an allreduce. The other 8,376 ran
+    /// the full protocol (own-buffer drain, outstanding-send wait, and under IndirectionAdapter a sibling
+    /// drain) only to abort on an arriving message.
+    ///
+    /// The skipped path MUST still poll. A skip that merely returns false livelocks the caller: its work
+    /// queue is empty, nothing else polls, so no message can ever arrive to refill it.
+    ///
+    /// Safe by construction in the direction that matters -- returning false early can only DELAY
+    /// termination, never trigger it prematurely -- so the failure mode of a bad threshold is a slower
+    /// run, not silent data loss.
+    [[nodiscard]] bool terminate_throttled(MessageHandler<MessageType> auto&& on_message,
+                                           std::size_t skip_threshold = 1) {
+        if (skip_threshold > 1 && (terminate_call_count_++ % skip_threshold) != 0) {
+            poll(on_message);
+            return false;
+        }
+        return terminate(std::forward<decltype(on_message)>(on_message));
+    }
+
     void reactivate() {
         queue_.reactivate();
     }
@@ -904,6 +928,7 @@ private:
     std::size_t num_buffer_stalls_ = 0;
     std::size_t num_drain_capacity_waits_ = 0;
     std::size_t num_overflow_capacity_waits_ = 0;
+    std::size_t terminate_call_count_ = 0;
     std::size_t num_forced_flushes_ = 0;
     std::size_t num_forced_flush_elements_ = 0;
     // Set only around flush_all_buffers_blocking's own flush call. Safe as a plain flag rather than a
