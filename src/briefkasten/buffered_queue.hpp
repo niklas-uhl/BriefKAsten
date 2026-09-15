@@ -303,14 +303,30 @@ public:
             // exactly "poll the second hop", which is what this drain must keep driving while it spins.
             flush_all_buffers_blocking(
                 on_message, [&] { return termination_state() == TerminationState::active; }, progress_hook);
+        };
+        // extra_round_prepare runs HERE, fused with the counts snapshot, rather than in the hook above.
+        //
+        // Both positions satisfy the ordering the adapter needs -- the sibling's buffers must be flushed before
+        // its counts are read -- but the hook runs at the TOP of terminate's loop, ahead of the two early-abort
+        // checks, so an attempt cancelled by an arriving message had already paid for a full sibling drain.
+        // Nearly every attempt is cancelled: relay-aggregation-probe_26_09_15 measured 8,379 terminate() calls
+        // per rank per iteration against 3 allreduce rounds, each drain force-flushing ~1.66 second-hop buffers
+        // at 10% fill -- 34% of every relay send. Fused with the counts, the drain only happens on an attempt
+        // that actually reaches the counting round.
+        //
+        // Deliberately NOT a change to flush_all_buffers_blocking's should_stop, which is hardwired false on the
+        // sibling for a documented reason (an activity predicate livelocks there, since relay PEs are also
+        // destinations). This moves WHEN the drain runs, not WHETHER it drains fully.
+        auto prepare_and_count = [&] {
             extra_round_prepare();
+            return additional_counts();
         };
         bool ret = queue_.terminate(
             split_handler(on_message),
             [&](std::size_t receipt, BufferContainer buffer) {
                 reclaim_aggregation_buffer(receipt, std::move(buffer));
             },
-            before_next_message_counting_round_hook, progress_hook, additional_counts);
+            before_next_message_counting_round_hook, progress_hook, prepare_and_count);
         return ret;
     }
 
