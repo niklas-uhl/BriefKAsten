@@ -57,8 +57,18 @@ struct Config {
 ///
 /// Sizes for double buffering so a destination never stalls on a premature flush:
 ///   send_backlog_capacity       = fan_out   (absorbs up to fan_out concurrent flushes without blocking)
-///   max_num_aggregation_buffers = 2*fan_out + num_request_slots
-///                               = fan_out (filling) + fan_out (backlog) + num_request_slots (in flight)
+///   max_num_aggregation_buffers = send_backlog_capacity + fan_out + num_request_slots
+///                               = backlog + fan_out (filling) + num_request_slots (in flight)
+///
+/// The buffer pool is derived from the *backlog*, not from fan_out a second time, because a backlogged
+/// send owns its aggregation buffer until it is actually posted. Sizing the pool at 2*fan_out while the
+/// caller raised send_backlog_capacity leaves the backlog unreachable: the pool runs dry first, so every
+/// wait for send capacity simply becomes a buffer stall at an unchanged total in-flight capacity, and the
+/// knob looks inert. Observed directly in relay-backpressure_26_09_15 (rmat n18 p76: 375,806 capacity
+/// waits -> 375,786 buffer stalls, runtime unchanged to the millisecond).
+///
+/// At the default (send_backlog_capacity == fan_out) this is exactly the old 2*fan_out + num_request_slots,
+/// so nothing changes unless the caller sets the backlog explicitly.
 ///
 /// Buffers are allocated lazily, so sparse workloads pay only for their active destinations.
 /// For large fan_out, startup overhead (MPI connection setup, NIC resources) grows with the number
@@ -69,7 +79,8 @@ inline Config apply_fan_out_defaults(Config config, std::size_t fan_out) {
         config.send_backlog_capacity = fan_out;
     }
     if (!config.max_num_aggregation_buffers) {
-        config.max_num_aggregation_buffers = (2 * fan_out) + config.num_request_slots;
+        config.max_num_aggregation_buffers =
+            config.send_backlog_capacity.value() + fan_out + config.num_request_slots;
     }
     return config;
 }
