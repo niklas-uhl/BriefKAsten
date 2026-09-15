@@ -319,7 +319,11 @@ public:
         // destinations). This moves WHEN the drain runs, not WHETHER it drains fully.
         auto prepare_and_count = [&] {
             extra_round_prepare();
-            return additional_counts();
+            auto counts = additional_counts();
+            // Our own buffered payload joins the sibling's. Without this a half-full buffer on THIS
+            // queue is invisible to the balance and termination can fire with data undelivered.
+            counts.pending += pending_elements();
+            return counts;
         };
         bool ret = queue_.terminate(
             split_handler(on_message),
@@ -330,8 +334,20 @@ public:
         return ret;
     }
 
+    /// Underlying packet counts PLUS this queue's own outstanding buffer contents. A sibling queue
+    /// folded into a joint termination round must be reported through this, not through the raw
+    /// queue's counts, or its buffered payload stays invisible to the decision.
     [[nodiscard]] internal::MessageCounter message_counts() const {
-        return queue_.message_counts();
+        auto counts = queue_.message_counts();
+        counts.pending += pending_elements();
+        return counts;
+    }
+
+    /// Payload currently held in aggregation buffers, in buffer elements. Only its zero-ness is
+    /// meaningful to termination. Already correct in the presence of a BufferCleaner: flush
+    /// subtracts the PRE-cleanup size, so discarded payload is accounted for.
+    [[nodiscard]] std::size_t pending_elements() const {
+        return global_buffer_size_;
     }
 
     /// Flush every aggregation buffer, blocking only while send slots are actually exhausted.

@@ -239,6 +239,9 @@ public:
                 second_hop_queue_.poll(second_hop_handler);
                 progress_hook();
             },
+            // message_counts() on a BufferedMessageQueue already folds in that queue's outstanding
+            // buffer contents, so the second hop's half-full relay buffers are visible to the
+            // termination decision rather than hidden behind a balanced packet count.
             [&] { return second_hop_queue_.message_counts(); },
             [&] {
                 // Drain all second-hop send buffers unconditionally. Any activity-based stop predicate
