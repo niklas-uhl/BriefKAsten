@@ -67,6 +67,17 @@ public:
         first_hop_queue_.send_backlog_capacity(first_cfg.send_backlog_capacity.value());
     }
 
+    /// Whether the relay keeps polling the first hop while blocked on second-hop send capacity. Default true
+    /// preserves the historical behaviour; false is the AML-style rule (only a loop blocked on the first hop may
+    /// drive the first hop). See post_message_blocking's direct_send branch.
+    void relay_drains_first_hop(bool enable) {
+        relay_drains_first_hop_ = enable;
+    }
+
+    [[nodiscard]] bool relay_drains_first_hop() const {
+        return relay_drains_first_hop_;
+    }
+
     auto& indirection_scheme() {
         return indirection_;
     }
@@ -116,11 +127,28 @@ public:
                                bool direct_send = false) {
         PEID next_hop = receiver;
         if (direct_send) {
-            // While blocked waiting for a second-hop send to complete, keep draining the first-hop queue. Otherwise
-            // peers blocked on the first hop never receive (and thus complete) the sends we are waiting on -> deadlock.
-            return second_hop_queue_.post_message_blocking(
-                std::forward<decltype(message)>(message), next_hop, envelope_sender, envelope_receiver, tag, on_message,
-                [&] { first_hop_queue_.poll(redirection_handler(on_message)); });
+            // This is the relay path: we are inside a first-hop receive handler, forwarding to the final destination.
+            //
+            // Historically we kept draining the first-hop queue while blocked here, on the reasoning that peers
+            // blocked on the first hop would otherwise never receive (and thus complete) the sends we wait on. That
+            // hook is also what removes the system's only backpressure path: a rank starved of second-hop capacity
+            // keeps ingesting first-hop work it demonstrably cannot forward, so its senders never see the stall and
+            // never stop producing. Dropping it makes the eight persistent receives fill, which blocks our first-hop
+            // peers in their own post_message_blocking and propagates back to the originators for free.
+            //
+            // Safe to drop only because every blocking loop now drives the second hop: the spin inside
+            // resolve_overflow_blocking polls *this* queue, and flush_all_buffers_blocking finally takes a progress
+            // hook (see buffered_queue.hpp). AML enforces exactly this rule -- its flush_buffer_intra spins on
+            // aml_poll_intra alone -- and does not deadlock. Kept behind a flag so the two can be measured against
+            // each other; see notes/takeover_relay_backpressure.md.
+            if (relay_drains_first_hop_) {
+                return second_hop_queue_.post_message_blocking(
+                    std::forward<decltype(message)>(message), next_hop, envelope_sender, envelope_receiver, tag,
+                    on_message, [&] { first_hop_queue_.poll(redirection_handler(on_message)); });
+            }
+            return second_hop_queue_.post_message_blocking(std::forward<decltype(message)>(message), next_hop,
+                                                           envelope_sender, envelope_receiver, tag, on_message,
+                                                           [] {});
         }
         next_hop = indirection_.next_hop(envelope_sender, envelope_receiver);
         // Symmetrically, while blocked on the first hop keep draining the second hop so final messages get received.
@@ -317,6 +345,7 @@ private:
         };
     }
     Indirector indirection_;
+    bool relay_drains_first_hop_ = true;
 };
 
 }  // namespace briefkasten

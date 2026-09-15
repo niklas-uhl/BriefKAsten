@@ -288,7 +288,10 @@ public:
                                  std::invocable<> auto&& additional_counts,
                                  std::invocable<> auto&& extra_round_prepare) {
         auto before_next_message_counting_round_hook = [&] {
-            flush_all_buffers_blocking(on_message, [&] { return termination_state() == TerminationState::active; });
+            // progress_hook is forwarded on to queue_.terminate below as an lvalue; under IndirectionAdapter it is
+            // exactly "poll the second hop", which is what this drain must keep driving while it spins.
+            flush_all_buffers_blocking(
+                on_message, [&] { return termination_state() == TerminationState::active; }, progress_hook);
             extra_round_prepare();
         };
         bool ret = queue_.terminate(
@@ -313,17 +316,26 @@ public:
     /// Each iteration first polls (non-blocking) so that incoming messages are observed: this both progresses sends
     /// and lets \p should_stop fire as soon as new work arrives, so we stop force-flushing not-yet-full buffers (which
     /// would defeat aggregation) once the termination attempt is going to be cancelled anyway.
+    ///
+    /// \p progress_hook mirrors the one on \ref post_message_blocking and exists for the same reason: this loop can
+    /// spin arbitrarily long on our own send capacity, and a sibling queue whose receiver is never driven during that
+    /// spin cannot complete the very sends we are waiting on. This was the one blocking loop of four that took no
+    /// hook, which is what made the invariant "every blocking loop drives the second hop" fail at termination time.
+    /// See notes/takeover_relay_backpressure.md.
     void flush_all_buffers_blocking(MessageHandler<MessageType> auto&& on_message,
-                                    std::predicate auto&& should_stop) {
+                                    std::predicate auto&& should_stop,
+                                    std::invocable<> auto&& progress_hook) {
         auto it = aggregation_buffers_.begin();
         while (it != aggregation_buffers_.end()) {
             poll(on_message);  // observe arrivals (may flip should_stop) and progress sends
+            progress_hook();
             if (should_stop()) {
                 return;
             }
             while (!queue_.has_send_capacity()) {
-                num_send_capacity_waits_++;
+                num_drain_capacity_waits_++;
                 poll(on_message);  // only block when slots are exhausted; polling frees them as peers receive
+                progress_hook();
                 if (should_stop()) {
                     return;
                 }
@@ -332,6 +344,13 @@ public:
             std::tie(it, flushed) = flush_buffer_impl(it, /*erase=*/true);
             KASSERT(flushed, "Flush must succeed once send capacity is ensured.");
         }
+    }
+
+    /// \overload for callers with no sibling queue to drive. Not a defaulted parameter: a default argument
+    /// cannot deduce an abbreviated-template (`auto&&`) parameter.
+    void flush_all_buffers_blocking(MessageHandler<MessageType> auto&& on_message, std::predicate auto&& should_stop) {
+        flush_all_buffers_blocking(std::forward<decltype(on_message)>(on_message),
+                                   std::forward<decltype(should_stop)>(should_stop), [] {});
     }
 
     void reactivate() {
@@ -467,11 +486,32 @@ public:
         return queue_.num_termination_rounds();
     }
 
-    /// Iterations spent spinning in \ref flush_all_buffers_blocking because the sender had neither a free
-    /// request slot nor backlog room. Complements \ref num_buffer_stalls, which only covers exhaustion of the
-    /// *aggregation* buffer pool and stays at zero when the request pool is the bottleneck.
+    /// Iterations spent spinning because the sender had neither a free request slot nor backlog room,
+    /// summed over both blocking sites. Complements \ref num_buffer_stalls, which only covers exhaustion
+    /// of the *aggregation* buffer pool and stays at zero when the request pool is the bottleneck.
+    ///
+    /// Always read this together with its two components below: they sit on opposite sides of the
+    /// termination boundary, and the total cannot distinguish them. Until 2026-09-15 only the drain site
+    /// was counted, which made every wait look like a termination artifact.
     [[nodiscard]] std::size_t num_send_capacity_waits() const {
-        return num_send_capacity_waits_;
+        return num_drain_capacity_waits_ + num_overflow_capacity_waits_;
+    }
+
+    /// Waits inside \ref flush_all_buffers_blocking, i.e. the *termination* drain: reached only from
+    /// \ref terminate (directly, and via IndirectionAdapter's extra_round_prepare for the sibling hop).
+    [[nodiscard]] std::size_t num_drain_capacity_waits() const {
+        return num_drain_capacity_waits_;
+    }
+
+    /// Waits inside \ref resolve_overflow_blocking, i.e. the *steady-state* post path: an aggregation
+    /// buffer filled up and the flush that must precede the merge could not get send capacity.
+    ///
+    /// On an IndirectionAdapter this is the counter that separates the two hypotheses for the async-grid
+    /// stall, because the two hops report separately: the second hop's count is the relay handler
+    /// (`redirection_handler` -> post_message_blocking(direct_send=true)), the first hop's is the
+    /// application originating a message. See notes/takeover_relay_backpressure.md.
+    [[nodiscard]] std::size_t num_overflow_capacity_waits() const {
+        return num_overflow_capacity_waits_;
     }
 
     [[nodiscard]] std::size_t num_polls() const {
@@ -507,7 +547,8 @@ public:
         num_overflows_ = 0;
         num_elements_flushed_ = 0;
         num_buffer_stalls_ = 0;
-        num_send_capacity_waits_ = 0;
+        num_drain_capacity_waits_ = 0;
+        num_overflow_capacity_waits_ = 0;
         queue_.reset_counters();
     }
 
@@ -745,6 +786,7 @@ private:
         // awaited local completion — make progress; PersistentReceiver masks this by never refusing to receive.
         // Mirrors flush_all_buffers_blocking.
         while (!queue_.has_send_capacity()) {
+            num_overflow_capacity_waits_++;
             poll(std::forward<decltype(on_message)>(on_message));
             progress_hook();
         }
@@ -794,7 +836,8 @@ private:
     std::size_t num_overflows_ = 0;
     std::size_t num_elements_flushed_ = 0;
     std::size_t num_buffer_stalls_ = 0;
-    std::size_t num_send_capacity_waits_ = 0;
+    std::size_t num_drain_capacity_waits_ = 0;
+    std::size_t num_overflow_capacity_waits_ = 0;
 
     Merger merge;
     Splitter split;
