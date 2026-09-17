@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <kamping/environment.hpp>
 #include <ranges>
@@ -77,10 +78,80 @@ protected:
 private:
     std::size_t num_receive_arms_ = 0;
 };
+
+/// @brief How deep receive handling nests, and how many receive slots are disarmed while it does.
+///
+/// A slot whose receive completed stays disarmed until its handler returns and the receive is re-armed. Under
+/// IndirectionAdapter the first-hop handler relays by calling post_message_blocking, which polls this same receiver
+/// again while the outer handler is still running. Every nesting level therefore holds at least one slot disarmed,
+/// and a receiver whose slots are all disarmed cannot accept anything -- the relay goes deaf to its row while it
+/// waits on second-hop capacity. These counters measure that directly instead of inferring it from capacity waits.
+/// See notes/takeover_relay_backpressure.md.
+///
+/// Observed once per probe call (a few integer compares next to an MPI_Testsome), so the cost is not measurable.
+/// Per-phase, unlike ReceiveArmCounter: reset by reset_nesting_counters().
+class ReceiveNestingCounter {
+public:
+    /// Deepest probe nesting seen, counting the outermost call as 1.
+    [[nodiscard]] std::size_t max_probe_depth() const {
+        return max_probe_depth_;
+    }
+
+    /// Probe calls made from inside a handler of this same receiver, i.e. at depth >= 2.
+    [[nodiscard]] std::size_t num_nested_probes() const {
+        return num_nested_probes_;
+    }
+
+    /// Most receive slots found disarmed at the start of a probe.
+    [[nodiscard]] std::size_t max_disarmed_slots() const {
+        return max_disarmed_slots_;
+    }
+
+    /// Probe calls that found at least half of the receive slots disarmed.
+    [[nodiscard]] std::size_t num_half_deaf_probes() const {
+        return num_half_deaf_probes_;
+    }
+
+    /// Probe calls that found every receive slot disarmed: nothing can be received until an outer handler returns.
+    [[nodiscard]] std::size_t num_deaf_probes() const {
+        return num_deaf_probes_;
+    }
+
+    void reset_nesting_counters() {
+        max_probe_depth_ = 0;
+        num_nested_probes_ = 0;
+        max_disarmed_slots_ = 0;
+        num_half_deaf_probes_ = 0;
+        num_deaf_probes_ = 0;
+    }
+
+protected:
+    /// \p enclosing_depth: probe calls of this receiver already on the stack. \p disarmed: slots not armed right now.
+    void observe_probe(std::size_t enclosing_depth, std::size_t disarmed, std::size_t num_slots) {
+        max_probe_depth_ = std::max(max_probe_depth_, enclosing_depth + 1);
+        if (enclosing_depth > 0) {
+            num_nested_probes_++;
+        }
+        max_disarmed_slots_ = std::max(max_disarmed_slots_, disarmed);
+        if (2 * disarmed >= num_slots) {
+            num_half_deaf_probes_++;
+        }
+        if (disarmed >= num_slots) {
+            num_deaf_probes_++;
+        }
+    }
+
+private:
+    std::size_t max_probe_depth_ = 0;
+    std::size_t num_nested_probes_ = 0;
+    std::size_t max_disarmed_slots_ = 0;
+    std::size_t num_half_deaf_probes_ = 0;
+    std::size_t num_deaf_probes_ = 0;
+};
 }  // namespace internal
 
 template <MPIBuffer ReceiveBufferContainer>
-class PersistentReceiver : public internal::ReceiveArmCounter {
+class PersistentReceiver : public internal::ReceiveArmCounter, public internal::ReceiveNestingCounter {
 public:
     using value_type = std::ranges::range_value_t<ReceiveBufferContainer>;
     // NOLINTBEGIN(*-easily-swappable-parameters)
@@ -163,6 +234,7 @@ public:
     }
 
     bool probe_for_one_message(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
+        observe_probe(static_cast<std::size_t>(probe_recursion_depth_), disarmed_slots_, receive_requests_.size());
         auto [statuses_buf, indices_buf] = step_probe_recursion();
         int& index = indices_buf[0];
         int request_completed = 0;
@@ -177,11 +249,13 @@ public:
             return false;
         }
         termination_->track_receive();
+        disarmed_slots_++;
         ReceiveBufferContainer& buffer = receive_buffers_[index];
         auto envelope = build_envelope(buffer, status, rank_);
         on_message(std::move(envelope));
         MPI_Start(&receive_requests_[index]);
         count_receive_arm();
+        disarmed_slots_--;
         unstep_probe_recursion();
         return true;
     }
@@ -190,6 +264,7 @@ public:
         // calling probe for messages recursively (i.e. via indirection), might lead to corruption of indices and
         // statuses buffers. Therefore we track the recursion depth and allocate more buffers if needed.
         // TODO: make this scope guarded
+        observe_probe(static_cast<std::size_t>(probe_recursion_depth_), disarmed_slots_, receive_requests_.size());
         auto [statuses_buf, indices_buf] = step_probe_recursion();
         int num_completed = 0;
         MPI_Testsome(static_cast<int>(receive_requests_.size()),  // count
@@ -205,6 +280,8 @@ public:
             unstep_probe_recursion();
             return false;
         }
+        // Every completed slot stays disarmed until its own handler below has returned and it is re-armed.
+        disarmed_slots_ += static_cast<std::size_t>(num_completed);
         auto indices = std::span(indices_buf).first(num_completed);
         auto statuses = std::span(statuses_buf).first(num_completed);
         auto buffers = indices | std::views::transform([&](int index) -> auto& { return receive_buffers_[index]; });
@@ -221,6 +298,7 @@ public:
             on_message(std::move(envelope));
             MPI_Start(&request);
             count_receive_arm();
+            disarmed_slots_--;
         }
         unstep_probe_recursion();
         return true;
@@ -293,6 +371,7 @@ private:
     std::vector<ReceiveBufferContainer> receive_buffers_;
     std::vector<std::vector<MPI_Status>> statuses_;
     std::vector<std::vector<int>> indices_;
+    std::size_t disarmed_slots_ = 0;  // completed receives whose handler has not returned yet (not re-armed)
     int probe_recursion_depth_ = 0;  // FIXME step_probe_recursion increments before use, so statuses_[0]/indices_[0] are never accessed
     internal::TerminationCounter* termination_;
     int rank_ = 0;
@@ -307,7 +386,7 @@ private:
 // created and freed each cycle, so nothing accumulates. Memory and back-pressure are identical to PersistentReceiver
 // (bounded at num_receive_slots buffers).
 template <MPIBuffer ReceiveBufferContainer>
-class PrepostingReceiver : public internal::ReceiveArmCounter {
+class PrepostingReceiver : public internal::ReceiveArmCounter, public internal::ReceiveNestingCounter {
 public:
     using value_type = std::ranges::range_value_t<ReceiveBufferContainer>;
     // NOLINTBEGIN(*-easily-swappable-parameters)
@@ -359,6 +438,7 @@ public:
     }
 
     bool probe_for_one_message(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
+        observe_probe(static_cast<std::size_t>(probe_recursion_depth_), disarmed_slots_, receive_requests_.size());
         auto [statuses_buf, indices_buf] = step_probe_recursion();
         int& index = indices_buf[0];
         int request_completed = 0;
@@ -373,10 +453,12 @@ public:
             return false;
         }
         termination_->track_receive();
+        disarmed_slots_++;
         ReceiveBufferContainer& buffer = receive_buffers_[index];
         auto envelope = build_envelope(buffer, status, rank_);
         on_message(std::move(envelope));
         post_receive(receive_buffers_[index], receive_requests_[index]);
+        disarmed_slots_--;
         unstep_probe_recursion();
         return true;
     }
@@ -384,6 +466,7 @@ public:
     bool probe_for_messages(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
         // Recursive calls (via indirection) may find some requests already completed but not yet re-posted further up
         // the stack, so statuses/indices buffers are tracked per recursion depth. Mirrors PersistentReceiver.
+        observe_probe(static_cast<std::size_t>(probe_recursion_depth_), disarmed_slots_, receive_requests_.size());
         auto [statuses_buf, indices_buf] = step_probe_recursion();
         int num_completed = 0;
         MPI_Testsome(static_cast<int>(receive_requests_.size()),  // count
@@ -395,6 +478,8 @@ public:
             unstep_probe_recursion();
             return false;
         }
+        // Every completed slot stays disarmed until its own handler below has returned and it is re-armed.
+        disarmed_slots_ += static_cast<std::size_t>(num_completed);
         auto indices = std::span(indices_buf).first(num_completed);
         auto statuses = std::span(statuses_buf).first(num_completed);
         auto buffers = indices | std::views::transform([&](int index) -> auto& { return receive_buffers_[index]; });
@@ -409,6 +494,7 @@ public:
             auto envelope = internal::build_envelope(buffer, status, rank_);
             on_message(std::move(envelope));
             post_receive(buffer, request);
+            disarmed_slots_--;
         }
         unstep_probe_recursion();
         return true;
@@ -485,13 +571,14 @@ private:
     std::vector<ReceiveBufferContainer> receive_buffers_;
     std::vector<std::vector<MPI_Status>> statuses_;
     std::vector<std::vector<int>> indices_;
+    std::size_t disarmed_slots_ = 0;  // completed receives whose handler has not returned yet (not re-armed)
     int probe_recursion_depth_ = 0;
     internal::TerminationCounter* termination_;
     int rank_ = 0;
 };
 
 template <MPIBuffer ReceiveBufferContainer>
-class ProbeReceiver : public internal::ReceiveArmCounter {
+class ProbeReceiver : public internal::ReceiveArmCounter, public internal::ReceiveNestingCounter {
 public:
     using value_type = std::ranges::range_value_t<ReceiveBufferContainer>;
     // NOLINTBEGIN(*-easily-swappable-parameters)
@@ -516,6 +603,8 @@ public:
     }
 
     bool probe_for_one_message(MessageHandler<value_type, std::span<value_type>> auto&& on_message) {
+        // A held slot is exactly one enclosing handler, so slots_in_use_ is both the depth and the disarmed count.
+        observe_probe(slots_in_use_, slots_in_use_, receive_buffers_.size());
         if (slots_in_use_ >= receive_buffers_.size()) {
             return false;
         }

@@ -308,6 +308,27 @@ public:
         return receiver_.num_receive_arms();
     }
 
+    /// Receive nesting on the small-message receiver; see \ref internal::ReceiveNestingCounter. Per-phase.
+    [[nodiscard]] std::size_t max_probe_depth() const {
+        return receiver_.max_probe_depth();
+    }
+
+    [[nodiscard]] std::size_t num_nested_probes() const {
+        return receiver_.num_nested_probes();
+    }
+
+    [[nodiscard]] std::size_t max_disarmed_slots() const {
+        return receiver_.max_disarmed_slots();
+    }
+
+    [[nodiscard]] std::size_t num_half_deaf_probes() const {
+        return receiver_.num_half_deaf_probes();
+    }
+
+    [[nodiscard]] std::size_t num_deaf_probes() const {
+        return receiver_.num_deaf_probes();
+    }
+
     [[nodiscard]] std::size_t num_immediate_sends() const {
         return sender_.num_immediate_sends();
     }
@@ -332,6 +353,7 @@ public:
         num_terminate_calls_ = 0;
         num_termination_drains_ = 0;
         sender_.reset_counters();
+        receiver_.reset_nesting_counters();
     }
 
     [[nodiscard]] std::size_t num_termination_rounds() const {

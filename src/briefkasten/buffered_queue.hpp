@@ -673,6 +673,29 @@ public:
         return queue_.num_receive_arms();
     }
 
+    /// How deeply receive handling nested and how many receive slots were disarmed meanwhile; see
+    /// \ref internal::ReceiveNestingCounter. On an IndirectionAdapter the FIRST hop's values are the relay: its
+    /// handler posts blocking into the second hop, which polls the first hop again from inside the handler.
+    [[nodiscard]] std::size_t max_probe_depth() const {
+        return queue_.max_probe_depth();
+    }
+
+    [[nodiscard]] std::size_t num_nested_probes() const {
+        return queue_.num_nested_probes();
+    }
+
+    [[nodiscard]] std::size_t max_disarmed_slots() const {
+        return queue_.max_disarmed_slots();
+    }
+
+    [[nodiscard]] std::size_t num_half_deaf_probes() const {
+        return queue_.num_half_deaf_probes();
+    }
+
+    [[nodiscard]] std::size_t num_deaf_probes() const {
+        return queue_.num_deaf_probes();
+    }
+
     [[nodiscard]] std::size_t num_immediate_sends() const {
         return queue_.num_immediate_sends();
     }
