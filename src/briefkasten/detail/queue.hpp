@@ -210,8 +210,9 @@ public:
             if (termination_state_ == TerminationState::active) {
                 return false;
             }
-            // additional_counts() folds in a sibling queue's send/receive counts so that termination of a multi-hop
-            // setup is decided by a single allreduce over the whole system (see IndirectionAdapter).
+            // additional_counts() contributes the caller's own not-yet-handed-to-MPI payload (BufferedMessageQueue's
+            // aggregation buffers) to the counting round. It used to also fold a sibling queue's packet counts in, back
+            // when IndirectionAdapter ran one queue per hop; that is gone with the two-hop collapse.
             termination_.start_message_counting(additional_counts());
             // poll at least once, so we don't miss any messages
             // if the the message box is empty upon calling this function

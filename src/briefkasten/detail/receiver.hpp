@@ -646,7 +646,7 @@ public:
         // the slot is reserved for the duration of on_message; a recursive probe_for_one_message call sees it as
         // occupied and uses the next free slot instead. Processing one message at a time (rather than batching all
         // receives before any handler call) is essential: batching N messages locks all N slots simultaneously,
-        // leaving none for recursive probes and causing a near-deadlock when second_hop send slots are exhausted.
+        // leaving none for recursive probes and causing a near-deadlock when the relay hop's send slots are exhausted.
         bool received_any = false;
         for (std::size_t i = 0; i < max_receives; i++) {
             if (!probe_for_one_message(std::forward<decltype(on_message)>(on_message))) {

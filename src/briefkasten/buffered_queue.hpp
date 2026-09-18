@@ -144,8 +144,11 @@ public:
         auto ret = post_message_impl(
             std::forward<decltype(message)>(message), receiver, envelope_sender, envelope_receiver, tag,
 
-            [&](auto it) {  // handle_overflow
-                resolve_overflow_blocking(it, on_message, progress_hook);
+            [&](auto /*it*/) {  // handle_overflow
+                // Keyed by `receiver`, not by the iterator we were handed: resolve_overflow_blocking polls,
+                // and under a single-queue IndirectionAdapter a poll can rehash or erase aggregation_buffers_
+                // underneath us. See post_message_impl's re-entrancy note.
+                resolve_overflow_blocking(receiver, on_message, progress_hook);
             },
             [&] {  // get_new_buffer
                 while (true) {
@@ -282,56 +285,32 @@ public:
     /// Note: Message handlers take a MessageEnvelope as single argument. The Envelope
     /// (not necessarily the underlying data) is moved to the handler when
     /// called.
-    [[nodiscard]] bool terminate(MessageHandler<MessageType> auto&& on_message, std::invocable<> auto&& progress_hook) {
-        return terminate(
-            std::forward<decltype(on_message)>(on_message), std::forward<decltype(progress_hook)>(progress_hook),
-            [] { return internal::MessageCounter{.send = 0, .receive = 0}; }, [] {});
-    }
-
-    /// Termination variant that participates in a joint, multi-hop termination protocol.
     ///
-    /// \p additional_counts contributes a sibling queue's send/receive counts to this queue's counting round, so a
-    /// single allreduce decides termination for the whole system. \p extra_round_prepare runs once per counting round
-    /// (right after flushing our own buffers, before the counts are snapshotted) and is where the sibling's buffers
-    /// must be flushed so no buffered message stays invisible to the count.
-    [[nodiscard]] bool terminate(MessageHandler<MessageType> auto&& on_message,
-                                 std::invocable<> auto&& progress_hook,
-                                 std::invocable<> auto&& additional_counts,
-                                 std::invocable<> auto&& extra_round_prepare) {
+    /// ONE COUNTING ROUND OVER ONE QUEUE. This used to have a four-argument sibling taking
+    /// `additional_counts` and `extra_round_prepare`, which existed solely so IndirectionAdapter could fold
+    /// a second hop's send/receive counts into this hop's allreduce -- two sequential per-hop terminations
+    /// deadlock, because a locally reactivated rank leaves the first collective and enters the second while
+    /// its peers are still in the first. The two-hop collapse (see indirection.hpp) removed the sibling
+    /// queue, and with it the fold and the whole class of bug where a message merged into the sibling's
+    /// buffer counted as received but not as sent.
+    [[nodiscard]] bool terminate(MessageHandler<MessageType> auto&& on_message, std::invocable<> auto&& progress_hook) {
         auto before_next_message_counting_round_hook = [&] {
-            // progress_hook is forwarded on to queue_.terminate below as an lvalue; under IndirectionAdapter it is
-            // exactly "poll the second hop", which is what this drain must keep driving while it spins.
             flush_all_buffers_blocking(
                 on_message, [&] { return termination_state() == TerminationState::active; }, progress_hook);
         };
-        // extra_round_prepare runs HERE, fused with the counts snapshot, rather than in the hook above.
-        //
-        // Both positions satisfy the ordering the adapter needs -- the sibling's buffers must be flushed before
-        // its counts are read -- but the hook runs at the TOP of terminate's loop, ahead of the two early-abort
-        // checks, so an attempt cancelled by an arriving message had already paid for a full sibling drain.
-        // Nearly every attempt is cancelled: relay-aggregation-probe_26_09_15 measured 8,379 terminate() calls
-        // per rank per iteration against 3 allreduce rounds, each drain force-flushing ~1.66 second-hop buffers
-        // at 10% fill -- 34% of every relay send. Fused with the counts, the drain only happens on an attempt
-        // that actually reaches the counting round.
-        //
-        // Deliberately NOT a change to flush_all_buffers_blocking's should_stop, which is hardwired false on the
-        // sibling for a documented reason (an activity predicate livelocks there, since relay PEs are also
-        // destinations). This moves WHEN the drain runs, not WHETHER it drains fully.
+        // Our own buffered payload -- including anything a relay received and merged but has not yet
+        // forwarded -- joins the counting round. send/receive are counted per PACKET, so without this term
+        // a relayed message sitting in a proxy's buffer is invisible: the packet that carried it was sent
+        // once and received once, the counts balance, and termination fires with the data undelivered.
         auto prepare_and_count = [&] {
-            extra_round_prepare();
-            auto counts = additional_counts();
-            // Our own buffered payload joins the sibling's. Without this a half-full buffer on THIS
-            // queue is invisible to the balance and termination can fire with data undelivered.
-            counts.pending += pending_elements();
-            return counts;
+            return internal::MessageCounter{.send = 0, .receive = 0, .pending = pending_elements()};
         };
-        bool ret = queue_.terminate(
+        return queue_.terminate(
             split_handler(on_message),
             [&](std::size_t receipt, BufferContainer buffer) {
                 reclaim_aggregation_buffer(receipt, std::move(buffer));
             },
             before_next_message_counting_round_hook, progress_hook, prepare_and_count);
-        return ret;
     }
 
     /// Underlying packet counts PLUS this queue's own outstanding buffer contents. A sibling queue
@@ -368,11 +347,25 @@ public:
     void flush_all_buffers_blocking(MessageHandler<MessageType> auto&& on_message,
                                     std::predicate auto&& should_stop,
                                     std::invocable<> auto&& progress_hook) {
-        auto it = aggregation_buffers_.begin();
-        while (it != aggregation_buffers_.end()) {
+        // Iterate over a SNAPSHOT of the destinations, not over live iterators. Every poll() below can run a
+        // relay handler that posts back into this queue (single-queue IndirectionAdapter), which rehashes
+        // aggregation_buffers_ and may erase entries; an iterator held across a poll is a dangling read.
+        // Destinations that appear DURING the drain are deliberately left for the next one: they hold
+        // freshly relayed payload, MessageCounter::pending refuses termination while any payload is
+        // buffered, and chasing them here would let a busy relay keep this loop running indefinitely.
+        KASSERT(!draining_, "flush_all_buffers_blocking is not re-entrant");
+        draining_ = true;
+        drain_targets_.clear();
+        drain_targets_.reserve(aggregation_buffers_.size());
+        for (auto const& entry : aggregation_buffers_) {
+            drain_targets_.push_back(entry.first);
+        }
+        auto finish = [&] { draining_ = false; };
+        for (PEID target : drain_targets_) {
             poll(on_message);  // observe arrivals (may flip should_stop) and progress sends
             progress_hook();
             if (should_stop()) {
+                finish();
                 return;
             }
             while (!queue_.has_send_capacity()) {
@@ -380,8 +373,13 @@ public:
                 poll(on_message);  // only block when slots are exhausted; polling frees them as peers receive
                 progress_hook();
                 if (should_stop()) {
+                    finish();
                     return;
                 }
+            }
+            auto it = aggregation_buffers_.find(target);
+            if (it == aggregation_buffers_.end()) {
+                continue;  // a nested relay post flushed it while we were polling
             }
             // Selective drain: skip a buffer that GREW since the last drain. Such a buffer is
             // actively filling and will reach its threshold on its own, so forcing it out now only
@@ -403,7 +401,6 @@ public:
                 if (current > last_seen) {
                     last_seen = current;
                     num_drain_skips_++;
-                    ++it;
                     continue;
                 }
             }
@@ -415,10 +412,11 @@ public:
             if (selective_drain_) {
                 last_drain_size_.erase(it->first);
             }
-            std::tie(it, flushed) = flush_buffer_impl(it, /*erase=*/true);
+            std::tie(std::ignore, flushed) = flush_buffer_impl(it, /*erase=*/true);
             forced_flush_ = false;
             KASSERT(flushed, "Flush must succeed once send capacity is ensured.");
         }
+        finish();
     }
 
     /// Skip actively-filling buffers when draining for termination; see flush_all_buffers_blocking.
@@ -522,9 +520,17 @@ public:
         Config config;
         config.local_threshold_bytes = new_threshold;
         local_threshold_bytes_ = new_threshold;
-        for (auto current = aggregation_buffers_.begin(); current != aggregation_buffers_.end(); current++) {
-            if (check_for_local_buffer_overflow(current->second, 0)) {
-                resolve_overflow_blocking(current, on_message, [] {});
+        // Snapshot the destinations: resolve_overflow_blocking polls, which under indirection can rehash
+        // this map from a relay handler. Same reasoning as flush_all_buffers_blocking.
+        std::vector<PEID> targets;
+        targets.reserve(aggregation_buffers_.size());
+        for (auto const& entry : aggregation_buffers_) {
+            targets.push_back(entry.first);
+        }
+        for (PEID target : targets) {
+            auto current = aggregation_buffers_.find(target);
+            if (current != aggregation_buffers_.end() && check_for_local_buffer_overflow(current->second, 0)) {
+                resolve_overflow_blocking(target, on_message, [] {});
             }
         }
         auto new_buffer_size = compute_buffer_size(config);
@@ -621,9 +627,7 @@ public:
         return queue_.num_termination_rounds();
     }
 
-    /// See MessageQueue::num_terminate_calls / num_termination_drains. Under IndirectionAdapter only the
-    /// FIRST hop's queue reports these: terminate() is delegated to it, and the second hop is drained from
-    /// inside its hook, so the second hop's counts stay at zero by construction.
+    /// See MessageQueue::num_terminate_calls / num_termination_drains.
     [[nodiscard]] std::size_t num_terminate_calls() const {
         return queue_.num_terminate_calls();
     }
@@ -644,7 +648,7 @@ public:
     }
 
     /// Waits inside \ref flush_all_buffers_blocking, i.e. the *termination* drain: reached only from
-    /// \ref terminate (directly, and via IndirectionAdapter's extra_round_prepare for the sibling hop).
+    /// \ref terminate.
     [[nodiscard]] std::size_t num_drain_capacity_waits() const {
         return num_drain_capacity_waits_;
     }
@@ -652,10 +656,11 @@ public:
     /// Waits inside \ref resolve_overflow_blocking, i.e. the *steady-state* post path: an aggregation
     /// buffer filled up and the flush that must precede the merge could not get send capacity.
     ///
-    /// On an IndirectionAdapter this is the counter that separates the two hypotheses for the async-grid
-    /// stall, because the two hops report separately: the second hop's count is the relay handler
-    /// (`redirection_handler` -> post_message_blocking(direct_send=true)), the first hop's is the
-    /// application originating a message. See notes/takeover_relay_backpressure.md.
+    /// Under a single-queue IndirectionAdapter this is where the relay's blocking shows up: the relay
+    /// handler reaches it through post_message_blocking(direct_send=true). It no longer separates the relay
+    /// from the application the way the two-hop split did (both now report into one counter); what the
+    /// stall investigation needed that split for is instead answered by the flow controller's own
+    /// counters. See notes/takeover_briefkasten_tokens.md.
     [[nodiscard]] std::size_t num_overflow_capacity_waits() const {
         return num_overflow_capacity_waits_;
     }
@@ -788,6 +793,13 @@ private:
 
     /// Note: messages have to be passed as rvalues. If you want to send static
     /// data without an additional copy, wrap it in a std::ranges::ref_view.
+    ///
+    /// RE-ENTRANCY. Both customization points can poll, and under a single-queue IndirectionAdapter a poll
+    /// runs the relay handler, which posts back into THIS queue: `aggregation_buffers_` may rehash (killing
+    /// iterators) and the entry for `receiver` may even be erased outright (get_new_buffer's
+    /// flush_largest_buffer path erases an empty buffer). So `it` is re-established by a fresh lookup after
+    /// every such call rather than reused. Before the two-hop collapse the relay posted into a *different*
+    /// queue object and none of this could happen; see indirection.hpp.
     bool post_message_impl(InputMessageRange<MessageType> auto&& message,
                            PEID receiver,  // NOLINT(*-easily-swappable-parameters)
                            PEID envelope_sender,
@@ -798,27 +810,31 @@ private:
         auto it = aggregation_buffers_.find(receiver);
         if (it == aggregation_buffers_.end()) {
             auto buffer = get_new_buffer();
-            std::tie(it, std::ignore) = aggregation_buffers_.emplace(receiver, std::move(buffer));
+            std::tie(it, std::ignore) = aggregation_buffers_.insert_or_assign(receiver, std::move(buffer));
         }
 
-        auto& buffer = it->second;
         auto envelope =
             MessageEnvelope{std::forward<decltype(message)>(message), envelope_sender, envelope_receiver, tag};
         size_t estimated_new_buffer_size = 0;
         if constexpr (aggregation::EstimatingMerger<Merger, MessageType, BufferContainer>) {
-            estimated_new_buffer_size = merge.estimate_new_buffer_size(buffer, receiver, queue_.rank(), envelope);
+            estimated_new_buffer_size = merge.estimate_new_buffer_size(it->second, receiver, queue_.rank(), envelope);
         } else {
-            estimated_new_buffer_size = buffer.size() + envelope.message.size();
+            estimated_new_buffer_size = it->second.size() + envelope.message.size();
         }
-        auto old_buffer_size = buffer.size();
         bool overflow = false;
-        if (check_for_buffer_overflow(buffer, estimated_new_buffer_size - old_buffer_size)) {
+        if (check_for_buffer_overflow(it->second, estimated_new_buffer_size - it->second.size())) {
             overflow = true;
             num_overflows_++;
-            handle_overflow(it);  // customization point
-            buffer = get_new_buffer();
-            old_buffer_size = buffer.size();  // fresh buffer; flush already adjusted global_buffer_size_
+            handle_overflow(it);             // customization point; may poll -> `it` is dead after this
+            auto buffer = get_new_buffer();  // may poll too, for the same reason
+            // insert_or_assign, not emplace: the local flush strategy leaves the entry in place holding a
+            // moved-from shell, while a nested flush may have erased it. Both cases end up here.
+            std::tie(it, std::ignore) = aggregation_buffers_.insert_or_assign(receiver, std::move(buffer));
         }
+        // Read immediately before the merge, so that whatever a nested poll did to OTHER buffers (and to
+        // global_buffer_size_) is already accounted for and this delta stays correct.
+        auto& buffer = it->second;
+        auto old_buffer_size = buffer.size();
         merge(buffer, receiver, queue_.rank(), std::move(envelope));
         auto new_buffer_size = buffer.size();
         global_buffer_size_ += new_buffer_size - old_buffer_size;
@@ -929,9 +945,20 @@ private:
     }
 
     /// @return returns false iff resolve failed
-    bool resolve_overflow(BufferMap::iterator current_buffer) {
+    ///
+    /// \p current_receiver is the destination whose buffer overflowed, or nullopt when the overflow was
+    /// global (no single buffer is "current"). Looked up here rather than passed as an iterator because
+    /// every blocking caller polls first, and a poll can invalidate iterators (see post_message_impl).
+    bool resolve_overflow(std::optional<PEID> current_receiver) {
+        auto current_buffer =
+            current_receiver ? aggregation_buffers_.find(*current_receiver) : aggregation_buffers_.end();
         switch (flush_strategy_) {
             case FlushStrategy::local: {
+                if (current_buffer == aggregation_buffers_.end()) {
+                    // A nested relay post already flushed (and erased) it while we waited for capacity.
+                    // The buffer we were asked to make room in no longer exists, so there is nothing to do.
+                    return true;
+                }
                 auto ret = flush_buffer_impl(current_buffer, /*erase=*/false);
                 return ret.second;
             }
@@ -950,7 +977,7 @@ private:
         return false;
     }
 
-    void resolve_overflow_blocking(BufferMap::iterator current_buffer,
+    void resolve_overflow_blocking(std::optional<PEID> current_receiver,
                                    MessageHandler<MessageType> auto&& on_message,
                                    std::invocable<> auto&& progress_hook) {
         // Block only while send slots are actually exhausted; polling frees them as peers receive.
@@ -967,7 +994,7 @@ private:
             progress_hook();
         }
         // capacity is ensured, so the flush must succeed
-        bool success = resolve_overflow(current_buffer);
+        bool success = resolve_overflow(current_receiver);
         if (success) {
             return;
         }
@@ -975,7 +1002,7 @@ private:
     }
     void resolve_overflow_blocking(MessageHandler<MessageType> auto&& on_message,
                                    std::invocable<> auto&& progress_hook) {
-        resolve_overflow_blocking(aggregation_buffers_.end(), std::forward<decltype(on_message)>(on_message),
+        resolve_overflow_blocking(std::nullopt, std::forward<decltype(on_message)>(on_message),
                                   std::forward<decltype(progress_hook)>(progress_hook));
     }
 
@@ -1022,11 +1049,18 @@ private:
     /// Buffer size seen at the previous drain, per destination. An unseen destination reads 0, so a
     /// non-empty buffer counts as "grew" on first sight and is skipped once.
     std::unordered_map<PEID, std::size_t> last_drain_size_;
-    // Set only around flush_all_buffers_blocking's own flush call. Safe as a plain flag rather than a
-    // counter: that loop's poll() hands messages to a handler which never posts back into THIS queue
-    // (the first hop's handler relays into the second hop's queue, a different object; the second hop's
-    // is terminal), so flush_buffer_impl cannot re-enter while it is set.
+    // Set only around flush_all_buffers_blocking's own flush call. Still safe as a plain flag rather than
+    // a counter after the two-hop collapse, but for a narrower reason than before: a relay handler DOES
+    // now post back into this queue, but only from the poll() at the top of the drain loop, which is
+    // outside the window this flag is set in. flush_buffer_impl itself never polls, so nothing can
+    // re-enter between the set and the clear. (The old reason -- that the handler posted into a different
+    // queue object -- no longer holds; see indirection.hpp.)
     bool forced_flush_ = false;
+    /// Reused scratch for flush_all_buffers_blocking's destination snapshot, so a drain that runs
+    /// thousands of times per iteration does not allocate. Guarded by draining_, which asserts the loop
+    /// is not re-entered (nothing calls terminate from inside a message handler).
+    std::vector<PEID> drain_targets_;
+    bool draining_ = false;
 
     Merger merge;
     Splitter split;
