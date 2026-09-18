@@ -45,6 +45,21 @@
 #include "./detail/link_class.hpp"
 #include "./detail/queue.hpp"
 
+/// Compiled in only with BRIEFKASTEN_STALL_TRACE (cmake: -DBRIEFKASTEN_STALL_TRACE=ON). Off by
+/// default so that no diagnostic scaffolding sits in the hot path of a production build, and so that a
+/// stray environment variable cannot enable it there.
+///
+/// WORTH KNOWING BEFORE YOU NEED IT: with this off, diagnosing a stall costs a rebuild and a requeue.
+/// That loop is what the tracer was built to avoid -- phase-end counters are useless against a stall,
+/// because the phase never ends -- and it found every bug in the flow-control work. If a run hangs,
+/// rebuild with -DBRIEFKASTEN_STALL_TRACE=ON and set BRIEFKASTEN_STALL_TRACE_SECONDS=5 before doing
+/// anything else. See notes/flow-control-findings.md in KaCCv2.
+#ifdef BRIEFKASTEN_STALL_TRACE
+#define BRIEFKASTEN_STALL_TRACE_TICK() stall_trace_tick()
+#else
+#define BRIEFKASTEN_STALL_TRACE_TICK() ((void)0)
+#endif
+
 namespace briefkasten {
 
 static constexpr std::size_t DEFAULT_NUM_REQUEST_SLOTS = 8;
@@ -174,10 +189,12 @@ public:
           pre_send_cleanup(std::move(cleaner)),
           flush_strategy_(effective_config_.flush_strategy) {
         reserve_aggregation_buffers(effective_config_.num_request_slots);
+#ifdef BRIEFKASTEN_STALL_TRACE
         if (char const* trace = std::getenv("BRIEFKASTEN_STALL_TRACE_SECONDS")) {
             stall_trace_interval_ = std::strtod(trace, nullptr);
             stall_trace_last_ = std::chrono::steady_clock::now();
         }
+#endif
         // ON BY DEFAULT, flat or not. A flat queue never relays, so it cannot suffer the defect credits
         // were built for -- a handler blocking and going deaf -- but it spins in the application's own
         // post path instead, and credits replace that too: measured 3.3-5.4M overflow_capacity_waits
@@ -388,7 +405,7 @@ public:
     /// Envelope (not necessarily the underlying data) is moved to the handler
     /// when called.
     auto poll(MessageHandler<MessageType> auto&& on_message) -> std::optional<std::pair<bool, bool>> {
-        stall_trace_tick();  // every spin loop in this class polls, so this is where a stall is visible
+        BRIEFKASTEN_STALL_TRACE_TICK();  // every spin loop polls, so this is where a stall is visible
         // Grants first: a credit that arrived this poll may release a deferred packet in the same poll.
         flow_.poll();
         auto result = queue_.poll(split_handler(on_message), [&](std::size_t receipt, BufferContainer buffer) {
@@ -439,6 +456,7 @@ public:
     /// its peers are still in the first. The two-hop collapse (see indirection.hpp) removed the sibling
     /// queue, and with it the fold and the whole class of bug where a message merged into the sibling's
     /// buffer counted as received but not as sent.
+#ifdef BRIEFKASTEN_STALL_TRACE
     /// Periodic dump of everything that could be holding termination up. Off unless
     /// BRIEFKASTEN_STALL_TRACE_SECONDS is set, in which case it prints at most that often per queue.
     ///
@@ -491,8 +509,10 @@ public:
         std::fputs(out.str().c_str(), stderr);
     }
 
+#endif  // BRIEFKASTEN_STALL_TRACE
+
     [[nodiscard]] bool terminate(MessageHandler<MessageType> auto&& on_message, std::invocable<> auto&& progress_hook) {
-        stall_trace_tick();
+        BRIEFKASTEN_STALL_TRACE_TICK();
         // MessageQueue::terminate's counting loop polls the RAW queue, not this one, so on its own it
         // drives neither the grant channel nor the deferred queues -- and a parked packet keeps
         // pending_elements() non-zero, so termination would never fire. Nothing would ever unpark it
@@ -1742,8 +1762,10 @@ private:
     std::size_t num_buffer_acquires_ = 0;
     std::size_t num_buffer_recycles_ = 0;
     std::size_t num_buffer_reclaims_ = 0;
+#ifdef BRIEFKASTEN_STALL_TRACE
     double stall_trace_interval_ = 0.0;
     std::chrono::steady_clock::time_point stall_trace_last_{};
+#endif
 
     Merger merge;
     Splitter split;

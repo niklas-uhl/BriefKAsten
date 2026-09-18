@@ -541,10 +541,14 @@ private:
         while (true) {
             // A stall here looks like a hang at the END of a phase, with no other symptom. Cheap to
             // trace and impossible to diagnose otherwise.
+#ifdef BRIEFKASTEN_STALL_TRACE
             if (++rounds % 1000 == 0 && std::getenv("BRIEFKASTEN_STALL_TRACE_SECONDS") != nullptr) {
                 std::fprintf(stderr, "[bk-quiesce] round %zu sent=%zu received=%zu\n", rounds,
                              grants_sent_, grants_received_);
             }
+#else
+            (void)rounds;
+#endif
             receive_grants();
             progress_resends();
             std::size_t outstanding = 0;
