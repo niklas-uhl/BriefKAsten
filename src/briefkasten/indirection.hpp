@@ -87,6 +87,11 @@ public:
         // One buffer and one class per peer. The queue caches this, so the scheme is consulted once per
         // peer rather than once per message.
         queue_.link_classifier([this](PEID peer) { return indirection_.link_class(peer); });
+        // Flow control defaults ON here and only here. This is the class that relays, and relaying is what
+        // makes a blocked send block a receive handler; a flat queue's handler is terminal and cannot
+        // block. An explicit budget of 0 in the config turns it off, which is the A/B control.
+        auto const budget = queue_.config().flow_control_budget_bytes.value_or(DEFAULT_FLOW_CONTROL_BUDGET_BYTES);
+        queue_.enable_flow_control(budget, fan_out(indirection_), /*has_relay_peers=*/true);
     }
 
     /// Enable the selective termination drain; see BufferedMessageQueue::flush_all_buffers_blocking.

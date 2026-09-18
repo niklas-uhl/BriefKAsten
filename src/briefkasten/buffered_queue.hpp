@@ -21,9 +21,11 @@
 
 #include <mpi.h>
 #include <algorithm>
+#include <kamping/environment.hpp>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <kassert/kassert.hpp>
 #include <limits>
@@ -35,6 +37,7 @@
 
 #include "./aggregators.hpp"
 #include "./detail/concepts.hpp"
+#include "./detail/flow_control.hpp"
 #include "./detail/link_class.hpp"
 #include "./detail/queue.hpp"
 
@@ -52,6 +55,12 @@ struct Config {
     size_t global_threshold_bytes = std::numeric_limits<size_t>::max();
     std::size_t local_threshold_bytes = DEFAULT_BUFFER_THRESHOLD;
     std::optional<std::size_t> send_backlog_capacity = std::nullopt;
+    /// Memory this queue lets peers have in flight towards it, rationed out as credit (see
+    /// internal::FlowController). nullopt means "whatever this context defaults to": off for a flat queue,
+    /// DEFAULT_FLOW_CONTROL_BUDGET_BYTES under IndirectionAdapter, which is where relaying -- and so the
+    /// blocking-inside-a-handler failure credit exists to remove -- happens at all. An explicit 0 turns it
+    /// off everywhere, which is the A/B control.
+    std::optional<std::size_t> flow_control_budget_bytes = std::nullopt;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -116,11 +125,44 @@ public:
           local_threshold_bytes_(effective_config_.local_threshold_bytes),
           global_threshold_bytes_(effective_config_.global_threshold_bytes),
           max_num_aggregation_buffers_(effective_config_.max_num_aggregation_buffers.value()),
+          flow_(comm, kamping::Environment<>::tag_upper_bound() - 3, effective_config_.num_request_slots),
           merge(std::move(merger)),
           split(std::move(splitter)),
           pre_send_cleanup(std::move(cleaner)),
           flush_strategy_(effective_config_.flush_strategy) {
         reserve_aggregation_buffers(effective_config_.num_request_slots);
+        // Flat topology: every peer is a potential destination and nothing is ever relayed. Only fires if
+        // the caller asked for flow control explicitly; IndirectionAdapter re-rations on top of this.
+        if (effective_config_.flow_control_budget_bytes.value_or(0) > 0) {
+            int comm_size = 0;
+            MPI_Comm_size(comm, &comm_size);
+            enable_flow_control(effective_config_.flow_control_budget_bytes.value(),
+                                static_cast<std::size_t>(comm_size), /*has_relay_peers=*/false);
+        }
+    }
+
+    /// Ration \p budget_bytes of in-flight payload across \p num_peers peers and, if this queue relays,
+    /// reserve the buffer pool the relay needs to stay non-blocking.
+    ///
+    /// \p has_relay_peers is what separates the two topologies. Without relaying, an arriving packet is
+    /// consumed by the handler and the pool only has to serve the application. With relaying, the handler
+    /// must be able to acquire a buffer to forward into -- if it cannot, it spins, and a spinning handler
+    /// is a receive slot that stays disarmed, which is the original defect. So the pool is sized to hold
+    /// the whole rationed budget plus one partially filled buffer per destination, and that share is
+    /// fenced off from the application (see acquire_buffer). The bound is exact rather than hopeful: the
+    /// base windows and the shared pool sum to the budget, so relayed payload in flight can never exceed
+    /// it, and payload spread over at most fan_out destinations needs at most budget/packet + fan_out
+    /// buffers to hold.
+    void enable_flow_control(std::size_t budget_bytes, std::size_t num_peers, bool has_relay_peers) {
+        if (budget_bytes == 0) {
+            return;
+        }
+        auto const packet_elements = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
+        auto const budget_elements = std::max<std::size_t>(budget_bytes / sizeof(BufferType), packet_elements);
+        flow_.configure(budget_elements, packet_elements, num_peers);
+        relay_buffer_reserve_ = has_relay_peers ? (budget_elements / packet_elements) + num_peers : 0;
+        max_num_aggregation_buffers(relay_buffer_reserve_ + num_peers + effective_config_.num_request_slots +
+                                    effective_config_.send_backlog_capacity.value());
     }
 
     ~BufferedMessageQueue() = default;
@@ -262,19 +304,26 @@ public:
     /// Envelope (not necessarily the underlying data) is moved to the handler
     /// when called.
     auto poll(MessageHandler<MessageType> auto&& on_message) -> std::optional<std::pair<bool, bool>> {
-        return queue_.poll(split_handler(on_message), [&](std::size_t receipt, BufferContainer buffer) {
+        // Grants first: a credit that arrived this poll may release a deferred packet in the same poll.
+        flow_.poll();
+        auto result = queue_.poll(split_handler(on_message), [&](std::size_t receipt, BufferContainer buffer) {
             reclaim_aggregation_buffer(receipt, std::move(buffer));
         });
+        drain_deferred();
+        return result;
     }
 
     auto poll_throttled(MessageHandler<MessageType> auto&& on_message,
                         std::size_t poll_skip_threshold = DEFAULT_POLL_SKIP_THRESHOLD) {
-        return queue_.poll_throttled(
+        flow_.poll();
+        auto result = queue_.poll_throttled(
             split_handler(on_message),
             [&](std::size_t receipt, BufferContainer buffer) {
                 reclaim_aggregation_buffer(receipt, std::move(buffer));
             },
             poll_skip_threshold);
+        drain_deferred();
+        return result;
     }
 
     /// Note: Message handlers take a MessageEnvelope as single argument. The Envelope
@@ -296,9 +345,23 @@ public:
     /// queue, and with it the fold and the whole class of bug where a message merged into the sibling's
     /// buffer counted as received but not as sent.
     [[nodiscard]] bool terminate(MessageHandler<MessageType> auto&& on_message, std::invocable<> auto&& progress_hook) {
+        // MessageQueue::terminate's counting loop polls the RAW queue, not this one, so on its own it
+        // drives neither the grant channel nor the deferred queues -- and a parked packet keeps
+        // pending_elements() non-zero, so termination would never fire. Nothing would ever unpark it
+        // either, because unparking needs a grant and grants arrive through flow_.poll(). The progress
+        // hook is the one callback that loop does invoke every iteration, so the credit machinery rides
+        // on it. Without this the indirect alltoall test hangs outright.
+        auto drive = [&] {
+            flow_.poll();
+            drain_deferred();
+            progress_hook();
+        };
         auto before_next_message_counting_round_hook = [&] {
+            // Unconditionally, before the snapshot loop: with every aggregation buffer already empty the
+            // loop body never runs, and this round would then make no transport progress at all.
+            drive();
             flush_all_buffers_blocking(
-                on_message, [&] { return termination_state() == TerminationState::active; }, progress_hook);
+                on_message, [&] { return termination_state() == TerminationState::active; }, drive);
         };
         // Our own buffered payload -- including anything a relay received and merged but has not yet
         // forwarded -- joins the counting round. send/receive are counted per PACKET, so without this term
@@ -312,7 +375,7 @@ public:
             [&](std::size_t receipt, BufferContainer buffer) {
                 reclaim_aggregation_buffer(receipt, std::move(buffer));
             },
-            before_next_message_counting_round_hook, progress_hook, prepare_and_count);
+            before_next_message_counting_round_hook, drive, prepare_and_count);
     }
 
     /// Underlying packet counts PLUS this queue's own outstanding buffer contents. A sibling queue
@@ -328,7 +391,11 @@ public:
     /// meaningful to termination. Already correct in the presence of a BufferCleaner: flush
     /// subtracts the PRE-cleanup size, so discarded payload is accounted for.
     [[nodiscard]] std::size_t pending_elements() const {
-        return global_buffer_size_;
+        // Deferred packets count too. They have left their aggregation buffer but have not been handed to
+        // MPI, so neither global_buffer_size_ nor the send count sees them; without this term termination
+        // could fire with a parked packet still undelivered -- the same silent-loss shape that
+        // MessageCounter::pending exists to close, arriving by a new route.
+        return global_buffer_size_ + deferred_elements_;
     }
 
     /// Flush every aggregation buffer, blocking only while send slots are actually exhausted.
@@ -370,7 +437,10 @@ public:
                 finish();
                 return;
             }
-            while (!queue_.has_send_capacity()) {
+            // Under flow control a flush never fails -- it parks the packet in its destination's deferred
+            // queue -- so there is nothing to wait for and the drain runs to completion without blocking.
+            // pending_elements() counts what was parked, so termination still refuses until it is gone.
+            while (!flow_.enabled() && !queue_.has_send_capacity()) {
                 num_drain_capacity_waits_++;
                 poll(on_message);  // only block when slots are exhausted; polling frees them as peers receive
                 progress_hook();
@@ -693,6 +763,63 @@ public:
         return num_overflow_capacity_waits_;
     }
 
+    /// Payload parked because its destination had granted no room (or our request pool was busy). The
+    /// number to read against runtime: it is what the protocol costs, where \ref num_send_capacity_waits
+    /// was what having no protocol cost. A deferral is cheap -- it is a move and a poll away from being
+    /// sent -- whereas a capacity wait was a spin inside a receive handler.
+    [[nodiscard]] std::size_t num_credit_deferrals() const {
+        return num_credit_deferrals_;
+    }
+
+    /// Packets parked right now, in elements. Should be near zero except under genuine congestion.
+    [[nodiscard]] std::size_t deferred_elements() const {
+        return deferred_elements_;
+    }
+
+    /// Relayed payload occupying the relay reserve, in elements. Bounded by the configured budget.
+    [[nodiscard]] std::size_t relay_outstanding_elements() const {
+        return flow_.relay_outstanding();
+    }
+
+    /// Should stay at zero; see acquire_buffer. Non-zero means the relay could not get a buffer and blocked
+    /// inside a handler, i.e. the pool sizing argument has broken.
+    [[nodiscard]] std::size_t num_relay_buffer_stalls() const {
+        return num_relay_buffer_stalls_;
+    }
+
+    /// See FlowController::num_grants_withheld.
+    [[nodiscard]] std::size_t num_grants_withheld() const {
+        return flow_.num_grants_withheld();
+    }
+
+    [[nodiscard]] std::size_t num_grants_sent() const {
+        return flow_.num_grants_sent();
+    }
+
+    [[nodiscard]] std::size_t num_grants_received() const {
+        return flow_.num_grants_received();
+    }
+
+    /// Times a peer's window was grown out of the shared pool because it had consumed its whole outstanding
+    /// grant before we could re-grant, i.e. how much skew the pool actually absorbed.
+    [[nodiscard]] std::size_t num_window_grows() const {
+        return flow_.num_window_grows();
+    }
+
+    /// Packets larger than a whole window, let through on the escape hatch in FlowController::has_credit.
+    /// Persistently non-zero means the aggregation threshold is mis-sized against the flow-control budget.
+    [[nodiscard]] std::size_t num_oversize_passes() const {
+        return flow_.num_oversize_passes();
+    }
+
+    [[nodiscard]] bool flow_control_enabled() const {
+        return flow_.enabled();
+    }
+
+    [[nodiscard]] std::size_t flow_control_window() const {
+        return flow_.base_window();
+    }
+
     [[nodiscard]] std::size_t num_polls() const {
         return queue_.num_polls();
     }
@@ -754,12 +881,22 @@ public:
         num_forced_flushes_ = 0;
         num_forced_flush_elements_ = 0;
         num_drain_skips_ = 0;
+        num_credit_deferrals_ = 0;
+        num_relay_buffer_stalls_ = 0;
+        flow_.reset_counters();
         queue_.reset_counters();
     }
 
 private:
     using BufferMap = std::unordered_map<PEID, BufferContainer>;
     using BufferList = std::vector<BufferContainer>;
+
+    /// A packet that has left its aggregation buffer but has no credit to go out on yet. \c relayed is how
+    /// much of it came in over a relay link, so the reserve can be released when its send completes.
+    struct DeferredPacket {
+        BufferContainer buffer;
+        std::size_t relayed = 0;
+    };
 
     // Fan-out for the direct case is p: every rank is a potential destination.
     static Config apply_comm_size_defaults(MPI_Comm comm, Config config) {
@@ -798,7 +935,26 @@ private:
         }
     }
 
+    /// \return a free buffer, or nullopt if the caller must wait for one.
+    ///
+    /// When this queue relays, part of the pool is fenced off for the relay. A relay handler that cannot
+    /// get a buffer spins, and a spinning handler is a disarmed receive slot -- the defect this whole
+    /// change exists to remove -- so the application is held back at a lower cap than the relay is. The
+    /// fence is sized in enable_flow_control so that the relay provably cannot exhaust its share.
     auto acquire_buffer() -> std::optional<BufferContainer> {
+        bool const for_relay = relaying_depth_ > 0;
+        if (!for_relay && relay_buffer_reserve_ > 0) {
+            auto const application_cap =
+                max_num_aggregation_buffers_ - std::min(max_num_aggregation_buffers_, relay_buffer_reserve_);
+            auto const in_use = num_aggregation_buffers_ - free_aggregation_buffers_.size();
+            if (in_use >= application_cap) {
+                if (aggregation_buffers_.size() >= application_cap) {
+                    flush_largest_buffer();
+                }
+                num_buffer_stalls_++;
+                return std::nullopt;
+            }
+        }
         if (free_aggregation_buffers_.empty()) {
             if (num_aggregation_buffers_ < max_num_aggregation_buffers_) {
                 reserve_aggregation_buffers(1);
@@ -810,6 +966,11 @@ private:
                     flush_largest_buffer();
                 }
                 num_buffer_stalls_++;
+                // Should be unreachable while flow control is on: the relay's share of the pool is sized
+                // to hold the entire rationed budget plus one partial buffer per destination, and the
+                // windows sum to that budget. If it ever fires, the sizing argument in
+                // enable_flow_control is wrong and the relay is about to block inside a handler again.
+                num_relay_buffer_stalls_ += for_relay ? 1 : 0;
                 return std::nullopt;
             }
         }
@@ -844,21 +1005,46 @@ private:
 
         auto envelope =
             MessageEnvelope{std::forward<decltype(message)>(message), envelope_sender, envelope_receiver, tag};
-        size_t estimated_new_buffer_size = 0;
-        if constexpr (aggregation::EstimatingMerger<Merger, MessageType, BufferContainer>) {
-            estimated_new_buffer_size = merge.estimate_new_buffer_size(it->second, receiver, queue_.rank(), envelope);
-        } else {
-            estimated_new_buffer_size = it->second.size() + envelope.message.size();
-        }
         bool overflow = false;
-        if (check_for_buffer_overflow(it->second, estimated_new_buffer_size - it->second.size())) {
+        // A LOOP, and the three-way reconciliation below is the point of it. Both calls inside can poll,
+        // and a poll runs a relay handler that posts into this very queue -- possibly into this very
+        // destination's buffer. Overwriting the entry afterwards (which is what the straight-line version
+        // did, harmlessly, while the relay lived on a second queue object) discards whatever the relay
+        // merged in: silent message loss, plus a global_buffer_size_ that keeps counting payload nobody
+        // holds, so termination never fires. That is not hypothetical -- it cost 5,415 of 800,000 messages
+        // per run on the four-rank indirect alltoall, nondeterministically.
+        //
+        // So each pass re-reads the entry and re-tests the overflow. The loop terminates because every
+        // pass flushes (or parks) this destination's buffer, and the only thing that can refill it is a
+        // relay handler forwarding payload that was already admitted under a credit.
+        while (true) {
+            size_t estimated_new_buffer_size = 0;
+            if constexpr (aggregation::EstimatingMerger<Merger, MessageType, BufferContainer>) {
+                estimated_new_buffer_size =
+                    merge.estimate_new_buffer_size(it->second, receiver, queue_.rank(), envelope);
+            } else {
+                estimated_new_buffer_size = it->second.size() + envelope.message.size();
+            }
+            if (!check_for_buffer_overflow(it->second, estimated_new_buffer_size - it->second.size())) {
+                break;
+            }
             overflow = true;
             num_overflows_++;
             handle_overflow(it);             // customization point; may poll -> `it` is dead after this
             auto buffer = get_new_buffer();  // may poll too, for the same reason
-            // insert_or_assign, not emplace: the local flush strategy leaves the entry in place holding a
-            // moved-from shell, while a nested flush may have erased it. Both cases end up here.
-            std::tie(it, std::ignore) = aggregation_buffers_.insert_or_assign(receiver, std::move(buffer));
+            it = aggregation_buffers_.find(receiver);
+            if (it == aggregation_buffers_.end()) {
+                // A nested flush erased it (the drain and flush_largest_buffer both erase).
+                std::tie(it, std::ignore) = aggregation_buffers_.emplace(receiver, std::move(buffer));
+            } else if (it->second.empty()) {
+                // The moved-from shell our own flush left behind. It carries no capacity, so swapping in
+                // the fresh buffer is what the straight-line version did and is still right.
+                it->second = std::move(buffer);
+            } else {
+                // Refilled by a relay handler while we polled. Its payload must survive, so the fresh
+                // buffer goes back to the pool and the next pass re-tests against the real contents.
+                recycle_buffer(std::move(buffer));
+            }
         }
         // Read immediately before the merge, so that whatever a nested poll did to OTHER buffers (and to
         // global_buffer_size_) is already accounted for and this delta stays correct.
@@ -866,7 +1052,12 @@ private:
         auto old_buffer_size = buffer.size();
         merge(buffer, receiver, queue_.rank(), std::move(envelope));
         auto new_buffer_size = buffer.size();
-        global_buffer_size_ += new_buffer_size - old_buffer_size;
+        auto const merged = new_buffer_size - old_buffer_size;
+        global_buffer_size_ += merged;
+        if (relaying_depth_ > 0 && merged > 0) {
+            relayed_in_buffer_[receiver] += merged;
+            flow_.note_relayed(merged);
+        }
         return overflow;
     }
 
@@ -886,6 +1077,9 @@ private:
         // we don't send if the cleanup has emptied the buffer
         if (buffer.empty()) {
             global_buffer_size_ -= pre_cleanup_buffer_size;
+            // The BufferCleaner discarded the whole packet, relayed payload included. Nothing will ever
+            // complete a send for it, so the reserve has to be released here or it leaks for the phase.
+            flow_.note_relay_released(take_relayed(receiver));
             if (erase) {
                 BufferContainer container = std::move(buffer_it->second);
                 auto next = aggregation_buffers_.erase(buffer_it);
@@ -894,22 +1088,112 @@ private:
             }
             return {++buffer_it, true};
         }
-        if (!queue_.has_send_capacity()) {
-            return {buffer_it, false};
-        }
-        num_elements_flushed_ += buffer_it->second.size();
+        auto const elements = buffer_it->second.size();
         if (forced_flush_) {
             num_forced_flushes_++;
-            num_forced_flush_elements_ += buffer_it->second.size();
+            num_forced_flush_elements_ += elements;
         }
+        // THE GATE, and section 4.4 puts it here rather than at post_message deliberately: this is the
+        // granularity at which the wire is actually used, so a credit is spent on a packet rather than on
+        // every message merged into one.
+        //
+        // Under flow control a flush NEVER fails. If the peer has not made room, or our own request pool
+        // is busy, the packet is parked in this destination's deferred queue and poll() sends it when
+        // credit arrives. That is what lets the caller stop spinning, and it is the whole mechanism: a
+        // relay handler that only ever appends and parks cannot block, so its receive slot is re-armed
+        // immediately and it never goes deaf to its row. The park is also per destination, which is the
+        // other half -- the old single FIFO backlog let a packet for a slow destination head-of-line
+        // block every packet behind it regardless of where they were going.
+        if (flow_.enabled()) {
+            if (!flow_.has_credit(receiver, elements) || !queue_.has_send_capacity()) {
+                num_credit_deferrals_++;
+                defer_packet(receiver, std::move(buffer_it->second));
+                global_buffer_size_ -= pre_cleanup_buffer_size;
+                if (erase) {
+                    return {aggregation_buffers_.erase(buffer_it), true};
+                }
+                return {++buffer_it, true};
+            }
+        } else if (!queue_.has_send_capacity()) {
+            return {buffer_it, false};
+        }
+        num_elements_flushed_ += elements;
+        auto const relayed = take_relayed(receiver);
         auto receipt = queue_.post_message(std::move(buffer_it->second), receiver);
         KASSERT(receipt.has_value(),
                 "We checked before that there is capacity, so posting the message should not fail.");
+        flow_.note_sent(receiver, elements);
+        if (relayed > 0) {
+            relayed_by_receipt_[*receipt] = relayed;
+        }
         global_buffer_size_ -= pre_cleanup_buffer_size;
         if (erase) {
             return {aggregation_buffers_.erase(buffer_it), true};
         }
         return {++buffer_it, true};
+    }
+
+    /// Park a packet that has no credit (or no free request slot) in its destination's own queue.
+    void defer_packet(PEID receiver, BufferContainer&& buffer) {
+        auto const elements = buffer.size();
+        auto& queue_for_peer = deferred_[receiver];
+        if (queue_for_peer.empty()) {
+            deferred_peers_.push_back(receiver);  // worklist entry; only added on the empty->non-empty edge
+        }
+        queue_for_peer.push_back(DeferredPacket{.buffer = std::move(buffer), .relayed = take_relayed(receiver)});
+        deferred_elements_ += elements;
+    }
+
+    /// Send whatever the peers have since made room for. Walks a worklist that is empty whenever nothing is
+    /// parked, so an uncongested run pays one branch per poll.
+    void drain_deferred() {
+        if (deferred_peers_.empty()) {
+            return;
+        }
+        std::size_t kept = 0;
+        for (std::size_t i = 0; i < deferred_peers_.size(); ++i) {
+            PEID receiver = deferred_peers_[i];
+            auto it = deferred_.find(receiver);
+            if (it == deferred_.end()) {
+                continue;
+            }
+            auto& packets = it->second;
+            while (!packets.empty()) {
+                auto const elements = packets.front().buffer.size();
+                if (!flow_.has_credit(receiver, elements) || !queue_.has_send_capacity()) {
+                    break;
+                }
+                auto const relayed = packets.front().relayed;
+                auto receipt = queue_.post_message(std::move(packets.front().buffer), receiver);
+                KASSERT(receipt.has_value(), "capacity was checked, so posting must succeed");
+                flow_.note_sent(receiver, elements);
+                if (relayed > 0) {
+                    relayed_by_receipt_[*receipt] = relayed;
+                }
+                num_elements_flushed_ += elements;
+                deferred_elements_ -= elements;
+                packets.pop_front();
+            }
+            if (packets.empty()) {
+                deferred_.erase(it);
+            } else {
+                deferred_peers_[kept++] = receiver;
+            }
+        }
+        deferred_peers_.resize(kept);
+    }
+
+    /// Relayed elements accumulated for \p receiver's currently filling buffer, handed over to whatever
+    /// takes ownership of that buffer (a send, or a deferred packet). The reserve they occupy is released
+    /// when that send completes -- see reclaim_aggregation_buffer.
+    std::size_t take_relayed(PEID receiver) {
+        auto it = relayed_in_buffer_.find(receiver);
+        if (it == relayed_in_buffer_.end()) {
+            return 0;
+        }
+        auto const relayed = it->second;
+        relayed_in_buffer_.erase(it);
+        return relayed;
     }
 
     /// if post_flush_hook return true, this breaks the loop
@@ -968,9 +1252,20 @@ private:
         return [&](Envelope<BufferType> auto buffer) {
             auto const source = buffer.sender;
             auto const posts_before = num_posts_;
+            auto const elements = buffer.message.size();
+            // Anything posted while this is non-zero is a forward of relayed payload, not an application
+            // send, and is charged to the relay reserve. A depth rather than a flag because handling can
+            // nest: a post that blocks polls, and a poll can run another packet's handler.
+            auto const source_class = link_class(source);
+            bool const relays = source_class == LinkClass::to_proxy;
+            flow_.set_link_class(source, source_class);
+            relaying_depth_ += relays ? 1 : 0;
             for (Envelope<MessageType> auto env : split(buffer.message, buffer.sender, queue_.rank())) {
                 on_message(std::move(env));
             }
+            relaying_depth_ -= relays ? 1 : 0;
+            // Release the peer's window now that the packet has been handled, which may grant it more.
+            flow_.note_admitted(source, elements);
             // ACYCLICITY. A to_destination link is terminal: handling what arrives over it must not post
             // anything, or the chain "different-column send -> same-column send -> delivery" is not a
             // chain and the deadlock argument in link_class.hpp is void. Checking it here rather than
@@ -987,9 +1282,23 @@ private:
         };
     }
 
-    auto reclaim_aggregation_buffer(std::size_t /*receipt*/, BufferContainer&& buffer) {
+    /// Return a buffer to the pool that was never sent. Deliberately NOT reclaim_aggregation_buffer with
+    /// a dummy receipt: receipt 0 is a real id, so that would release some other send's relay reserve.
+    void recycle_buffer(BufferContainer&& buffer) {
         buffer.resize(0);  // this does not reduce the capacity
         free_aggregation_buffers_.emplace_back(std::move(buffer));
+    }
+
+    auto reclaim_aggregation_buffer(std::size_t receipt, BufferContainer&& buffer) {
+        // A completed send is the moment relayed payload stops occupying anything: it is no longer in an
+        // aggregation buffer, a deferred queue, or MPI's hands. Releasing it any earlier would let a relay
+        // grant room it does not have.
+        auto it = relayed_by_receipt_.find(receipt);
+        if (it != relayed_by_receipt_.end()) {
+            flow_.note_relay_released(it->second);
+            relayed_by_receipt_.erase(it);
+        }
+        recycle_buffer(std::move(buffer));
     }
 
     /// @return returns false iff resolve failed
@@ -1036,10 +1345,29 @@ private:
         // receive slot) removes the incoming traffic whose receipt is what lets remote sends — and thus our
         // awaited local completion — make progress; PersistentReceiver masks this by never refusing to receive.
         // Mirrors flush_all_buffers_blocking.
-        while (!queue_.has_send_capacity()) {
-            num_overflow_capacity_waits_++;
-            poll(std::forward<decltype(on_message)>(on_message));
-            progress_hook();
+        // THIS is the loop the async-grid stall lived in. It sits on the relay's path
+        // (redirection_handler -> post_message_blocking -> handle_overflow -> here), and a relay spinning
+        // here is a receive slot left disarmed, so the relay stops accepting from its row entirely. Under
+        // flow control it is dead code: the flush below parks the packet instead of failing, so there is
+        // nothing to wait for. The loop stays for the no-flow-control configuration, which is the A/B
+        // control and still needs it.
+        if (flow_.enabled()) {
+            // Never block, and never poll from inside a message handler. Polling here is what nests
+            // receive handling: every level holds a receive slot disarmed, and a relay with all its slots
+            // disarmed is deaf to its row -- the defect itself, just reached from the other side. So the
+            // application's post path keeps driving the transport (one non-blocking poll, no loop), and
+            // the relay's post path does nothing but append. That is the AML rule: only a loop blocked on
+            // a hop may drive that hop.
+            if (relaying_depth_ == 0) {
+                poll(std::forward<decltype(on_message)>(on_message));
+                progress_hook();
+            }
+        } else {
+            while (!queue_.has_send_capacity()) {
+                num_overflow_capacity_waits_++;
+                poll(std::forward<decltype(on_message)>(on_message));
+                progress_hook();
+            }
         }
         // capacity is ensured, so the flush must succeed
         bool success = resolve_overflow(current_receiver);
@@ -1114,6 +1442,25 @@ private:
     std::size_t num_posts_ = 0;
     std::function<LinkClass(PEID)> link_classifier_;
     mutable std::unordered_map<PEID, LinkClass> link_class_cache_;
+
+    internal::FlowController flow_;
+    /// Packets parked per destination, waiting for that destination to grant room. Per destination, not
+    /// one shared FIFO: a shared queue lets a packet for a slow peer head-of-line block everything behind
+    /// it regardless of where it is going, which is half of what made the old backlog unusable.
+    std::unordered_map<PEID, std::deque<DeferredPacket>> deferred_;
+    /// Destinations with something parked. Kept as a worklist so an uncongested poll costs one branch.
+    std::vector<PEID> deferred_peers_;
+    std::size_t deferred_elements_ = 0;
+    /// Relayed payload merged into each destination's currently filling buffer, moved onto the packet when
+    /// that buffer is flushed or parked.
+    std::unordered_map<PEID, std::size_t> relayed_in_buffer_;
+    /// Relayed payload per in-flight send, released when the send completes.
+    std::unordered_map<std::size_t, std::size_t> relayed_by_receipt_;
+    /// Nesting depth of relay-link packet handlers on the stack; see split_handler.
+    std::size_t relaying_depth_ = 0;
+    std::size_t relay_buffer_reserve_ = 0;
+    std::size_t num_credit_deferrals_ = 0;
+    std::size_t num_relay_buffer_stalls_ = 0;
 
     Merger merge;
     Splitter split;
