@@ -238,7 +238,15 @@ public:
     ///
     ///     pool cap (enforced)   = buffers_per_peer * peers + request slots      2.6 MiB at p=12288
     ///     worst-case ceiling    = (buffers_per_peer + window + 1) * peers       10.4 MiB at p=12288
-    ///     measured              = at the cap; relay_overdraft was 0 on every arm of every sweep
+    ///     measured              = at the cap on MultiStep reachability; relay_overdraft 0 there
+    ///
+    /// THAT LAST LINE IS PER-WORKLOAD, NOT UNIVERSAL -- it read "relay_overdraft was 0 on every arm
+    /// of every sweep" until 2026-09-18, when standalone label propagation on rmat became the first
+    /// workload to draw on the overdraft at all (KaCCv2 coloring-mode-rederive_26_09_18: 2.5x fan_out
+    /// allocated, overdraft 32/732/106 at p=1536/6144/12288). That is the mechanism working, not a
+    /// leak -- it stayed far under relay_pool_ceiling() and num_relay_buffer_stalls stayed 0 -- but
+    /// the calibration above was done on reachability, where the per-peer traffic is far less skewed.
+    /// Skewed degree makes relay peers hot enough to need the growth the overdraft exists to provide.
     ///
     /// The ceiling is what credits would permit if a relay were holding everything it had granted at
     /// once. It has never been approached. Both are linear in the peer count, which is the requirement.
