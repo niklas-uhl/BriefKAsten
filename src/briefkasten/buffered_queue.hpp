@@ -65,6 +65,16 @@ struct Config {
     /// blocking-inside-a-handler failure credit exists to remove -- happens at all. An explicit 0 turns it
     /// off everywhere, which is the A/B control.
     std::optional<std::size_t> flow_control_budget_bytes = std::nullopt;
+    /// Aggregation buffers the application may hold per peer, i.e. how many packets it may have
+    /// outstanding to each destination -- filling, parked, or in the sender -- before it blocks.
+    /// nullopt leaves the flow-control default.
+    ///
+    /// PER PEER, not an absolute count, because that is the shape that keeps memory O(peers): an
+    /// absolute budget is too tight at large p and too loose at small p. 2 is the classic
+    /// double-buffering rule this library started with (one filling while one is in flight), and it is
+    /// the value worth aiming for -- with credits underneath, it is no longer load-bearing for
+    /// correctness the way the old send_backlog_capacity constant was.
+    std::optional<std::size_t> outbound_buffers_per_peer = std::nullopt;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -145,74 +155,74 @@ public:
             int comm_size = 0;
             MPI_Comm_size(comm, &comm_size);
             enable_flow_control(effective_config_.flow_control_budget_bytes.value(),
-                                static_cast<std::size_t>(comm_size), /*has_relay_peers=*/false);
+                                static_cast<std::size_t>(comm_size));
         }
     }
 
-    /// Ration \p budget_bytes of in-flight payload across \p num_peers peers and, if this queue relays,
-    /// reserve the buffer pool the relay needs to stay non-blocking.
+    /// Ration \p budget_bytes of in-flight payload across \p num_peers peers.
     ///
-    /// \p has_relay_peers is what separates the two topologies. Without relaying, an arriving packet is
-    /// consumed by the handler and the pool only has to serve the application. With relaying, the handler
-    /// must be able to acquire a buffer to forward into -- if it cannot, it spins, and a spinning handler
-    /// is a receive slot that stays disarmed, which is the original defect. So the pool is sized to hold
-    /// the whole rationed budget plus one partially filled buffer per destination, and that share is
-    /// fenced off from the application (see acquire_buffer). The bound is exact rather than hopeful: the
-    /// base windows and the shared pool sum to the budget, so relayed payload in flight can never exceed
-    /// it, and payload spread over at most fan_out destinations needs at most budget/packet + fan_out
-    /// buffers to hold.
-    void enable_flow_control(std::size_t budget_bytes, std::size_t num_peers, bool has_relay_peers) {
+    /// The topology does not need to be declared here. Whether this queue relays is decided per post, by
+    /// relaying_depth_, and that is what lets the relay grow the buffer pool while the application is
+    /// held at the cap (see acquire_buffer). A flat queue simply never takes that path.
+    void enable_flow_control(std::size_t budget_bytes, std::size_t num_peers) {
         if (budget_bytes == 0) {
             return;
         }
         auto const packet_elements = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
         auto const budget_elements = std::max<std::size_t>(budget_bytes / sizeof(BufferType), packet_elements);
         flow_.configure(budget_elements, packet_elements, num_peers);
-        // UNCAP THE SEND BACKLOG. This is the sizing error section 1 of the takeover note names as the
-        // root of the whole investigation: apply_fan_out_defaults sets backlog = fan_out, sizing the
-        // queue by the NUMBER OF PEERS when what matters is the burst a relay has to absorb. Those are
-        // unrelated quantities, which is why no constant ever worked.
+        // THE SEND BACKLOG GOES BACK TO ZERO, which is what MessageQueue was built with before
+        // apply_fan_out_defaults raised it to fan_out. At zero, has_send_capacity() reduces to "is a
+        // request slot free", i.e. plain double buffering, and everything else waits in the
+        // per-destination deferred queues.
         //
-        // With credits the cap is not merely mis-sized, it is redundant: what may be in flight is
-        // already bounded, per peer, by grants. Leaving it at fan_out (28 at p=192, 56 at p=768) meant
-        // peak_send_backlog sat pinned at the cap on every rank and 96-99% of ALL packets took the
-        // deferral path -- a path built for the exceptional case of a peer that has granted no room.
-        // Measured insensitive to a 32x larger credit window, which is what proved those deferrals were
-        // never about credit.
+        // That is the whole point of having those queues. The Sender's backlog is a SINGLE FIFO deque,
+        // so a packet for a slow destination head-of-line blocks every packet behind it regardless of
+        // where they are going -- the exact structure credits exist to replace. Parking is per
+        // destination and credit-aware, so it is the right waiting room.
         //
-        // SIZE_MAX is special-cased in Sender::has_capacity, which then reports capacity
-        // unconditionally, so flush_buffer_impl defers only on genuine credit exhaustion.
-        queue_.set_send_backlog_capacity(std::numeric_limits<std::size_t>::max());
-        // Sized from the controller's own high-water mark, not from the nominal budget. The two differ
-        // by one window, because the grant that trips the gate has already raised a peer's allowance by
-        // then -- and getting this wrong does not deadlock, it silently degrades: the relay fails to
-        // acquire a buffer, spins in get_new_buffer, and is blocking inside a handler again. The
-        // `+ num_peers` covers one partially filled buffer per destination on top of the whole packets.
-        relay_buffer_reserve_ =
-            has_relay_peers ? (flow_.relay_high_water() / packet_elements) + num_peers + 1 : 0;
-        // The APPLICATION needs a deferral allowance of its own, and this is where the first version got
-        // it badly wrong: it gave the relay the whole worst-case reserve and left the application the
-        // allowance it had before flow control existed (fan_out + slots + backlog = 18 buffers at p=5).
-        // But parking is a NEW consumer of application buffers -- before credits, a full buffer was
-        // handed to MPI immediately and came straight back. Three parked packets plus the open buffers
-        // and the in-flight sends exhaust 18, after which post_message_blocking spins in get_new_buffer
-        // forever: measured as a hard stall on every rank count from 5 to 16, with credit sitting
-        // unused on every peer.
+        // An earlier attempt set this to SIZE_MAX instead, because 96-99% of packets were deferring on
+        // !has_send_capacity and that looked like the fan_out cap being mis-sized. It was -- but
+        // uncapping fixed the symptom by moving every waiting packet into the shared FIFO. Deferring is
+        // not an exceptional path here; it is the designed one, and a high deferral rate is only a
+        // problem if parking is expensive, which the budget sweep showed it is not (removing deferral
+        // entirely bought ~5%).
         //
-        // So the application gets the same allowance as the relay. Buffers are allocated lazily, so a
-        // cap only costs what is actually used -- and what is actually used is bounded by credit on the
-        // relay side and by the application blocking on this pool on its own side.
-        auto const application_allowance =
-            relay_buffer_reserve_ + num_peers + effective_config_.num_request_slots +
-            effective_config_.send_backlog_capacity.value();
-        max_num_aggregation_buffers(relay_buffer_reserve_ + application_allowance);
+        // Total outbound memory is bounded by max_num_aggregation_buffers regardless of which queue the
+        // packets wait in, since Sender-held buffers come from the same pool.
+        if (!user_config_.send_backlog_capacity) {
+            queue_.set_send_backlog_capacity(0);
+        }
+        // ONE CAP, and it throttles the APPLICATION only -- the relay grows the pool past it (see
+        // acquire_buffer), so there is nothing to fence off and nothing to size for the relay's worst
+        // case. That is what lets this be the configured budget rather than 4.3x it: the previous
+        // version reserved relay_high_water()/packet buffers for the relay and then gave the
+        // application the same again, so an 8 MiB budget capped the pool at ~34 MiB.
+        //
+        // What the application actually needs: enough to hold a packet in flight per destination, one
+        // filling buffer per destination, and the request slots. Parked packets come out of the same
+        // allowance and are what makes the application block when its peers stop granting -- which is
+        // the intended backpressure, and the one place blocking is still correct.
+        //
+        // An explicit Config::max_num_aggregation_buffers wins, so the cap can be swept. It is the one
+        // number here that is a POLICY rather than a derived bound: parked payload is not bounded by
+        // credits (a packet is parked precisely because it has no credit), so nothing derives it and
+        // only measurement can say what it should be.
+        if (user_config_.max_num_aggregation_buffers) {
+            // An explicit absolute cap wins over everything; used to sweep the pool directly.
+        } else if (user_config_.outbound_buffers_per_peer) {
+            max_num_aggregation_buffers((*user_config_.outbound_buffers_per_peer * num_peers) +
+                                        effective_config_.num_request_slots);
+        } else {
+            max_num_aggregation_buffers((budget_elements / packet_elements) + num_peers +
+                                        effective_config_.num_request_slots);
+        }
         if (stall_trace_interval_ > 0.0) {
             std::fprintf(stderr,
                          "[bk-config rank %d] budget_bytes=%zu budget_elems=%zu packet=%zu peers=%zu "
-                         "relay=%d high_water=%zu reserve=%zu window=%zu\n",
+                         "high_water=%zu pool_cap=%zu window=%zu\n",
                          rank(), budget_bytes, budget_elements, packet_elements, num_peers,
-                         static_cast<int>(has_relay_peers), flow_.relay_high_water(),
-                         relay_buffer_reserve_, flow_.base_window());
+                         flow_.relay_high_water(), max_num_aggregation_buffers_, flow_.base_window());
         }
 
     }
@@ -429,7 +439,7 @@ public:
             << " buffered=" << global_buffer_size_ << " deferred=" << deferred_elements_
             << " deferred_peers=" << deferred_peers_.size() << " buffers=" << num_aggregation_buffers_
             << "/" << max_num_aggregation_buffers_ << " free=" << free_aggregation_buffers_.size()
-            << " relay_reserve=" << relay_buffer_reserve_ << " credit_deferrals=" << num_credit_deferrals_
+            << " credit_deferrals=" << num_credit_deferrals_
             << " capacity_deferrals=" << num_capacity_deferrals_
             << " relay_buffer_stalls=" << num_relay_buffer_stalls_
             << " relay_pool_growths=" << num_relay_pool_growths_
@@ -905,10 +915,17 @@ public:
         return num_overflow_capacity_waits_;
     }
 
-    /// Packets parked because our own send path was full rather than because the peer had granted no
-    /// room. Under flow control this should be near zero: credits already bound what can be in flight,
-    /// so the send backlog does not need a cap of its own, and one would only push traffic through the
-    /// deferral path for no reason. See enable_flow_control.
+    /// Packets parked because no request slot was free, rather than because the peer had granted no
+    /// room.
+    ///
+    /// EXPECTED TO BE LARGE, and that is not a fault. Under flow control the send backlog is 0, so a
+    /// packet goes out only when one of the request slots is free and everything else waits in its
+    /// destination's deferred queue -- which is the designed waiting room, because it is per
+    /// destination and credit-aware, unlike the Sender's single FIFO. Parking is cheap: the budget
+    /// sweep showed that eliminating deferral entirely bought ~5%.
+    ///
+    /// Read it against \ref num_credit_deferrals, which is the one that says the peer is the
+    /// constraint, and against peak_send_backlog, which should now be 0.
     [[nodiscard]] std::size_t num_capacity_deferrals() const {
         return num_capacity_deferrals_;
     }
@@ -937,11 +954,16 @@ public:
         return num_relay_buffer_stalls_;
     }
 
-    /// Times the relay had to grow the buffer pool past its nominal cap because the free list was empty.
-    /// Non-zero is fine and expected under load -- it is what keeps \ref num_relay_buffer_stalls at
-    /// zero. What matters is that it plateaus: credits bound the relayed payload, so this should stop
-    /// growing once the working set is reached. Climbing without limit means the credit accounting has a
-    /// leak, since relay_outstanding_ is supposed to cap what the relay can be holding.
+    /// Times the relay grew the buffer pool past the cap because the free list was empty.
+    ///
+    /// Non-zero is normal, and more so since the cap became the configured budget rather than several
+    /// times it: growing is simply how the relay exceeds an allowance meant for the application, and it
+    /// is what keeps \ref num_relay_buffer_stalls at zero.
+    ///
+    /// What matters is that it PLATEAUS. Credits bound the relayed payload -- relay_outstanding_ cannot
+    /// exceed FlowController::relay_high_water() -- so growth must stop once the working set is reached.
+    /// Climbing without limit means that accounting leaks, and the pool is no longer bounded by
+    /// anything.
     [[nodiscard]] std::size_t num_relay_pool_growths() const {
         return num_relay_pool_growths_;
     }
@@ -1097,64 +1119,23 @@ private:
 
     /// \return a free buffer, or nullopt if the caller must wait for one.
     ///
-    /// When this queue relays, part of the pool is fenced off for the relay. A relay handler that cannot
-    /// get a buffer spins, and a spinning handler is a disarmed receive slot -- the defect this whole
-    /// change exists to remove -- so the application is held back at a lower cap than the relay is. The
-    /// fence is sized in enable_flow_control so that the relay provably cannot exhaust its share.
+    /// THE RELAY IS NEVER REFUSED; the cap throttles the application only. A relay handler that cannot
+    /// get a buffer spins, and that spin polls from inside a receive handler, which nests receive
+    /// handling, disarms receive slots and makes the relay deaf to its row -- the defect this whole
+    /// design exists to remove. So when the relay finds the pool empty it grows it, and relay memory is
+    /// bounded where it should be: by credits. relay_outstanding_ cannot exceed
+    /// FlowController::relay_high_water(), which is asserted at every grant.
+    ///
+    /// An earlier version fenced a share of a fixed pool off for the relay instead, sized by converting
+    /// the credit system's payload bound into a buffer count. That mapping is loose -- a parked packet
+    /// that is mostly application payload occupies a whole buffer while barely registering in
+    /// relay_outstanding_ -- and it failed on the cluster at p=48/192/768 with relay_buffer_stalls and
+    /// deaf_probes both non-zero. Growing on demand guarantees strictly more than the fence did, with
+    /// less machinery and a cap that means what it says.
     auto acquire_buffer() -> std::optional<BufferContainer> {
         bool const for_relay = relaying_depth_ > 0;
-        if (!for_relay && relay_buffer_reserve_ > 0) {
-            // What the relay could still obtain: buffers sitting free, plus buffers we have not created
-            // yet. Both terms are exact and non-negative.
-            //
-            // NOT `num_aggregation_buffers_ - free_aggregation_buffers_.size()`, which is what this was
-            // and which deadlocked: those two counters are NOT conserved against each other. A flush
-            // with erase=false moves the buffer out and leaves a moved-from husk in the map; the next
-            // post merges straight into the husk, growing a buffer that was never acquired, and when
-            // that is eventually flushed and reclaimed it enters the free list as a phantom. Measured on
-            // a 5-rank gnm run: 24 buffers ever created against 97 in the free list, so the subtraction
-            // underflowed to ~1.8e19 and the application was refused a buffer forever -- 10M failed
-            // acquisitions per second, with nothing else moving.
-            //
-            // The husk pattern predates this code and was harmless until something compared the two
-            // counters. It is fixed at the source below (resolve_overflow erases rather than leaving a
-            // husk), but this check no longer depends on that holding.
-            auto const creatable = max_num_aggregation_buffers_ -
-                                   std::min(max_num_aggregation_buffers_, num_aggregation_buffers_);
-            auto const available = free_aggregation_buffers_.size() + creatable;
-            if (available <= relay_buffer_reserve_) {
-                if (stall_trace_interval_ > 0.0 && (num_buffer_stalls_ % 2000000) == 0) {
-                    std::fprintf(stderr,
-                                 "[bk-quota rank %d] REFUSE app buffer: available=%zu reserve=%zu free=%zu "
-                                 "created=%zu max=%zu map=%zu deferred_elems=%zu stalls=%zu\n",
-                                 rank(), available, relay_buffer_reserve_, free_aggregation_buffers_.size(),
-                                 num_aggregation_buffers_, max_num_aggregation_buffers_,
-                                 aggregation_buffers_.size(), deferred_elements_, num_buffer_stalls_);
-                }
-                flush_largest_buffer();
-                num_buffer_stalls_++;
-                return std::nullopt;
-            }
-        }
         if (free_aggregation_buffers_.empty()) {
             if (for_relay && num_aggregation_buffers_ >= max_num_aggregation_buffers_) {
-                // THE RELAY IS NEVER REFUSED. It has nowhere to put the message it is holding, so
-                // refusing it means it spins in get_new_buffer -- and that spin polls from inside a
-                // receive handler, which nests receive handling, disarms receive slots and makes the
-                // relay deaf to its row. That is the entire defect this design exists to remove, so the
-                // buffer pool must not be the thing that reintroduces it.
-                //
-                // The first version tried to guarantee this with a reserved share of a fixed pool, sized
-                // by converting the credit system's PAYLOAD bound into a buffer count. That mapping is
-                // loose in a way that bites at scale: a parked packet that is mostly application payload
-                // with a little relayed payload in it occupies a whole buffer while barely registering
-                // in relay_outstanding_. Measured at p=768: relay_buffer_stalls and deaf_probes both
-                // non-zero, i.e. the relay was blocking inside its handler again.
-                //
-                // So the cap is a soft cap for the application only, and the relay grows the pool when
-                // it must. Relay memory is bounded by CREDITS -- relay_outstanding_ cannot exceed
-                // FlowController::relay_high_water(), which is asserted at every grant -- and that is
-                // the bound that was designed to hold it. A buffer count was never the right mechanism.
                 max_num_aggregation_buffers_++;
                 effective_config_.max_num_aggregation_buffers = max_num_aggregation_buffers_;
                 num_relay_pool_growths_++;
@@ -1162,17 +1143,16 @@ private:
             if (num_aggregation_buffers_ < max_num_aggregation_buffers_) {
                 reserve_aggregation_buffers(1);
             } else {
-                // Heuristic: at quota with no free buffer → flush one.
+                // Heuristic: at the cap with no free buffer -> flush one.
                 // It won’t free capacity immediately, but once the send
                 // completes the buffer will be recycled via reclaim_aggregation_buffer
                 if (aggregation_buffers_.size() >= max_num_aggregation_buffers_) {
                     flush_largest_buffer();
                 }
                 num_buffer_stalls_++;
-                // Should be unreachable while flow control is on: the relay's share of the pool is sized
-                // to hold the entire rationed budget plus one partial buffer per destination, and the
-                // windows sum to that budget. If it ever fires, the sizing argument in
-                // enable_flow_control is wrong and the relay is about to block inside a handler again.
+                // Unreachable for the relay by construction now -- it grew the pool above rather than
+                // arriving here. Kept as the canary: non-zero means that reasoning has broken and the
+                // relay is about to block inside a handler again.
                 num_relay_buffer_stalls_ += for_relay ? 1 : 0;
                 return std::nullopt;
             }
@@ -1699,7 +1679,6 @@ private:
     std::unordered_map<std::size_t, std::size_t> relayed_by_receipt_;
     /// Nesting depth of relay-link packet handlers on the stack; see split_handler.
     std::size_t relaying_depth_ = 0;
-    std::size_t relay_buffer_reserve_ = 0;
     std::size_t num_credit_deferrals_ = 0;
     std::size_t num_capacity_deferrals_ = 0;
     std::size_t num_relay_buffer_stalls_ = 0;
