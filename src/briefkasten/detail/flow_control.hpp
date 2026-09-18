@@ -176,6 +176,18 @@ public:
         auto const peers = std::max<std::size_t>(1, num_peers);
         auto const floor = std::max<std::size_t>(2 * std::max<std::size_t>(packet_elements, 1), 1);
         base_window_ = std::max(floor, budget_elements / peers);
+        // THE FLOOR WINS, AND THE BUDGET FOLLOWS IT. A window below two packets serialises the peer,
+        // so the floor is not negotiable -- but when it beats budget/peers the base windows promise
+        // more than the configured budget, and the promise is what the buffer pool has to be able to
+        // hold. Raising the budget to match is the only consistent choice; the alternative, honouring a
+        // small budget by rationing below the floor, hands every peer less than one packet of credit.
+        //
+        // Found the hard way: an 8 KiB budget at p=9 (6 peers, 1024-element floor) promised 6144
+        // elements against a 1024-element budget, and the implicit initial windows are handed out at
+        // peer creation without passing the grant gate -- so the overshoot was structural, not a race.
+        // It only shows up with a small EXPLICIT budget on a grid with several peers; at the 8 MiB
+        // default the ration dominates the floor and this line changes nothing.
+        budget_elements = std::max(budget_elements, base_window_ * peers);
         // Room to double a skewed peer, but never past a quarter of the whole budget: one destination
         // monopolising the reserve is the failure this is meant to absorb, not cause.
         max_window_ = std::max(base_window_, std::min(4 * base_window_, budget_elements / 4));
@@ -204,15 +216,24 @@ public:
 
     /// The hard bound on relayed payload a caller must size its buffer pool for.
     ///
-    /// \ref maybe_grant refuses to raise a relay peer's grant once relay_outstanding_ +
-    /// proxy_allowance_ has reached relay_budget_, where proxy_allowance_ is the grant already handed to
-    /// relay peers and not yet used. Since a single grant raises one peer's allowance by at most its
-    /// window, the pair can exceed relay_budget_ by at most one window and no more -- which is this
-    /// number. Counting the unused allowance is the whole point: gating on relay_outstanding_ alone
-    /// leaves the grants already in flight unbounded, so the true worst case would be a second whole
-    /// budget on top and a pool sized for one budget could be exhausted.
+    /// Three terms, and each one is a thing that actually happened during implementation:
+    ///
+    ///  * `relay_budget_` -- payload we are already holding plus grants we have issued. \ref maybe_grant
+    ///    stops raising a relay peer's grant once relay_outstanding_ + proxy_allowance_ reaches it.
+    ///    Counting the unused allowance is the point: gating on relay_outstanding_ alone leaves the
+    ///    grants already in flight unbounded.
+    ///  * `+ relay_budget_` again -- the implicit initial windows. Both ends derive them without
+    ///    exchanging a message, so they cannot be gated: the sender has already assumed its credit by
+    ///    the time we learn the link is a relay one. Their sum is bounded by the budget, because the
+    ///    budget is raised to cover the base windows (see configure), but they arrive outside the gate.
+    ///  * `+ max_window_` -- the single grant that trips the gate has already raised one peer's
+    ///    allowance by the time the check runs.
+    ///
+    /// Generous rather than tight, deliberately. Getting it wrong does not deadlock, it silently
+    /// degrades: the relay fails to acquire a buffer, spins in get_new_buffer, and is blocking inside a
+    /// handler again -- the defect this whole design exists to remove, with only a counter to say so.
     [[nodiscard]] std::size_t relay_high_water() const {
-        return relay_budget_ + max_window_;
+        return (2 * relay_budget_) + max_window_;
     }
 
     /// May a packet of \p elements elements go out to \p peer right now?

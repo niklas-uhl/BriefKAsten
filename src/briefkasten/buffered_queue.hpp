@@ -319,17 +319,27 @@ public:
         return result;
     }
 
+    /// Throttled poll. The throttle is counted HERE rather than delegated to the underlying queue, so
+    /// that everything a poll drives -- the grant channel and the deferred queues included -- is
+    /// throttled together.
+    ///
+    /// This matters more than it looks. The callers poll once per VERTEX (see KaCCv2's
+    /// reachability_labeling and the async min_label_propagation), which is why the throttle exists at
+    /// all: at skip 100 that is one MPI call per hundred vertices instead of one per vertex. Driving the
+    /// flow controller ahead of the throttle put an MPI_Testsome over the grant slots back on every
+    /// single call -- a hundredfold increase in MPI calls on the hottest loop of the async paths.
+    /// Invisible on a small local graph, fatal at scale.
+    ///
+    /// Grants are safe to throttle for the same reason data receives are: nothing blocks on one
+    /// arriving, it only decides how soon a parked packet can go out. Termination drives the controller
+    /// unthrottled anyway (see terminate), so a run winding down does not wait on this.
     auto poll_throttled(MessageHandler<MessageType> auto&& on_message,
-                        std::size_t poll_skip_threshold = DEFAULT_POLL_SKIP_THRESHOLD) {
-        flow_.poll();
-        auto result = queue_.poll_throttled(
-            split_handler(on_message),
-            [&](std::size_t receipt, BufferContainer buffer) {
-                reclaim_aggregation_buffer(receipt, std::move(buffer));
-            },
-            poll_skip_threshold);
-        drain_deferred();
-        return result;
+                        std::size_t poll_skip_threshold = DEFAULT_POLL_SKIP_THRESHOLD)
+        -> std::optional<std::pair<bool, bool>> {
+        if (poll_skip_threshold > 1 && (poll_throttle_count_++ % poll_skip_threshold) != 0) {
+            return std::nullopt;
+        }
+        return poll(std::forward<decltype(on_message)>(on_message));
     }
 
     /// Note: Message handlers take a MessageEnvelope as single argument. The Envelope
@@ -362,18 +372,36 @@ public:
             drain_deferred();
             progress_hook();
         };
-        auto before_next_message_counting_round_hook = [&] {
-            // Unconditionally, before the snapshot loop: with every aggregation buffer already empty the
-            // loop body never runs, and this round would then make no transport progress at all.
-            drive();
+        // Transport progress on every attempt, but NO drain here. See prepare_and_count.
+        auto before_next_message_counting_round_hook = [&] { drive(); };
+        // The drain runs HERE, fused with the counts snapshot, and that position is load-bearing.
+        //
+        // This hook's sibling above runs at the TOP of terminate's loop, ahead of both early-abort
+        // checks, so a drain placed there is paid by every attempt -- and nearly every attempt is
+        // cancelled by an arriving message. Measured on rmat n18 p128: 8,379 terminate() calls per rank
+        // per iteration against 3 that reached an allreduce. Everything this loop flushes is FORCED, at
+        // whatever fill it happens to have, so draining on all 8,379 fragments the traffic badly: 64% of
+        // relay packets at p=608 went out at ~5% fill.
+        //
+        // The two-queue version had this right and the one-queue collapse nearly threw it away. There,
+        // the relay hop was drained from extra_round_prepare (fused with the counts, so ~3 times) while
+        // only the originating hop paid the per-attempt drain. With a single queue the two hops share a
+        // buffer set, so leaving the drain in the per-attempt hook would have force-flushed the relay's
+        // buffers 8,379 times an iteration instead of 3 -- reintroducing exactly the fragmentation that
+        // commits da23c11 and 17700dd removed.
+        //
+        // Safe because flushing is about progress, not correctness: the `pending` term below refuses
+        // termination while any payload is buffered, so a buffer left un-drained can delay termination
+        // but can never let it fire with data undelivered. Before that term existed this would have been
+        // a silent-data-loss bug.
+        //
+        // Our own buffered payload -- including anything a relay received and merged but has not yet
+        // forwarded -- joins the counting round. send/receive are counted per PACKET, so without this
+        // term a relayed message sitting in a proxy's buffer is invisible: the packet that carried it was
+        // sent once and received once, the counts balance, and termination fires with data undelivered.
+        auto prepare_and_count = [&] {
             flush_all_buffers_blocking(
                 on_message, [&] { return termination_state() == TerminationState::active; }, drive);
-        };
-        // Our own buffered payload -- including anything a relay received and merged but has not yet
-        // forwarded -- joins the counting round. send/receive are counted per PACKET, so without this term
-        // a relayed message sitting in a proxy's buffer is invisible: the packet that carried it was sent
-        // once and received once, the counts balance, and termination fires with the data undelivered.
-        auto prepare_and_count = [&] {
             return internal::MessageCounter{.send = 0, .receive = 0, .pending = pending_elements()};
         };
         return queue_.terminate(
@@ -1467,6 +1495,9 @@ private:
     std::size_t relay_buffer_reserve_ = 0;
     std::size_t num_credit_deferrals_ = 0;
     std::size_t num_relay_buffer_stalls_ = 0;
+    /// Counts calls to poll_throttled. Held here rather than in the underlying queue so that the
+    /// throttle covers the flow controller and the deferred queues too; see poll_throttled.
+    std::size_t poll_throttle_count_ = 0;
 
     Merger merge;
     Splitter split;
