@@ -508,6 +508,14 @@ public:
     /// meaningful to termination. Already correct in the presence of a BufferCleaner: flush
     /// subtracts the PRE-cleanup size, so discarded payload is accounted for.
     [[nodiscard]] std::size_t pending_elements() const {
+        // An empty buffer map with payload still on the books means a buffer was destroyed without its
+        // contents being accounted for -- and the consequence is not just lost data: pending never
+        // returns to zero, so termination can never fire and the run hangs with no other symptom. That
+        // is exactly how the tight-budget stall presented, so it is asserted rather than left to be
+        // rediscovered. Compiled out at assertion level 0.
+        KASSERT(!aggregation_buffers_.empty() || global_buffer_size_ == 0,
+                "buffer map is empty but " << global_buffer_size_
+                                           << " elements are still counted as buffered");
         // Deferred packets count too. They have left their aggregation buffer but have not been handed to
         // MPI, so neither global_buffer_size_ nor the send count sees them; without this term termination
         // could fire with a parked packet still undelivered -- the same silent-loss shape that
@@ -1139,7 +1147,21 @@ private:
         auto it = aggregation_buffers_.find(receiver);
         if (it == aggregation_buffers_.end()) {
             auto buffer = get_new_buffer();
-            std::tie(it, std::ignore) = aggregation_buffers_.insert_or_assign(receiver, std::move(buffer));
+            // Re-look-up, for the same reason the overflow path below does. get_new_buffer POLLS when the
+            // pool is empty, and a poll runs a relay handler that can post to this very destination and
+            // create the entry we just failed to find. insert_or_assign would then destroy the payload
+            // the relay had merged -- silently, and worse than silently: global_buffer_size_ goes on
+            // counting it, so pending_elements() never returns to zero and termination can NEVER fire.
+            //
+            // Needs a tight buffer pool to reach, because get_new_buffer only polls when it cannot
+            // satisfy the request outright. That is why it hid behind the shipped 8 MiB budget and only
+            // surfaced at --briefkasten-flow-control-budget-bytes 8192.
+            it = aggregation_buffers_.find(receiver);
+            if (it == aggregation_buffers_.end()) {
+                std::tie(it, std::ignore) = aggregation_buffers_.emplace(receiver, std::move(buffer));
+            } else {
+                recycle_buffer(std::move(buffer));
+            }
         }
 
         auto envelope =
