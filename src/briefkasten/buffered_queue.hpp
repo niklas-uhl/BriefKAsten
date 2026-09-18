@@ -49,11 +49,21 @@ namespace briefkasten {
 
 static constexpr std::size_t DEFAULT_NUM_REQUEST_SLOTS = 8;
 static constexpr std::size_t DEFAULT_BUFFER_THRESHOLD = 32ULL * 1024;
-/// Credit window per peer, in packets. Everything the flow controller bounds is this times the peer
-/// count, so it is the single number that sets how much payload may be in flight towards a rank.
-static constexpr std::size_t DEFAULT_CREDIT_WINDOW_PACKETS = 16;
-/// Packets the application may have outstanding per peer before it blocks; 2 is double buffering.
-static constexpr std::size_t DEFAULT_OUTBOUND_BUFFERS_PER_PEER = 2;
+/// Credit window per peer, in packets: what each peer may have in flight towards this rank.
+///
+/// Measured, not chosen. Sweeping 2/4/8/16/32 at p=768..3072 on rmat and gnm: rmat is flat throughout,
+/// gnm has a floor at 8 (w=4 costs ~8% at p=768, 1.65x against 1.43x) and is flat above it. 8 is the
+/// smallest value that gives up nothing.
+static constexpr std::size_t DEFAULT_CREDIT_WINDOW_PACKETS = 8;
+/// Aggregation buffers per peer: the pool cap is this times the peer count, plus the request slots.
+///
+/// 3 = one filling buffer per destination plus two parked. NOT a per-peer reservation -- the pool is
+/// shared and nothing tracks per-peer usage, so a hot destination takes many and a quiet one none. It
+/// is an aggregate cap with a per-peer scaling coefficient, and the scaling is justified by UNIFORM
+/// traffic, where every peer is active at once and the working set really is proportional to the peer
+/// count. Skewed traffic (rmat) concentrates on a few destinations and the shared pool absorbs it,
+/// which is why rmat was insensitive to all of this and gnm was not.
+static constexpr std::size_t DEFAULT_BUFFERS_PER_PEER = 3;
 
 enum class FlushStrategy : std::uint8_t { local, global, random, largest };
 
@@ -74,13 +84,14 @@ struct Config {
     /// shrink as p grows, and leaves every bound derived from it O(1) in p instead of O(peers) -- which
     /// is what the memory argument needs.
     std::optional<std::size_t> credit_window_packets = std::nullopt;
-    /// Packets the application may have outstanding to each peer -- filling, parked, or in the sender --
-    /// before it blocks for a buffer. nullopt leaves DEFAULT_OUTBOUND_BUFFERS_PER_PEER.
+    /// Aggregation buffers this queue may hold, per peer: the pool cap is this times the peer count
+    /// plus the request slots. nullopt leaves DEFAULT_BUFFERS_PER_PEER.
     ///
-    /// 2 is the classic double-buffering rule this library started with: one filling while one is in
-    /// flight. With credits underneath it is no longer load-bearing for correctness the way the old
-    /// send_backlog_capacity constant was, so it can be set for memory rather than for safety.
-    std::optional<std::size_t> outbound_buffers_per_peer = std::nullopt;
+    /// This is the cap that is actually ENFORCED, and the number to look at for memory: at 3 and
+    /// p=12288 it is 674 buffers, about 2.6 MiB per rank, and buffers are allocated lazily so it costs
+    /// only what is touched. It bounds the APPLICATION, which blocks in get_new_buffer when it is
+    /// reached; the relay overdraws it rather than blocking, bounded separately by credits.
+    std::optional<std::size_t> buffers_per_peer = std::nullopt;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -161,27 +172,38 @@ public:
             int comm_size = 0;
             MPI_Comm_size(comm, &comm_size);
             enable_flow_control(effective_config_.credit_window_packets.value(),
-                                effective_config_.outbound_buffers_per_peer.value_or(
-                                    DEFAULT_OUTBOUND_BUFFERS_PER_PEER),
+                                effective_config_.buffers_per_peer.value_or(DEFAULT_BUFFERS_PER_PEER),
                                 static_cast<std::size_t>(comm_size));
         }
     }
 
-    /// Give each of \p num_peers peers a credit window of \p window_packets, and let the application
-    /// hold \p parking_packets per peer before it blocks.
+    /// Give each of \p num_peers peers a credit window of \p window_packets, and cap the buffer pool at
+    /// \p buffers_per_peer per peer.
     ///
-    /// EVERYTHING HERE IS O(#PEERS), which is the requirement this design has to meet:
+    /// TWO NUMBERS, TWO DIFFERENT JOBS, and they do not trade against each other -- measured:
     ///
-    ///     credit in flight toward us   <= window_packets * peers          (grants)
-    ///     relayed payload we hold      <= window_packets * peers + window (we only admit what we granted)
-    ///     application parking          <= parking_packets * peers         (it blocks at the cap)
-    ///     -------------------------------------------------------------------------------
-    ///     buffers                      <= (window + parking + 2) * peers + request slots
+    ///   window_packets     PROTOCOL. What each peer may have in flight towards us, and so (every rank
+    ///                      running the same config) what we may have in flight towards it. Must be
+    ///                      identical on every rank, because the initial windows are implicit and
+    ///                      unexchanged. Sets how fast the wire moves: after a window we wait for a grant.
+    ///   buffers_per_peer   LOCAL. The pool cap, which is what the application blocks against. Purely a
+    ///                      memory policy; a rank could pick its own and nothing would break.
     ///
-    /// The pool cap below covers the application; the relay overdraws it (it must never be refused a
-    /// buffer) and \ref relay_pool_ceiling bounds that overdraft at window*peers + peers + 1. Both
-    /// terms are linear in the peer count, so the total is too.
-    void enable_flow_control(std::size_t window_packets, std::size_t parking_packets,
+    /// The 2x2 sweep (w in {2,8} x buffers in {3,9}, p=384..3072, rmat and gnm) showed credit deferrals
+    /// per send are a pure function of w -- identical to three decimals across the buffer counts -- and
+    /// that a larger pool neither rescues a small window nor improves a healthy one. So parking cannot
+    /// substitute for credit, which is what the design says: parking does not make a peer accept faster.
+    ///
+    /// WHAT IS BOUNDED, AND BY WHAT. These are different quantities and conflating them overstates the
+    /// footprint by 4x, which an earlier version of this comment did:
+    ///
+    ///     pool cap (enforced)   = buffers_per_peer * peers + request slots      2.6 MiB at p=12288
+    ///     worst-case ceiling    = (buffers_per_peer + window + 1) * peers       10.4 MiB at p=12288
+    ///     measured              = at the cap; relay_overdraft was 0 on every arm of every sweep
+    ///
+    /// The ceiling is what credits would permit if a relay were holding everything it had granted at
+    /// once. It has never been approached. Both are linear in the peer count, which is the requirement.
+    void enable_flow_control(std::size_t window_packets, std::size_t buffers_per_peer,
                              std::size_t num_peers) {
         if (window_packets == 0) {
             return;
@@ -198,10 +220,9 @@ public:
         if (!user_config_.send_backlog_capacity) {
             queue_.set_send_backlog_capacity(0);
         }
-        // One filling buffer per destination plus the application's parking, and the request slots for
-        // buffers the sender is holding. An explicit absolute cap still wins, for sweeping it directly.
+        // An explicit absolute cap still wins, for sweeping the pool directly.
         if (!user_config_.max_num_aggregation_buffers) {
-            max_num_aggregation_buffers(((parking_packets + 1) * num_peers) +
+            max_num_aggregation_buffers((buffers_per_peer * num_peers) +
                                         effective_config_.num_request_slots);
         }
     }
@@ -933,10 +954,9 @@ public:
         return num_relay_buffer_stalls_;
     }
 
-    /// Buffers the relay may need beyond the application's cap, derived from what credits allow it to
-    /// be holding: relay_high_water() elements, spread over whole packets plus at most one partially
-    /// filled buffer per destination. This -- not max_num_aggregation_buffers -- is what bounds relay
-    /// memory, and \ref relay_overdraft is checked against it.
+    /// The ceiling on \ref relay_overdraft: what credits would permit a relay to be holding, in
+    /// buffers. A safety bound, not an allocation -- the overdraft measured 0 on every arm of every
+    /// sweep, meaning the relay has never needed a buffer beyond the application's cap.
     [[nodiscard]] std::size_t relay_pool_ceiling() const {
         auto const packet = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
         return (flow_.relay_high_water() / packet) + num_peers_ + 1;
