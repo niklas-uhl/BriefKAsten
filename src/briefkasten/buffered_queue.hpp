@@ -24,6 +24,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <kassert/kassert.hpp>
 #include <limits>
 #include <optional>
@@ -34,6 +35,7 @@
 
 #include "./aggregators.hpp"
 #include "./detail/concepts.hpp"
+#include "./detail/link_class.hpp"
 #include "./detail/queue.hpp"
 
 namespace briefkasten {
@@ -547,6 +549,32 @@ public:
         return user_config_;
     }
 
+    /// Install the link classifier for this queue's peers; see LinkClass.
+    ///
+    /// Set by IndirectionAdapter from its routing scheme. Left unset the queue classifies every peer as
+    /// \ref LinkClass::to_destination, which is correct for a flat queue: nothing is ever relayed.
+    ///
+    /// Looked up at most once per peer and then cached, so the std::function indirection is paid O(peers)
+    /// times per phase, not per message.
+    void link_classifier(std::function<LinkClass(PEID)> classifier) {
+        link_classifier_ = std::move(classifier);
+        link_class_cache_.clear();
+    }
+
+    /// The class of the link to \p peer, memoised.
+    [[nodiscard]] LinkClass link_class(PEID peer) const {
+        if (!link_classifier_) {
+            return LinkClass::to_destination;
+        }
+        auto it = link_class_cache_.find(peer);
+        if (it != link_class_cache_.end()) {
+            return it->second;
+        }
+        auto cls = link_classifier_(peer);
+        link_class_cache_.emplace(peer, cls);
+        return cls;
+    }
+
     /// Raise (or lower) the cap on concurrently held aggregation buffers. The cap only bounds lazy growth in
     /// acquire_buffer(), so adjusting it after construction is safe; already-allocated buffers are untouched.
     void max_num_aggregation_buffers(std::size_t new_max) {
@@ -807,6 +835,7 @@ private:
                            int tag,
                            OverflowHandler<BufferMap> auto&& handle_overflow,
                            BufferProvider<BufferContainer> auto&& get_new_buffer) {
+        num_posts_++;  // observed by split_handler's acyclicity assertion
         auto it = aggregation_buffers_.find(receiver);
         if (it == aggregation_buffers_.end()) {
             auto buffer = get_new_buffer();
@@ -931,11 +960,30 @@ private:
         return true;
     }
 
+    /// Wraps the per-message handler around one arriving PACKET, and is where the receive side sees both
+    /// the immediate MPI source (\c buffer.sender -- not \c env.sender, which under indirection is the
+    /// original origin) and the packet's element count. That makes it the natural place to check the
+    /// property the whole credit design rests on.
     auto split_handler(MessageHandler<MessageType> auto&& on_message) {
         return [&](Envelope<BufferType> auto buffer) {
+            auto const source = buffer.sender;
+            auto const posts_before = num_posts_;
             for (Envelope<MessageType> auto env : split(buffer.message, buffer.sender, queue_.rank())) {
                 on_message(std::move(env));
             }
+            // ACYCLICITY. A to_destination link is terminal: handling what arrives over it must not post
+            // anything, or the chain "different-column send -> same-column send -> delivery" is not a
+            // chain and the deadlock argument in link_class.hpp is void. Checking it here rather than
+            // asserting it in prose catches both a mis-stated scheme (a classifier that calls a relay link
+            // terminal) and an application that sends from inside a message handler -- the precondition in
+            // section 4.5 of notes/takeover_briefkasten_tokens.md, which is otherwise silent until it
+            // deadlocks at scale. One integer compare per packet; compiled out at assertion level 0.
+            KASSERT(link_class(source) == LinkClass::to_proxy || num_posts_ == posts_before,
+                    "posted " << (num_posts_ - posts_before)
+                              << " message(s) while handling a packet from rank " << source
+                              << ", whose link is classified terminal (LinkClass::to_destination). Either the "
+                                 "indirection scheme mis-classifies that link, or the application sends from "
+                                 "inside a message handler.");
         };
     }
 
@@ -1061,6 +1109,11 @@ private:
     /// is not re-entered (nothing calls terminate from inside a message handler).
     std::vector<PEID> drain_targets_;
     bool draining_ = false;
+    /// Calls to post_message_impl. Only ever read as a difference across one packet's handling, to check
+    /// that a terminal link's handler posts nothing; see split_handler.
+    std::size_t num_posts_ = 0;
+    std::function<LinkClass(PEID)> link_classifier_;
+    mutable std::unordered_map<PEID, LinkClass> link_class_cache_;
 
     Merger merge;
     Splitter split;

@@ -22,6 +22,7 @@
 #include <mpi.h>
 
 #include "./detail/definitions.hpp"
+#include "./detail/link_class.hpp"
 
 namespace briefkasten {
 class NoopIndirectionScheme {
@@ -48,6 +49,13 @@ public:
     // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
     [[nodiscard]] PEID num_groups() const {
         return 1;
+    }
+
+    /// Without indirection nothing is ever relayed, so every link is terminal and a receiver may return
+    /// credit as soon as its handler has run. There is no relay reserve to ration.
+    // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
+    [[nodiscard]] LinkClass link_class(PEID /*peer*/) const {
+        return LinkClass::to_destination;
     }
 
 private:

@@ -24,6 +24,7 @@
 #include "./buffered_queue.hpp"   // IWYU pragma: keep
 #include "./detail/concepts.hpp"  // IWYU pragma: keep
 #include "./detail/definitions.hpp"
+#include "./detail/link_class.hpp"
 
 namespace briefkasten {
 template <typename T>
@@ -35,6 +36,9 @@ concept IndirectionScheme = requires(T scheme, MPI_Comm comm, PEID sender, PEID 
     // the fan-out and drive the buffering defaults (see fan_out below).
     { scheme.group_size() } -> std::convertible_to<std::size_t>;
     { scheme.num_groups() } -> std::convertible_to<std::size_t>;
+    // Which obligation a link to `receiver` puts on its far end. Must be a property of the LINK alone --
+    // not of the record travelling over it -- and both endpoints must agree on it; see detail/link_class.hpp.
+    { scheme.link_class(receiver) } -> std::same_as<LinkClass>;
 };
 
 /// Routes every message over at most two hops of \p Indirector, using a SINGLE underlying queue.
@@ -80,6 +84,9 @@ public:
         auto cfg = apply_fan_out_defaults(queue_.config(), fan_out(indirection_));
         queue_.max_num_aggregation_buffers(cfg.max_num_aggregation_buffers.value());
         queue_.send_backlog_capacity(cfg.send_backlog_capacity.value());
+        // One buffer and one class per peer. The queue caches this, so the scheme is consulted once per
+        // peer rather than once per message.
+        queue_.link_classifier([this](PEID peer) { return indirection_.link_class(peer); });
     }
 
     /// Enable the selective termination drain; see BufferedMessageQueue::flush_all_buffers_blocking.
