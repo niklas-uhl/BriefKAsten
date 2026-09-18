@@ -170,6 +170,7 @@ public:
         }
         auto const packet_elements = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
         auto const budget_elements = std::max<std::size_t>(budget_bytes / sizeof(BufferType), packet_elements);
+        num_peers_ = num_peers;
         flow_.configure(budget_elements, packet_elements, num_peers);
         // THE SEND BACKLOG GOES BACK TO ZERO, which is what MessageQueue was built with before
         // apply_fan_out_defaults raised it to fan_out. At zero, has_send_capacity() reduces to "is a
@@ -438,11 +439,11 @@ public:
         out << "[bk-stall rank " << rank() << "] pending=" << pending_elements()
             << " buffered=" << global_buffer_size_ << " deferred=" << deferred_elements_
             << " deferred_peers=" << deferred_peers_.size() << " buffers=" << num_aggregation_buffers_
-            << "/" << max_num_aggregation_buffers_ << " free=" << free_aggregation_buffers_.size()
+            << "/" << buffer_limit() << " free=" << free_aggregation_buffers_.size()
             << " credit_deferrals=" << num_credit_deferrals_
             << " capacity_deferrals=" << num_capacity_deferrals_
             << " relay_buffer_stalls=" << num_relay_buffer_stalls_
-            << " relay_pool_growths=" << num_relay_pool_growths_
+            << " relay_overdraft=" << relay_overdraft_
             << " buffer_stalls=" << num_buffer_stalls_ << " sends=" << counts.send
             << " recvs=" << counts.receive << " term_calls=" << queue_.num_terminate_calls()
             << " term_drains=" << queue_.num_termination_drains()
@@ -954,18 +955,26 @@ public:
         return num_relay_buffer_stalls_;
     }
 
-    /// Times the relay grew the buffer pool past the cap because the free list was empty.
+    /// Buffers the relay may need beyond the application's cap, derived from what credits allow it to
+    /// be holding: relay_high_water() elements, spread over whole packets plus at most one partially
+    /// filled buffer per destination. This -- not max_num_aggregation_buffers -- is what bounds relay
+    /// memory, and \ref relay_overdraft is checked against it.
+    [[nodiscard]] std::size_t relay_pool_ceiling() const {
+        auto const packet = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
+        return (flow_.relay_high_water() / packet) + num_peers_ + 1;
+    }
+
+    /// Buffers the relay has drawn beyond the application's cap, because it must never be refused one.
     ///
-    /// Non-zero is normal, and more so since the cap became the configured budget rather than several
-    /// times it: growing is simply how the relay exceeds an allowance meant for the application, and it
-    /// is what keeps \ref num_relay_buffer_stalls at zero.
+    /// The cap does NOT bound the relay, and this is the number that says by how much. Non-zero is
+    /// normal -- overdrawing is simply how the relay exceeds an allowance meant for the application, and
+    /// it is what keeps \ref num_relay_buffer_stalls at zero.
     ///
-    /// What matters is that it PLATEAUS. Credits bound the relayed payload -- relay_outstanding_ cannot
-    /// exceed FlowController::relay_high_water() -- so growth must stop once the working set is reached.
-    /// Climbing without limit means that accounting leaks, and the pool is no longer bounded by
-    /// anything.
-    [[nodiscard]] std::size_t num_relay_pool_growths() const {
-        return num_relay_pool_growths_;
+    /// What matters is that it PLATEAUS, below \ref relay_pool_ceiling. Credits bound the relayed
+    /// payload, so the overdraft must stop growing once the working set is reached; climbing without
+    /// limit means that accounting leaks and nothing bounds the pool at all.
+    [[nodiscard]] std::size_t relay_overdraft() const {
+        return relay_overdraft_;
     }
 
     /// See FlowController::num_grants_withheld.
@@ -1098,6 +1107,14 @@ private:
         return (bytes_per_buffer + sizeof(BufferType) - 1) / sizeof(BufferType);
     }
 
+    /// Buffers the pool may hold: the application's configured cap, plus whatever the relay has had to
+    /// overdraw. Kept as two numbers rather than one mutated one, so that the cap stays a configuration
+    /// value and means exactly one thing -- the application's allowance -- while the relay's extra
+    /// allocation is explicit, separately bounded (see relay_pool_ceiling) and separately reported.
+    [[nodiscard]] std::size_t buffer_limit() const {
+        return max_num_aggregation_buffers_ + relay_overdraft_;
+    }
+
     void reserve_aggregation_buffers(std::size_t num_buffers) {
         auto buffer_size = queue_.reserved_receive_buffer_size();
         reserve_aggregation_buffers(num_buffers, buffer_size);
@@ -1105,7 +1122,7 @@ private:
 
     // NOLINTNEXTLINE(*-easily-swappable-parameters)
     void reserve_aggregation_buffers(std::size_t num_buffers, std::size_t buffer_size) {
-        if (num_aggregation_buffers_ + num_buffers > max_num_aggregation_buffers_) {
+        if (num_aggregation_buffers_ + num_buffers > buffer_limit()) {
             throw std::runtime_error("Exceeded maximum number of aggregation buffers.");
         }
         auto old_size = free_aggregation_buffers_.size();
@@ -1136,17 +1153,27 @@ private:
         bool const for_relay = relaying_depth_ > 0;
         if (free_aggregation_buffers_.empty()) {
             if (for_relay && num_aggregation_buffers_ >= max_num_aggregation_buffers_) {
-                max_num_aggregation_buffers_++;
-                effective_config_.max_num_aggregation_buffers = max_num_aggregation_buffers_;
-                num_relay_pool_growths_++;
+                // The relay ignores the cap, so say what DOES bound it. Credits cap the relayed payload
+                // at relay_high_water() elements; spread over at most one partially filled buffer per
+                // destination plus whole packets, that is this many buffers. Growth past it means the
+                // credit accounting has leaked and nothing is bounding the pool any more.
+                //
+                // Asserted rather than enforced. Enforcing it would mean refusing the relay a buffer,
+                // which is the defect itself -- so in a production build (assertion level 0) unbounded
+                // growth is the safer failure than a deaf relay, and this fires in testing instead.
+                KASSERT(relay_overdraft_ < relay_pool_ceiling(),
+                        "relay overdrew the buffer pool by " << relay_overdraft_
+                            << " buffers, past the " << relay_pool_ceiling()
+                            << " that credits should have bounded it to");
+                relay_overdraft_++;
             }
-            if (num_aggregation_buffers_ < max_num_aggregation_buffers_) {
+            if (num_aggregation_buffers_ < buffer_limit()) {
                 reserve_aggregation_buffers(1);
             } else {
                 // Heuristic: at the cap with no free buffer -> flush one.
                 // It won’t free capacity immediately, but once the send
                 // completes the buffer will be recycled via reclaim_aggregation_buffer
-                if (aggregation_buffers_.size() >= max_num_aggregation_buffers_) {
+                if (aggregation_buffers_.size() >= buffer_limit()) {
                     flush_largest_buffer();
                 }
                 num_buffer_stalls_++;
@@ -1682,7 +1709,8 @@ private:
     std::size_t num_credit_deferrals_ = 0;
     std::size_t num_capacity_deferrals_ = 0;
     std::size_t num_relay_buffer_stalls_ = 0;
-    std::size_t num_relay_pool_growths_ = 0;
+    std::size_t relay_overdraft_ = 0;
+    std::size_t num_peers_ = 0;
     /// Counts calls to poll_throttled. Held here rather than in the underlying queue so that the
     /// throttle covers the flow controller and the deferred queues too; see poll_throttled.
     std::size_t poll_throttle_count_ = 0;
