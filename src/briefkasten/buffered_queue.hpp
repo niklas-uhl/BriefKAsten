@@ -416,6 +416,7 @@ public:
             << "/" << max_num_aggregation_buffers_ << " free=" << free_aggregation_buffers_.size()
             << " relay_reserve=" << relay_buffer_reserve_ << " credit_deferrals=" << num_credit_deferrals_
             << " relay_buffer_stalls=" << num_relay_buffer_stalls_
+            << " relay_pool_growths=" << num_relay_pool_growths_
             << " buffer_stalls=" << num_buffer_stalls_ << " sends=" << counts.send
             << " recvs=" << counts.receive << " term_calls=" << queue_.num_terminate_calls()
             << " term_drains=" << queue_.num_termination_drains()
@@ -912,6 +913,15 @@ public:
         return num_relay_buffer_stalls_;
     }
 
+    /// Times the relay had to grow the buffer pool past its nominal cap because the free list was empty.
+    /// Non-zero is fine and expected under load -- it is what keeps \ref num_relay_buffer_stalls at
+    /// zero. What matters is that it plateaus: credits bound the relayed payload, so this should stop
+    /// growing once the working set is reached. Climbing without limit means the credit accounting has a
+    /// leak, since relay_outstanding_ is supposed to cap what the relay can be holding.
+    [[nodiscard]] std::size_t num_relay_pool_growths() const {
+        return num_relay_pool_growths_;
+    }
+
     /// See FlowController::num_grants_withheld.
     [[nodiscard]] std::size_t num_grants_withheld() const {
         return flow_.num_grants_withheld();
@@ -1102,6 +1112,28 @@ private:
             }
         }
         if (free_aggregation_buffers_.empty()) {
+            if (for_relay && num_aggregation_buffers_ >= max_num_aggregation_buffers_) {
+                // THE RELAY IS NEVER REFUSED. It has nowhere to put the message it is holding, so
+                // refusing it means it spins in get_new_buffer -- and that spin polls from inside a
+                // receive handler, which nests receive handling, disarms receive slots and makes the
+                // relay deaf to its row. That is the entire defect this design exists to remove, so the
+                // buffer pool must not be the thing that reintroduces it.
+                //
+                // The first version tried to guarantee this with a reserved share of a fixed pool, sized
+                // by converting the credit system's PAYLOAD bound into a buffer count. That mapping is
+                // loose in a way that bites at scale: a parked packet that is mostly application payload
+                // with a little relayed payload in it occupies a whole buffer while barely registering
+                // in relay_outstanding_. Measured at p=768: relay_buffer_stalls and deaf_probes both
+                // non-zero, i.e. the relay was blocking inside its handler again.
+                //
+                // So the cap is a soft cap for the application only, and the relay grows the pool when
+                // it must. Relay memory is bounded by CREDITS -- relay_outstanding_ cannot exceed
+                // FlowController::relay_high_water(), which is asserted at every grant -- and that is
+                // the bound that was designed to hold it. A buffer count was never the right mechanism.
+                max_num_aggregation_buffers_++;
+                effective_config_.max_num_aggregation_buffers = max_num_aggregation_buffers_;
+                num_relay_pool_growths_++;
+            }
             if (num_aggregation_buffers_ < max_num_aggregation_buffers_) {
                 reserve_aggregation_buffers(1);
             } else {
@@ -1631,6 +1663,7 @@ private:
     std::size_t relay_buffer_reserve_ = 0;
     std::size_t num_credit_deferrals_ = 0;
     std::size_t num_relay_buffer_stalls_ = 0;
+    std::size_t num_relay_pool_growths_ = 0;
     /// Counts calls to poll_throttled. Held here rather than in the underlying queue so that the
     /// throttle covers the flow controller and the deferred queues too; see poll_throttled.
     std::size_t poll_throttle_count_ = 0;
