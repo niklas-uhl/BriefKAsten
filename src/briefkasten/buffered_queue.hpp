@@ -49,6 +49,11 @@ namespace briefkasten {
 
 static constexpr std::size_t DEFAULT_NUM_REQUEST_SLOTS = 8;
 static constexpr std::size_t DEFAULT_BUFFER_THRESHOLD = 32ULL * 1024;
+/// Credit window per peer, in packets. Everything the flow controller bounds is this times the peer
+/// count, so it is the single number that sets how much payload may be in flight towards a rank.
+static constexpr std::size_t DEFAULT_CREDIT_WINDOW_PACKETS = 16;
+/// Packets the application may have outstanding per peer before it blocks; 2 is double buffering.
+static constexpr std::size_t DEFAULT_OUTBOUND_BUFFERS_PER_PEER = 2;
 
 enum class FlushStrategy : std::uint8_t { local, global, random, largest };
 
@@ -59,21 +64,22 @@ struct Config {
     size_t global_threshold_bytes = std::numeric_limits<size_t>::max();
     std::size_t local_threshold_bytes = DEFAULT_BUFFER_THRESHOLD;
     std::optional<std::size_t> send_backlog_capacity = std::nullopt;
-    /// Memory this queue lets peers have in flight towards it, rationed out as credit (see
-    /// internal::FlowController). nullopt means "whatever this context defaults to": off for a flat queue,
-    /// DEFAULT_FLOW_CONTROL_BUDGET_BYTES under IndirectionAdapter, which is where relaying -- and so the
-    /// blocking-inside-a-handler failure credit exists to remove -- happens at all. An explicit 0 turns it
-    /// off everywhere, which is the A/B control.
-    std::optional<std::size_t> flow_control_budget_bytes = std::nullopt;
-    /// Aggregation buffers the application may hold per peer, i.e. how many packets it may have
-    /// outstanding to each destination -- filling, parked, or in the sender -- before it blocks.
-    /// nullopt leaves the flow-control default.
+    /// Packets each peer may have in flight towards this rank, i.e. the credit window, in packets.
+    /// nullopt means "whatever this context defaults to": off for a flat queue, DEFAULT_CREDIT_WINDOW_PACKETS
+    /// under IndirectionAdapter, which is where relaying -- and so the blocking-inside-a-handler failure
+    /// credit exists to remove -- happens at all. An explicit 0 turns flow control off everywhere,
+    /// which is the A/B control.
     ///
-    /// PER PEER, not an absolute count, because that is the shape that keeps memory O(peers): an
-    /// absolute budget is too tight at large p and too loose at small p. 2 is the classic
-    /// double-buffering rule this library started with (one filling while one is in flight), and it is
-    /// the value worth aiming for -- with credits underneath, it is no longer load-bearing for
-    /// correctness the way the old send_backlog_capacity constant was.
+    /// PER PEER rather than a rationed total. A fixed budget divided by the peer count makes the window
+    /// shrink as p grows, and leaves every bound derived from it O(1) in p instead of O(peers) -- which
+    /// is what the memory argument needs.
+    std::optional<std::size_t> credit_window_packets = std::nullopt;
+    /// Packets the application may have outstanding to each peer -- filling, parked, or in the sender --
+    /// before it blocks for a buffer. nullopt leaves DEFAULT_OUTBOUND_BUFFERS_PER_PEER.
+    ///
+    /// 2 is the classic double-buffering rule this library started with: one filling while one is in
+    /// flight. With credits underneath it is no longer load-bearing for correctness the way the old
+    /// send_backlog_capacity constant was, so it can be set for memory rather than for safety.
     std::optional<std::size_t> outbound_buffers_per_peer = std::nullopt;
 };
 
@@ -151,81 +157,53 @@ public:
         }
         // Flat topology: every peer is a potential destination and nothing is ever relayed. Only fires if
         // the caller asked for flow control explicitly; IndirectionAdapter re-rations on top of this.
-        if (effective_config_.flow_control_budget_bytes.value_or(0) > 0) {
+        if (effective_config_.credit_window_packets.value_or(0) > 0) {
             int comm_size = 0;
             MPI_Comm_size(comm, &comm_size);
-            enable_flow_control(effective_config_.flow_control_budget_bytes.value(),
+            enable_flow_control(effective_config_.credit_window_packets.value(),
+                                effective_config_.outbound_buffers_per_peer.value_or(
+                                    DEFAULT_OUTBOUND_BUFFERS_PER_PEER),
                                 static_cast<std::size_t>(comm_size));
         }
     }
 
-    /// Ration \p budget_bytes of in-flight payload across \p num_peers peers.
+    /// Give each of \p num_peers peers a credit window of \p window_packets, and let the application
+    /// hold \p parking_packets per peer before it blocks.
     ///
-    /// The topology does not need to be declared here. Whether this queue relays is decided per post, by
-    /// relaying_depth_, and that is what lets the relay grow the buffer pool while the application is
-    /// held at the cap (see acquire_buffer). A flat queue simply never takes that path.
-    void enable_flow_control(std::size_t budget_bytes, std::size_t num_peers) {
-        if (budget_bytes == 0) {
+    /// EVERYTHING HERE IS O(#PEERS), which is the requirement this design has to meet:
+    ///
+    ///     credit in flight toward us   <= window_packets * peers          (grants)
+    ///     relayed payload we hold      <= window_packets * peers + window (we only admit what we granted)
+    ///     application parking          <= parking_packets * peers         (it blocks at the cap)
+    ///     -------------------------------------------------------------------------------
+    ///     buffers                      <= (window + parking + 2) * peers + request slots
+    ///
+    /// The pool cap below covers the application; the relay overdraws it (it must never be refused a
+    /// buffer) and \ref relay_pool_ceiling bounds that overdraft at window*peers + peers + 1. Both
+    /// terms are linear in the peer count, so the total is too.
+    void enable_flow_control(std::size_t window_packets, std::size_t parking_packets,
+                             std::size_t num_peers) {
+        if (window_packets == 0) {
             return;
         }
-        auto const packet_elements = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
-        auto const budget_elements = std::max<std::size_t>(budget_bytes / sizeof(BufferType), packet_elements);
         num_peers_ = num_peers;
-        flow_.configure(budget_elements, packet_elements, num_peers);
-        // THE SEND BACKLOG GOES BACK TO ZERO, which is what MessageQueue was built with before
-        // apply_fan_out_defaults raised it to fan_out. At zero, has_send_capacity() reduces to "is a
-        // request slot free", i.e. plain double buffering, and everything else waits in the
-        // per-destination deferred queues.
-        //
-        // That is the whole point of having those queues. The Sender's backlog is a SINGLE FIFO deque,
-        // so a packet for a slow destination head-of-line blocks every packet behind it regardless of
-        // where they are going -- the exact structure credits exist to replace. Parking is per
-        // destination and credit-aware, so it is the right waiting room.
-        //
-        // An earlier attempt set this to SIZE_MAX instead, because 96-99% of packets were deferring on
-        // !has_send_capacity and that looked like the fan_out cap being mis-sized. It was -- but
-        // uncapping fixed the symptom by moving every waiting packet into the shared FIFO. Deferring is
-        // not an exceptional path here; it is the designed one, and a high deferral rate is only a
-        // problem if parking is expensive, which the budget sweep showed it is not (removing deferral
-        // entirely bought ~5%).
-        //
-        // Total outbound memory is bounded by max_num_aggregation_buffers regardless of which queue the
-        // packets wait in, since Sender-held buffers come from the same pool.
+        auto const packet_elements = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
+        flow_.configure(window_packets * packet_elements, num_peers);
+        // THE SEND BACKLOG IS 0, where MessageQueue started before apply_fan_out_defaults raised it to
+        // fan_out during the bug hunt. At 0, has_send_capacity() is just "is a request slot free":
+        // plain double buffering, with everything else waiting in its destination's deferred queue.
+        // That is the right waiting room -- the Sender's backlog is a single FIFO, so a packet for a
+        // slow destination head-of-line blocks every packet behind it regardless of where they are
+        // going, which is the structure credits exist to replace.
         if (!user_config_.send_backlog_capacity) {
             queue_.set_send_backlog_capacity(0);
         }
-        // ONE CAP, and it throttles the APPLICATION only -- the relay grows the pool past it (see
-        // acquire_buffer), so there is nothing to fence off and nothing to size for the relay's worst
-        // case. That is what lets this be the configured budget rather than 4.3x it: the previous
-        // version reserved relay_high_water()/packet buffers for the relay and then gave the
-        // application the same again, so an 8 MiB budget capped the pool at ~34 MiB.
-        //
-        // What the application actually needs: enough to hold a packet in flight per destination, one
-        // filling buffer per destination, and the request slots. Parked packets come out of the same
-        // allowance and are what makes the application block when its peers stop granting -- which is
-        // the intended backpressure, and the one place blocking is still correct.
-        //
-        // An explicit Config::max_num_aggregation_buffers wins, so the cap can be swept. It is the one
-        // number here that is a POLICY rather than a derived bound: parked payload is not bounded by
-        // credits (a packet is parked precisely because it has no credit), so nothing derives it and
-        // only measurement can say what it should be.
-        if (user_config_.max_num_aggregation_buffers) {
-            // An explicit absolute cap wins over everything; used to sweep the pool directly.
-        } else if (user_config_.outbound_buffers_per_peer) {
-            max_num_aggregation_buffers((*user_config_.outbound_buffers_per_peer * num_peers) +
-                                        effective_config_.num_request_slots);
-        } else {
-            max_num_aggregation_buffers((budget_elements / packet_elements) + num_peers +
+        // One filling buffer per destination plus the application's parking, and the request slots for
+        // buffers the sender is holding. An explicit absolute cap still wins, for sweeping it directly.
+        if (!user_config_.max_num_aggregation_buffers) {
+            max_num_aggregation_buffers(((parking_packets + 1) * num_peers) +
                                         effective_config_.num_request_slots);
         }
-        if (stall_trace_interval_ > 0.0) {
-            std::fprintf(stderr,
-                         "[bk-config rank %d] budget_bytes=%zu budget_elems=%zu packet=%zu peers=%zu "
-                         "high_water=%zu pool_cap=%zu window=%zu\n",
-                         rank(), budget_bytes, budget_elements, packet_elements, num_peers,
-                         flow_.relay_high_water(), max_num_aggregation_buffers_, flow_.base_window());
-        }
-
     }
 
     ~BufferedMessageQueue() = default;
@@ -964,6 +942,11 @@ public:
         return (flow_.relay_high_water() / packet) + num_peers_ + 1;
     }
 
+    /// The credit window each peer holds, in elements.
+    [[nodiscard]] std::size_t flow_control_window_elements() const {
+        return flow_.base_window();
+    }
+
     /// Buffers the relay has drawn beyond the application's cap, because it must never be refused one.
     ///
     /// The cap does NOT bound the relay, and this is the number that says by how much. Non-zero is
@@ -992,10 +975,6 @@ public:
 
     /// Times a peer's window was grown out of the shared pool because it had consumed its whole outstanding
     /// grant before we could re-grant, i.e. how much skew the pool actually absorbed.
-    [[nodiscard]] std::size_t num_window_grows() const {
-        return flow_.num_window_grows();
-    }
-
     /// Packets larger than a whole window, let through on the escape hatch in FlowController::has_credit.
     /// Persistently non-zero means the aggregation threshold is mis-sized against the flow-control budget.
     [[nodiscard]] std::size_t num_oversize_passes() const {

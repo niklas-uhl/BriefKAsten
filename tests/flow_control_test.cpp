@@ -99,7 +99,7 @@ TEST(FlowControlTest, indirect_alltoall_delivers_everything) {
 TEST(FlowControlTest, indirect_alltoall_without_flow_control) {
     kamping::Communicator<> comm;
     briefkasten::Config conf;
-    conf.flow_control_budget_bytes = 0;
+    conf.credit_window_packets = 0;
     auto outcome = run_alltoall(comm, conf);
 
     EXPECT_FALSE(outcome.flow_control);
@@ -114,8 +114,8 @@ TEST(FlowControlTest, indirect_alltoall_without_flow_control) {
 TEST(FlowControlTest, deferral_under_a_tiny_budget_still_delivers_everything) {
     kamping::Communicator<> comm;
     briefkasten::Config conf;
-    conf.local_threshold_bytes = 1024;        // 256 elements per packet
-    conf.flow_control_budget_bytes = 8'192;  // 2048 elements in flight, a couple of packets per peer
+    conf.local_threshold_bytes = 1024;   // 256 elements per packet
+    conf.credit_window_packets = 2;      // two packets of credit per peer: as tight as the design allows
     // Deliberately no polling while posting. A sender that services its own inbox between posts keeps its
     // peers' windows fed and never starves -- which is what happened at 2 ranks, where the grid degenerates
     // to a single column and nothing is relayed. Withholding the poll is what forces packets to be parked,

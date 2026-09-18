@@ -90,8 +90,10 @@ public:
         // Flow control defaults ON here and only here. This is the class that relays, and relaying is what
         // makes a blocked send block a receive handler; a flat queue's handler is terminal and cannot
         // block. An explicit budget of 0 in the config turns it off, which is the A/B control.
-        auto const budget = queue_.config().flow_control_budget_bytes.value_or(DEFAULT_FLOW_CONTROL_BUDGET_BYTES);
-        queue_.enable_flow_control(budget, fan_out(indirection_));
+        auto const window = queue_.config().credit_window_packets.value_or(DEFAULT_CREDIT_WINDOW_PACKETS);
+        auto const parking =
+            queue_.config().outbound_buffers_per_peer.value_or(DEFAULT_OUTBOUND_BUFFERS_PER_PEER);
+        queue_.enable_flow_control(window, parking, fan_out(indirection_));
     }
 
     /// Enable the selective termination drain; see BufferedMessageQueue::flush_all_buffers_blocking.

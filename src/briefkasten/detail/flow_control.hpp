@@ -128,12 +128,11 @@ public:
           receive_requests_(std::move(other.receive_requests_)),
           receive_buffers_(std::move(other.receive_buffers_)), peers_(std::move(other.peers_)),
           resend_worklist_(std::move(other.resend_worklist_)), base_window_(other.base_window_),
-          max_window_(other.max_window_), pool_(other.pool_), budget_(other.budget_),
           relay_budget_(other.relay_budget_), proxy_allowance_(other.proxy_allowance_),
           relay_outstanding_(other.relay_outstanding_),
           grant_blocked_(std::move(other.grant_blocked_)), grants_sent_(other.grants_sent_),
           grants_received_(other.grants_received_), num_oversize_passes_(other.num_oversize_passes_),
-          num_window_grows_(other.num_window_grows_), num_grants_withheld_(other.num_grants_withheld_) {
+           num_grants_withheld_(other.num_grants_withheld_) {
         other.enabled_ = false;
         other.receive_requests_.clear();
         other.receive_buffers_.clear();
@@ -159,7 +158,6 @@ public:
         }
     }
 
-    /// Ration \p budget_elements across the peers of both classes and arm the grant receiver.
     ///
     /// \p packet_elements is the aggregation threshold in elements. The base window is floored at two
     /// packets so a peer is never reduced to one packet in flight (that is the serialising allocation this
@@ -169,35 +167,36 @@ public:
     /// built for a fan-out of p down to the grid's O(sqrt p) peers. Only legal before anything has been
     /// sent, because the initial windows are implicit and a re-ration would silently disagree with a peer
     /// that already holds the old one.
-    void configure(std::size_t budget_elements,
-                   std::size_t packet_elements,  // NOLINT(*-easily-swappable-parameters)
-                   std::size_t num_peers) {
-        if (budget_elements == 0) {
+    /// Give every peer a window of \p window_elements and arm the grant channel.
+    ///
+    /// PER PEER, NOT A RATIONED TOTAL, and that is the whole shape of the memory argument. An absolute
+    /// budget divided by the peer count -- which is what this was -- makes the window shrink as p grows
+    /// and leaves every derived bound O(1) in p rather than O(peers). Every loose term this class used
+    /// to carry came from that one decision:
+    ///
+    ///   * the per-peer floor fighting the ration, and the budget having to be raised to cover it;
+    ///   * a shared pool of unrationed slack, and windows growing into it;
+    ///   * relay_high_water needing 2x the budget, because the implicit initial windows summed to a
+    ///     budget's worth ON TOP of the gated allowance.
+    ///
+    /// With a per-peer window all three vanish. The initial windows ARE the allowance rather than an
+    /// extra term, so the high-water mark is one window above the gate rather than double the budget,
+    /// and everything the caller sizes from it is O(peers).
+    ///
+    /// Calling it again re-rations, which is how IndirectionAdapter narrows a queue built for a fan-out
+    /// of p down to the grid's O(sqrt p) peers. Only legal before anything has been sent, because the
+    /// initial windows are implicit and a re-ration would silently disagree with a peer holding the old
+    /// one.
+    void configure(std::size_t window_elements, std::size_t num_peers) {
+        if (window_elements == 0) {
             return;
         }
         KASSERT(peers_.empty(), "flow control must be rationed before the first message");
-        auto const peers = std::max<std::size_t>(1, num_peers);
-        auto const floor = std::max<std::size_t>(2 * std::max<std::size_t>(packet_elements, 1), 1);
-        base_window_ = std::max(floor, budget_elements / peers);
-        // THE FLOOR WINS, AND THE BUDGET FOLLOWS IT. A window below two packets serialises the peer,
-        // so the floor is not negotiable -- but when it beats budget/peers the base windows promise
-        // more than the configured budget, and the promise is what the buffer pool has to be able to
-        // hold. Raising the budget to match is the only consistent choice; the alternative, honouring a
-        // small budget by rationing below the floor, hands every peer less than one packet of credit.
-        //
-        // Found the hard way: an 8 KiB budget at p=9 (6 peers, 1024-element floor) promised 6144
-        // elements against a 1024-element budget, and the implicit initial windows are handed out at
-        // peer creation without passing the grant gate -- so the overshoot was structural, not a race.
-        // It only shows up with a small EXPLICIT budget on a grid with several peers; at the 8 MiB
-        // default the ration dominates the floor and this line changes nothing.
-        budget_elements = std::max(budget_elements, base_window_ * peers);
-        // Room to double a skewed peer, but never past a quarter of the whole budget: one destination
-        // monopolising the reserve is the failure this is meant to absorb, not cause.
-        max_window_ = std::max(base_window_, std::min(4 * base_window_, budget_elements / 4));
-        auto const committed = base_window_ * peers;
-        pool_ = budget_elements > committed ? budget_elements - committed : 0;
-        budget_ = budget_elements;
-        relay_budget_ = budget_elements;
+        base_window_ = window_elements;
+        // What every relay peer together may have outstanding toward us. The gate holds
+        // relay_outstanding_ + proxy_allowance_ below this, and proxy_allowance_ alone can never exceed
+        // it, so the initial windows need no separate term.
+        relay_budget_ = window_elements * std::max<std::size_t>(1, num_peers);
         if (!enabled_) {
             enabled_ = true;
             arm_receives();
@@ -212,31 +211,22 @@ public:
         return base_window_;
     }
 
-    /// Total elements this rank has rationed out, i.e. the most that can be in flight towards it.
+    /// The most that may be in flight towards this rank: one window per peer.
     [[nodiscard]] std::size_t budget() const {
-        return budget_;
+        return relay_budget_;
     }
 
-    /// The hard bound on relayed payload a caller must size its buffer pool for.
+    /// The hard bound on relayed payload, and so on the buffers a caller must be able to find for it.
     ///
-    /// Three terms, and each one is a thing that actually happened during implementation:
+    /// Two terms only: the gate (\ref maybe_grant stops raising a relay peer's grant once
+    /// relay_outstanding_ + proxy_allowance_ reaches relay_budget_), plus the one grant that trips it,
+    /// which has already raised a peer's allowance by a window before the check runs.
     ///
-    ///  * `relay_budget_` -- payload we are already holding plus grants we have issued. \ref maybe_grant
-    ///    stops raising a relay peer's grant once relay_outstanding_ + proxy_allowance_ reaches it.
-    ///    Counting the unused allowance is the point: gating on relay_outstanding_ alone leaves the
-    ///    grants already in flight unbounded.
-    ///  * `+ relay_budget_` again -- the implicit initial windows. Both ends derive them without
-    ///    exchanging a message, so they cannot be gated: the sender has already assumed its credit by
-    ///    the time we learn the link is a relay one. Their sum is bounded by the budget, because the
-    ///    budget is raised to cover the base windows (see configure), but they arrive outside the gate.
-    ///  * `+ max_window_` -- the single grant that trips the gate has already raised one peer's
-    ///    allowance by the time the check runs.
-    ///
-    /// Generous rather than tight, deliberately. Getting it wrong does not deadlock, it silently
-    /// degrades: the relay fails to acquire a buffer, spins in get_new_buffer, and is blocking inside a
-    /// handler again -- the defect this whole design exists to remove, with only a counter to say so.
+    /// relay_budget_ is windows-times-peers, so this is O(peers) -- which is the point. It used to be
+    /// 2*budget + max_window because an absolute budget made the implicit initial windows a separate,
+    /// uncounted term; with a per-peer window they are the allowance itself.
     [[nodiscard]] std::size_t relay_high_water() const {
-        return (2 * relay_budget_) + max_window_;
+        return relay_budget_ + base_window_;
     }
 
     /// May a packet of \p elements elements go out to \p peer right now?
@@ -284,17 +274,11 @@ public:
             return;
         }
         Peer& state = peer_state(peer);
-        // A peer that consumed its entire outstanding grant before we could re-grant was starved by its
-        // window, not by the network. That is the skew signal the shared pool exists for.
-        bool starved = state.granted <= state.consumed + elements;
         state.consumed += elements;
         if (state.link_class == LinkClass::to_proxy) {
             // This much of the relay allowance has now been spent; it is relay_outstanding_'s problem
             // from here, and stays so until the forwarding send completes.
             proxy_allowance_ -= std::min(proxy_allowance_, elements);
-        }
-        if (starved) {
-            grow_window(state);
         }
         maybe_grant(peer, state);
     }
@@ -367,10 +351,6 @@ public:
         return num_oversize_passes_;
     }
 
-    [[nodiscard]] std::size_t num_window_grows() const {
-        return num_window_grows_;
-    }
-
     [[nodiscard]] std::size_t num_grants_sent() const {
         return grants_sent_;
     }
@@ -388,13 +368,13 @@ public:
     /// free.
     [[nodiscard]] std::string describe() const {
         std::ostringstream out;
-        out << "fc{enabled=" << enabled_ << " budget=" << budget_ << " relay_budget=" << relay_budget_
+        out << "fc{enabled=" << enabled_ << " budget=" << relay_budget_
             << " relay_outstanding=" << relay_outstanding_ << " proxy_allowance=" << proxy_allowance_
             << " high_water=" << relay_high_water() << " base_window=" << base_window_
-            << " max_window=" << max_window_ << " pool=" << pool_ << " grants_sent=" << grants_sent_
+            << " grants_sent=" << grants_sent_
             << " grants_received=" << grants_received_ << " withheld=" << num_grants_withheld_
             << " blocked_list=" << grant_blocked_.size() << " resend_list=" << resend_worklist_.size()
-            << " oversize=" << num_oversize_passes_ << " grows=" << num_window_grows_ << "}";
+            << " oversize=" << num_oversize_passes_ <<  "}";
         for (auto const& entry : peers_) {
             Peer const& st = entry.second;
             out << "\n    peer " << entry.first
@@ -411,7 +391,6 @@ public:
 
     void reset_counters() {
         num_oversize_passes_ = 0;
-        num_window_grows_ = 0;
         num_grants_withheld_ = 0;
     }
 
@@ -433,18 +412,6 @@ private:
         return peers_.emplace(peer, fresh).first->second;
     }
 
-    void grow_window(Peer& state) {
-        if (state.window >= max_window_ || pool_ == 0) {
-            return;
-        }
-        auto const grow = std::min({state.window, max_window_ - state.window, pool_});
-        if (grow == 0) {
-            return;
-        }
-        pool_ -= grow;
-        state.window += grow;
-        num_window_grows_++;
-    }
 
     /// Grant when at least half the window has come free, or immediately when the peer is fully blocked.
     /// The hysteresis is what keeps grant traffic O(peers) per window of payload rather than O(messages):
@@ -612,9 +579,6 @@ private:
     std::unordered_map<PEID, Peer> peers_;
     std::vector<PEID> resend_worklist_;
     std::size_t base_window_ = 0;
-    std::size_t max_window_ = 0;
-    std::size_t pool_ = 0;
-    std::size_t budget_ = 0;
     std::size_t relay_budget_ = 0;
     /// Payload relay peers are entitled to send us but have not yet sent: sum over to_proxy peers of
     /// (granted - consumed). Held against the same budget as payload we are already carrying.
@@ -625,7 +589,6 @@ private:
     std::size_t grants_sent_ = 0;
     std::size_t grants_received_ = 0;
     std::size_t num_oversize_passes_ = 0;
-    std::size_t num_window_grows_ = 0;
     std::size_t num_grants_withheld_ = 0;
 };
 
