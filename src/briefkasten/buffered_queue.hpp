@@ -160,7 +160,13 @@ public:
         auto const packet_elements = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
         auto const budget_elements = std::max<std::size_t>(budget_bytes / sizeof(BufferType), packet_elements);
         flow_.configure(budget_elements, packet_elements, num_peers);
-        relay_buffer_reserve_ = has_relay_peers ? (budget_elements / packet_elements) + num_peers : 0;
+        // Sized from the controller's own high-water mark, not from the nominal budget. The two differ
+        // by one window, because the grant that trips the gate has already raised a peer's allowance by
+        // then -- and getting this wrong does not deadlock, it silently degrades: the relay fails to
+        // acquire a buffer, spins in get_new_buffer, and is blocking inside a handler again. The
+        // `+ num_peers` covers one partially filled buffer per destination on top of the whole packets.
+        relay_buffer_reserve_ =
+            has_relay_peers ? (flow_.relay_high_water() / packet_elements) + num_peers + 1 : 0;
         max_num_aggregation_buffers(relay_buffer_reserve_ + num_peers + effective_config_.num_request_slots +
                                     effective_config_.send_backlog_capacity.value());
     }

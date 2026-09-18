@@ -105,6 +105,7 @@ public:
         std::uint64_t outgoing = 0;  ///< the value being sent; must outlive the Isend, hence a member
         bool resend_due = false;     ///< a grant fell due while one was in flight; coalesced into the next
         bool grant_blocked = false;  ///< a grant is due but the relay reserve is full; see maybe_grant
+        bool class_known = false;    ///< set once the first packet from this peer fixes its link class
     };
 
     // NOLINTBEGIN(*-easily-swappable-parameters)
@@ -125,7 +126,8 @@ public:
           receive_buffers_(std::move(other.receive_buffers_)), peers_(std::move(other.peers_)),
           resend_worklist_(std::move(other.resend_worklist_)), base_window_(other.base_window_),
           max_window_(other.max_window_), pool_(other.pool_), budget_(other.budget_),
-          relay_budget_(other.relay_budget_), relay_outstanding_(other.relay_outstanding_),
+          relay_budget_(other.relay_budget_), proxy_allowance_(other.proxy_allowance_),
+          relay_outstanding_(other.relay_outstanding_),
           grant_blocked_(std::move(other.grant_blocked_)), grants_sent_(other.grants_sent_),
           grants_received_(other.grants_received_), num_oversize_passes_(other.num_oversize_passes_),
           num_window_grows_(other.num_window_grows_), num_grants_withheld_(other.num_grants_withheld_) {
@@ -180,12 +182,7 @@ public:
         auto const committed = base_window_ * peers;
         pool_ = budget_elements > committed ? budget_elements - committed : 0;
         budget_ = budget_elements;
-        // Half the budget, because the gate is checked at grant time and a grant already outstanding when
-        // it closes still has to be honoured. That overshoot is bounded by the sum of the to_proxy
-        // windows, which is at most the whole budget, so gating at half keeps relayed payload inside the
-        // budget the buffer pool was sized for. Sizing the gate at the full budget instead would need
-        // twice the pool for the same configured number.
-        relay_budget_ = std::max<std::size_t>(budget_elements / 2, packet_elements);
+        relay_budget_ = budget_elements;
         if (!enabled_) {
             enabled_ = true;
             arm_receives();
@@ -203,6 +200,19 @@ public:
     /// Total elements this rank has rationed out, i.e. the most that can be in flight towards it.
     [[nodiscard]] std::size_t budget() const {
         return budget_;
+    }
+
+    /// The hard bound on relayed payload a caller must size its buffer pool for.
+    ///
+    /// \ref maybe_grant refuses to raise a relay peer's grant once relay_outstanding_ +
+    /// proxy_allowance_ has reached relay_budget_, where proxy_allowance_ is the grant already handed to
+    /// relay peers and not yet used. Since a single grant raises one peer's allowance by at most its
+    /// window, the pair can exceed relay_budget_ by at most one window and no more -- which is this
+    /// number. Counting the unused allowance is the whole point: gating on relay_outstanding_ alone
+    /// leaves the grants already in flight unbounded, so the true worst case would be a second whole
+    /// budget on top and a pool sized for one budget could be exhausted.
+    [[nodiscard]] std::size_t relay_high_water() const {
+        return relay_budget_ + max_window_;
     }
 
     /// May a packet of \p elements elements go out to \p peer right now?
@@ -254,6 +264,11 @@ public:
         // window, not by the network. That is the skew signal the shared pool exists for.
         bool starved = state.granted <= state.consumed + elements;
         state.consumed += elements;
+        if (state.link_class == LinkClass::to_proxy) {
+            // This much of the relay allowance has now been spent; it is relay_outstanding_'s problem
+            // from here, and stays so until the forwarding send completes.
+            proxy_allowance_ -= std::min(proxy_allowance_, elements);
+        }
         if (starved) {
             grow_window(state);
         }
@@ -272,7 +287,7 @@ public:
     void note_relay_released(std::size_t elements) {
         KASSERT(relay_outstanding_ >= elements, "relay reserve accounting underflowed");
         relay_outstanding_ -= std::min(relay_outstanding_, elements);
-        if (!grant_blocked_.empty() && relay_outstanding_ < relay_budget_) {
+        if (!grant_blocked_.empty() && relay_outstanding_ + proxy_allowance_ < relay_budget_) {
             auto blocked = std::move(grant_blocked_);
             grant_blocked_.clear();
             for (PEID peer : blocked) {
@@ -303,7 +318,18 @@ public:
         if (!enabled_) {
             return;
         }
-        peer_state(peer).link_class = cls;
+        Peer& state = peer_state(peer);
+        if (state.class_known) {
+            KASSERT(state.link_class == cls, "a link's class must not change under us");
+            return;
+        }
+        state.class_known = true;
+        state.link_class = cls;
+        if (cls == LinkClass::to_proxy) {
+            // The implicit initial window was handed out before we knew this was a relay link, so it
+            // has to join the allowance now or the first window's worth escapes the bound.
+            proxy_allowance_ += state.granted - std::min(state.granted, state.consumed);
+        }
     }
 
     /// Grant decisions deferred because the relay reserve was full, i.e. how often backpressure actually
@@ -382,7 +408,11 @@ private:
         if (desired <= state.granted) {
             return;
         }
-        if (state.link_class == LinkClass::to_proxy && relay_outstanding_ >= relay_budget_) {
+        // Both terms, not just the first. relay_outstanding_ is payload we are already holding;
+        // proxy_allowance_ is payload our peers are already entitled to send us and which we will have
+        // to hold when it arrives. Gating on the sum is what makes relay_high_water() a real bound.
+        if (state.link_class == LinkClass::to_proxy &&
+            relay_outstanding_ + proxy_allowance_ >= relay_budget_) {
             if (!state.grant_blocked) {
                 state.grant_blocked = true;
                 grant_blocked_.push_back(peer);
@@ -395,8 +425,14 @@ private:
         if (!blocked && freed * 2 < state.window) {
             return;
         }
+        if (state.link_class == LinkClass::to_proxy) {
+            proxy_allowance_ += desired - state.granted;
+        }
         state.granted = desired;
         send_grant(peer, state);
+        KASSERT(relay_outstanding_ + proxy_allowance_ <= relay_high_water(),
+                "relay reserve overshot its high-water mark: outstanding=" << relay_outstanding_
+                    << " allowance=" << proxy_allowance_ << " bound=" << relay_high_water());
     }
 
     void send_grant(PEID peer, Peer& state) {
@@ -519,6 +555,9 @@ private:
     std::size_t pool_ = 0;
     std::size_t budget_ = 0;
     std::size_t relay_budget_ = 0;
+    /// Payload relay peers are entitled to send us but have not yet sent: sum over to_proxy peers of
+    /// (granted - consumed). Held against the same budget as payload we are already carrying.
+    std::size_t proxy_allowance_ = 0;
     std::size_t relay_outstanding_ = 0;
     /// Peers whose grant is waiting on the relay reserve; drained by note_relay_released.
     std::vector<PEID> grant_blocked_;
