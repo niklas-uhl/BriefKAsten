@@ -89,10 +89,8 @@ struct Config {
     std::size_t local_threshold_bytes = DEFAULT_BUFFER_THRESHOLD;
     std::optional<std::size_t> send_backlog_capacity = std::nullopt;
     /// Packets each peer may have in flight towards this rank, i.e. the credit window, in packets.
-    /// nullopt means "whatever this context defaults to": off for a flat queue, DEFAULT_CREDIT_WINDOW_PACKETS
-    /// under IndirectionAdapter, which is where relaying -- and so the blocking-inside-a-handler failure
-    /// credit exists to remove -- happens at all. An explicit 0 turns flow control off everywhere,
-    /// which is the A/B control.
+    /// nullopt leaves DEFAULT_CREDIT_WINDOW_PACKETS; an explicit 0 turns flow control off, which is the
+    /// A/B control. On by default whether or not this queue relays -- see the constructor.
     ///
     /// PER PEER rather than a rationed total. A fixed budget divided by the peer count makes the window
     /// shrink as p grows, and leaves every bound derived from it O(1) in p instead of O(peers) -- which
@@ -180,14 +178,24 @@ public:
             stall_trace_interval_ = std::strtod(trace, nullptr);
             stall_trace_last_ = std::chrono::steady_clock::now();
         }
-        // Flat topology: every peer is a potential destination and nothing is ever relayed. Only fires if
-        // the caller asked for flow control explicitly; IndirectionAdapter re-rations on top of this.
-        if (effective_config_.credit_window_packets.value_or(0) > 0) {
+        // ON BY DEFAULT, flat or not. A flat queue never relays, so it cannot suffer the defect credits
+        // were built for -- a handler blocking and going deaf -- but it spins in the application's own
+        // post path instead, and credits replace that too: measured 3.3-5.4M overflow_capacity_waits
+        // per phase at p=768..3072 on a flat queue, against EXACTLY ZERO with credits, and worth
+        // 2.11x -> 1.31x on gnm and 1.45x -> 0.91x on rmat at p=3072 (flow-control-uniform_26_09_18).
+        //
+        // The peer count is the only thing that differs: p here, O(sqrt p) under IndirectionAdapter,
+        // which re-rations on top of this. That is the point -- one mechanism, one buffer rule, and
+        // indirection as a parameter rather than a special case.
+        //
+        // An explicit 0 still turns it off everywhere, which is the A/B control.
+        if (effective_config_.credit_window_packets.value_or(DEFAULT_CREDIT_WINDOW_PACKETS) > 0) {
             int comm_size = 0;
             MPI_Comm_size(comm, &comm_size);
-            enable_flow_control(effective_config_.credit_window_packets.value(),
-                                effective_config_.buffers_per_peer.value_or(DEFAULT_BUFFERS_PER_PEER),
-                                static_cast<std::size_t>(comm_size));
+            enable_flow_control(
+                effective_config_.credit_window_packets.value_or(DEFAULT_CREDIT_WINDOW_PACKETS),
+                effective_config_.buffers_per_peer.value_or(DEFAULT_BUFFERS_PER_PEER),
+                static_cast<std::size_t>(comm_size));
         }
     }
 

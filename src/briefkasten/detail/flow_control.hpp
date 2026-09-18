@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -540,7 +541,7 @@ private:
         while (true) {
             // A stall here looks like a hang at the END of a phase, with no other symptom. Cheap to
             // trace and impossible to diagnose otherwise.
-            if (++rounds % 1000 == 0) {
+            if (++rounds % 1000 == 0 && std::getenv("BRIEFKASTEN_STALL_TRACE_SECONDS") != nullptr) {
                 std::fprintf(stderr, "[bk-quiesce] round %zu sent=%zu received=%zu\n", rounds,
                              grants_sent_, grants_received_);
             }
