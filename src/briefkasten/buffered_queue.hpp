@@ -57,13 +57,27 @@ static constexpr std::size_t DEFAULT_BUFFER_THRESHOLD = 32ULL * 1024;
 static constexpr std::size_t DEFAULT_CREDIT_WINDOW_PACKETS = 8;
 /// Aggregation buffers per peer: the pool cap is this times the peer count, plus the request slots.
 ///
-/// 3 = one filling buffer per destination plus two parked. NOT a per-peer reservation -- the pool is
-/// shared and nothing tracks per-peer usage, so a hot destination takes many and a quiet one none. It
-/// is an aggregate cap with a per-peer scaling coefficient, and the scaling is justified by UNIFORM
-/// traffic, where every peer is active at once and the working set really is proportional to the peer
-/// count. Skewed traffic (rmat) concentrates on a few destinations and the shared pool absorbs it,
-/// which is why rmat was insensitive to all of this and gnm was not.
-static constexpr std::size_t DEFAULT_BUFFERS_PER_PEER = 3;
+/// 2 = one filling buffer per destination plus one parked, i.e. twice the measured working set.
+///
+/// MEASURED. Peak allocation is almost exactly ONE buffer per peer, everywhere: 55 of 56 peers at
+/// p=768, 110 of 111 at p=3072, and -- the same law with a different peer count -- 12,286 of 12,288 on
+/// a FLAT queue at p=12288. The application never once hit the cap (buffer_stalls = 0 on every arm of
+/// every sweep), and raising the coefficient to 9 left the working set unchanged at 10% utilisation.
+/// So the pool was 3x oversized and 2x is still double the headroom anything has ever used. 1 is the
+/// true floor -- the filling set itself -- and is not shipped, because the first parked packet would
+/// then block the application.
+///
+/// It also makes the rule UNIFORM. A flat queue's existing default was 2*p + slots, so a flat and an
+/// indirected queue now size their pools by the same expression; only the peer count differs, p against
+/// O(sqrt p). That is the whole of what indirection changes here, and it is worth a number: at
+/// p=12288 a flat queue allocates 12,286 buffers against an indirected one's 221.
+///
+/// NOT a per-peer reservation. The pool is shared and nothing tracks per-peer usage, so a hot
+/// destination takes many buffers and a quiet one none. It is an aggregate cap with a per-peer scaling
+/// coefficient, and the scaling is justified by UNIFORM traffic, where every peer is active at once.
+/// Skew (rmat) concentrates on a few destinations and the shared pool absorbs it -- measured as 0.9
+/// buffers per peer on rmat against 1.0 on gnm.
+static constexpr std::size_t DEFAULT_BUFFERS_PER_PEER = 2;
 
 enum class FlushStrategy : std::uint8_t { local, global, random, largest };
 
