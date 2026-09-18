@@ -168,6 +168,21 @@ public:
         auto const packet_elements = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
         auto const budget_elements = std::max<std::size_t>(budget_bytes / sizeof(BufferType), packet_elements);
         flow_.configure(budget_elements, packet_elements, num_peers);
+        // UNCAP THE SEND BACKLOG. This is the sizing error section 1 of the takeover note names as the
+        // root of the whole investigation: apply_fan_out_defaults sets backlog = fan_out, sizing the
+        // queue by the NUMBER OF PEERS when what matters is the burst a relay has to absorb. Those are
+        // unrelated quantities, which is why no constant ever worked.
+        //
+        // With credits the cap is not merely mis-sized, it is redundant: what may be in flight is
+        // already bounded, per peer, by grants. Leaving it at fan_out (28 at p=192, 56 at p=768) meant
+        // peak_send_backlog sat pinned at the cap on every rank and 96-99% of ALL packets took the
+        // deferral path -- a path built for the exceptional case of a peer that has granted no room.
+        // Measured insensitive to a 32x larger credit window, which is what proved those deferrals were
+        // never about credit.
+        //
+        // SIZE_MAX is special-cased in Sender::has_capacity, which then reports capacity
+        // unconditionally, so flush_buffer_impl defers only on genuine credit exhaustion.
+        queue_.set_send_backlog_capacity(std::numeric_limits<std::size_t>::max());
         // Sized from the controller's own high-water mark, not from the nominal budget. The two differ
         // by one window, because the grant that trips the gate has already raised a peer's allowance by
         // then -- and getting this wrong does not deadlock, it silently degrades: the relay fails to
@@ -415,6 +430,7 @@ public:
             << " deferred_peers=" << deferred_peers_.size() << " buffers=" << num_aggregation_buffers_
             << "/" << max_num_aggregation_buffers_ << " free=" << free_aggregation_buffers_.size()
             << " relay_reserve=" << relay_buffer_reserve_ << " credit_deferrals=" << num_credit_deferrals_
+            << " capacity_deferrals=" << num_capacity_deferrals_
             << " relay_buffer_stalls=" << num_relay_buffer_stalls_
             << " relay_pool_growths=" << num_relay_pool_growths_
             << " buffer_stalls=" << num_buffer_stalls_ << " sends=" << counts.send
@@ -889,7 +905,15 @@ public:
         return num_overflow_capacity_waits_;
     }
 
-    /// Payload parked because its destination had granted no room (or our request pool was busy). The
+    /// Packets parked because our own send path was full rather than because the peer had granted no
+    /// room. Under flow control this should be near zero: credits already bound what can be in flight,
+    /// so the send backlog does not need a cap of its own, and one would only push traffic through the
+    /// deferral path for no reason. See enable_flow_control.
+    [[nodiscard]] std::size_t num_capacity_deferrals() const {
+        return num_capacity_deferrals_;
+    }
+
+    /// Payload parked because its destination had granted no room. The
     /// number to read against runtime: it is what the protocol costs, where \ref num_send_capacity_waits
     /// was what having no protocol cost. A deferral is cheap -- it is a move and a poll away from being
     /// sent -- whereas a capacity wait was a spin inside a receive handler.
@@ -1017,6 +1041,7 @@ public:
         num_forced_flush_elements_ = 0;
         num_drain_skips_ = 0;
         num_credit_deferrals_ = 0;
+        num_capacity_deferrals_ = 0;
         num_relay_buffer_stalls_ = 0;
         flow_.reset_counters();
         queue_.reset_counters();
@@ -1310,8 +1335,17 @@ private:
         // other half -- the old single FIFO backlog let a packet for a slow destination head-of-line
         // block every packet behind it regardless of where they were going.
         if (flow_.enabled()) {
-            if (!flow_.has_credit(receiver, elements) || !queue_.has_send_capacity()) {
-                num_credit_deferrals_++;
+            bool const no_credit = !flow_.has_credit(receiver, elements);
+            if (no_credit || !queue_.has_send_capacity()) {
+                // Counted apart, because conflating them hid the answer. The first cluster sweep showed
+                // 96-99% of all packets deferred and completely insensitive to a 32x larger credit
+                // window -- which only makes sense once you can see that almost none of those deferrals
+                // were about credit at all.
+                if (no_credit) {
+                    num_credit_deferrals_++;
+                } else {
+                    num_capacity_deferrals_++;
+                }
                 defer_packet(receiver, std::move(buffer_it->second));
                 global_buffer_size_ -= pre_cleanup_buffer_size;
                 if (erase) {
@@ -1667,6 +1701,7 @@ private:
     std::size_t relaying_depth_ = 0;
     std::size_t relay_buffer_reserve_ = 0;
     std::size_t num_credit_deferrals_ = 0;
+    std::size_t num_capacity_deferrals_ = 0;
     std::size_t num_relay_buffer_stalls_ = 0;
     std::size_t num_relay_pool_growths_ = 0;
     /// Counts calls to poll_throttled. Held here rather than in the underlying queue so that the
