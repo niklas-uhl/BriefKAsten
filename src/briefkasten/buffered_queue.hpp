@@ -21,6 +21,10 @@
 
 #include <mpi.h>
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <sstream>
 #include <kamping/environment.hpp>
 #include <concepts>
 #include <cstddef>
@@ -131,6 +135,10 @@ public:
           pre_send_cleanup(std::move(cleaner)),
           flush_strategy_(effective_config_.flush_strategy) {
         reserve_aggregation_buffers(effective_config_.num_request_slots);
+        if (char const* trace = std::getenv("BRIEFKASTEN_STALL_TRACE_SECONDS")) {
+            stall_trace_interval_ = std::strtod(trace, nullptr);
+            stall_trace_last_ = std::chrono::steady_clock::now();
+        }
         // Flat topology: every peer is a potential destination and nothing is ever relayed. Only fires if
         // the caller asked for flow control explicitly; IndirectionAdapter re-rations on top of this.
         if (effective_config_.flow_control_budget_bytes.value_or(0) > 0) {
@@ -167,8 +175,31 @@ public:
         // `+ num_peers` covers one partially filled buffer per destination on top of the whole packets.
         relay_buffer_reserve_ =
             has_relay_peers ? (flow_.relay_high_water() / packet_elements) + num_peers + 1 : 0;
-        max_num_aggregation_buffers(relay_buffer_reserve_ + num_peers + effective_config_.num_request_slots +
-                                    effective_config_.send_backlog_capacity.value());
+        // The APPLICATION needs a deferral allowance of its own, and this is where the first version got
+        // it badly wrong: it gave the relay the whole worst-case reserve and left the application the
+        // allowance it had before flow control existed (fan_out + slots + backlog = 18 buffers at p=5).
+        // But parking is a NEW consumer of application buffers -- before credits, a full buffer was
+        // handed to MPI immediately and came straight back. Three parked packets plus the open buffers
+        // and the in-flight sends exhaust 18, after which post_message_blocking spins in get_new_buffer
+        // forever: measured as a hard stall on every rank count from 5 to 16, with credit sitting
+        // unused on every peer.
+        //
+        // So the application gets the same allowance as the relay. Buffers are allocated lazily, so a
+        // cap only costs what is actually used -- and what is actually used is bounded by credit on the
+        // relay side and by the application blocking on this pool on its own side.
+        auto const application_allowance =
+            relay_buffer_reserve_ + num_peers + effective_config_.num_request_slots +
+            effective_config_.send_backlog_capacity.value();
+        max_num_aggregation_buffers(relay_buffer_reserve_ + application_allowance);
+        if (stall_trace_interval_ > 0.0) {
+            std::fprintf(stderr,
+                         "[bk-config rank %d] budget_bytes=%zu budget_elems=%zu packet=%zu peers=%zu "
+                         "relay=%d high_water=%zu reserve=%zu window=%zu\n",
+                         rank(), budget_bytes, budget_elements, packet_elements, num_peers,
+                         static_cast<int>(has_relay_peers), flow_.relay_high_water(),
+                         relay_buffer_reserve_, flow_.base_window());
+        }
+
     }
 
     ~BufferedMessageQueue() = default;
@@ -253,8 +284,8 @@ public:
                       int tag) {
         return post_message_impl(
             std::forward<decltype(message)>(message), receiver, envelope_sender, envelope_receiver, tag,
-            [&](auto it) {
-                bool success = resolve_overflow(it);
+            [&](auto /*it*/) {
+                bool success = resolve_overflow(receiver);
                 if (!success) {
                     throw std::runtime_error(
                         "Failed to resolve overflow, because sending to the underlying queue failed.");
@@ -310,6 +341,7 @@ public:
     /// Envelope (not necessarily the underlying data) is moved to the handler
     /// when called.
     auto poll(MessageHandler<MessageType> auto&& on_message) -> std::optional<std::pair<bool, bool>> {
+        stall_trace_tick();  // every spin loop in this class polls, so this is where a stall is visible
         // Grants first: a credit that arrived this poll may release a deferred packet in the same poll.
         flow_.poll();
         auto result = queue_.poll(split_handler(on_message), [&](std::size_t receipt, BufferContainer buffer) {
@@ -360,7 +392,58 @@ public:
     /// its peers are still in the first. The two-hop collapse (see indirection.hpp) removed the sibling
     /// queue, and with it the fold and the whole class of bug where a message merged into the sibling's
     /// buffer counted as received but not as sent.
+    /// Periodic dump of everything that could be holding termination up. Off unless
+    /// BRIEFKASTEN_STALL_TRACE_SECONDS is set, in which case it prints at most that often per queue.
+    ///
+    /// Exists because briefkasten stalls are hard to catch any other way: they are rare, they are
+    /// timing-dependent, and by the time a run has hung there is nothing to look at -- the counters are
+    /// only reported when a phase ENDS, which is exactly what is not happening. Print two dumps a few
+    /// seconds apart and read what has not moved between them.
+    void stall_trace_tick() {
+        if (stall_trace_interval_ <= 0.0) {
+            return;
+        }
+        auto const now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - stall_trace_last_).count() < stall_trace_interval_) {
+            return;
+        }
+        stall_trace_last_ = now;
+        auto const counts = message_counts();
+        std::ostringstream out;
+        out << "[bk-stall rank " << rank() << "] pending=" << pending_elements()
+            << " buffered=" << global_buffer_size_ << " deferred=" << deferred_elements_
+            << " deferred_peers=" << deferred_peers_.size() << " buffers=" << num_aggregation_buffers_
+            << "/" << max_num_aggregation_buffers_ << " free=" << free_aggregation_buffers_.size()
+            << " relay_reserve=" << relay_buffer_reserve_ << " credit_deferrals=" << num_credit_deferrals_
+            << " relay_buffer_stalls=" << num_relay_buffer_stalls_
+            << " buffer_stalls=" << num_buffer_stalls_ << " sends=" << counts.send
+            << " recvs=" << counts.receive << " term_calls=" << queue_.num_terminate_calls()
+            << " term_drains=" << queue_.num_termination_drains()
+            << " term_rounds=" << num_termination_rounds() << " polls=" << num_polls()
+            << " unproductive=" << num_unproductive_polls() << " deaf=" << num_deaf_probes()
+            << " overflow_waits=" << num_overflow_capacity_waits()
+            << " drain_waits=" << num_drain_capacity_waits()
+            << " | acquires=" << num_buffer_acquires_ << " recycles=" << num_buffer_recycles_
+            << " reclaims=" << num_buffer_reclaims_ << "\n    " << flow_.describe();
+        for (auto const& entry : deferred_) {
+            std::size_t elements = 0;
+            for (auto const& packet : entry.second) {
+                elements += packet.buffer.size();
+            }
+            out << "\n    DEFERRED to " << entry.first << ": " << entry.second.size() << " packets, "
+                << elements << " elements";
+        }
+        for (auto const& entry : aggregation_buffers_) {
+            if (!entry.second.empty()) {
+                out << "\n    buffering for " << entry.first << ": " << entry.second.size() << " elements";
+            }
+        }
+        out << "\n";
+        std::fputs(out.str().c_str(), stderr);
+    }
+
     [[nodiscard]] bool terminate(MessageHandler<MessageType> auto&& on_message, std::invocable<> auto&& progress_hook) {
+        stall_trace_tick();
         // MessageQueue::terminate's counting loop polls the RAW queue, not this one, so on its own it
         // drives neither the grant channel nor the deferred queues -- and a parked packet keeps
         // pending_elements() non-zero, so termination would never fire. Nothing would ever unpark it
@@ -978,13 +1061,34 @@ private:
     auto acquire_buffer() -> std::optional<BufferContainer> {
         bool const for_relay = relaying_depth_ > 0;
         if (!for_relay && relay_buffer_reserve_ > 0) {
-            auto const application_cap =
-                max_num_aggregation_buffers_ - std::min(max_num_aggregation_buffers_, relay_buffer_reserve_);
-            auto const in_use = num_aggregation_buffers_ - free_aggregation_buffers_.size();
-            if (in_use >= application_cap) {
-                if (aggregation_buffers_.size() >= application_cap) {
-                    flush_largest_buffer();
+            // What the relay could still obtain: buffers sitting free, plus buffers we have not created
+            // yet. Both terms are exact and non-negative.
+            //
+            // NOT `num_aggregation_buffers_ - free_aggregation_buffers_.size()`, which is what this was
+            // and which deadlocked: those two counters are NOT conserved against each other. A flush
+            // with erase=false moves the buffer out and leaves a moved-from husk in the map; the next
+            // post merges straight into the husk, growing a buffer that was never acquired, and when
+            // that is eventually flushed and reclaimed it enters the free list as a phantom. Measured on
+            // a 5-rank gnm run: 24 buffers ever created against 97 in the free list, so the subtraction
+            // underflowed to ~1.8e19 and the application was refused a buffer forever -- 10M failed
+            // acquisitions per second, with nothing else moving.
+            //
+            // The husk pattern predates this code and was harmless until something compared the two
+            // counters. It is fixed at the source below (resolve_overflow erases rather than leaving a
+            // husk), but this check no longer depends on that holding.
+            auto const creatable = max_num_aggregation_buffers_ -
+                                   std::min(max_num_aggregation_buffers_, num_aggregation_buffers_);
+            auto const available = free_aggregation_buffers_.size() + creatable;
+            if (available <= relay_buffer_reserve_) {
+                if (stall_trace_interval_ > 0.0 && (num_buffer_stalls_ % 2000000) == 0) {
+                    std::fprintf(stderr,
+                                 "[bk-quota rank %d] REFUSE app buffer: available=%zu reserve=%zu free=%zu "
+                                 "created=%zu max=%zu map=%zu deferred_elems=%zu stalls=%zu\n",
+                                 rank(), available, relay_buffer_reserve_, free_aggregation_buffers_.size(),
+                                 num_aggregation_buffers_, max_num_aggregation_buffers_,
+                                 aggregation_buffers_.size(), deferred_elements_, num_buffer_stalls_);
                 }
+                flush_largest_buffer();
                 num_buffer_stalls_++;
                 return std::nullopt;
             }
@@ -1009,6 +1113,7 @@ private:
             }
         }
         KASSERT(!free_aggregation_buffers_.empty());
+        num_buffer_acquires_++;
         auto buffer = std::move(free_aggregation_buffers_.back());
         free_aggregation_buffers_.pop_back();
         return buffer;
@@ -1102,7 +1207,14 @@ private:
         auto& [receiver, buffer] = *buffer_it;
         if (buffer.empty()) {
             if (erase) {
-                return {aggregation_buffers_.erase(buffer_it), true};
+                // Back to the pool, not destroyed. An entry that is empty here usually still owns a real
+                // buffer with its capacity reserved, and dropping it silently shrank the pool: measured
+                // at 68 buffers lost out of 74 on a tight-budget run, after which the application could
+                // never acquire another one.
+                BufferContainer container = std::move(buffer_it->second);
+                auto next = aggregation_buffers_.erase(buffer_it);
+                recycle_buffer(std::move(container));
+                return {next, true};
             }
             return {++buffer_it, true};
         }
@@ -1319,6 +1431,7 @@ private:
     /// Return a buffer to the pool that was never sent. Deliberately NOT reclaim_aggregation_buffer with
     /// a dummy receipt: receipt 0 is a real id, so that would release some other send's relay reserve.
     void recycle_buffer(BufferContainer&& buffer) {
+        num_buffer_recycles_++;
         buffer.resize(0);  // this does not reduce the capacity
         free_aggregation_buffers_.emplace_back(std::move(buffer));
     }
@@ -1327,6 +1440,7 @@ private:
         // A completed send is the moment relayed payload stops occupying anything: it is no longer in an
         // aggregation buffer, a deferred queue, or MPI's hands. Releasing it any earlier would let a relay
         // grant room it does not have.
+        num_buffer_reclaims_++;
         auto it = relayed_by_receipt_.find(receipt);
         if (it != relayed_by_receipt_.end()) {
             flow_.note_relay_released(it->second);
@@ -1498,6 +1612,15 @@ private:
     /// Counts calls to poll_throttled. Held here rather than in the underlying queue so that the
     /// throttle covers the flow controller and the deferred queues too; see poll_throttled.
     std::size_t poll_throttle_count_ = 0;
+    /// Buffer-pool traffic. Only ever read from the stall tracer, and read as a TRIPLE: recycles
+    /// exceeding acquires means buffers are entering the free list that the pool never handed out, which
+    /// is possible here (see acquire_buffer's note on husks) and is why nothing may derive the number of
+    /// buffers in use by subtracting one of these counters from another.
+    std::size_t num_buffer_acquires_ = 0;
+    std::size_t num_buffer_recycles_ = 0;
+    std::size_t num_buffer_reclaims_ = 0;
+    double stall_trace_interval_ = 0.0;
+    std::chrono::steady_clock::time_point stall_trace_last_{};
 
     Merger merge;
     Splitter split;

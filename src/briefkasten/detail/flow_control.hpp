@@ -23,6 +23,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -376,6 +379,36 @@ public:
         return grants_received_;
     }
 
+    /// Whole-ledger snapshot for stall tracing. Allocates and formats, so it is only ever called from
+    /// BufferedMessageQueue's stall tracer, which is off unless BRIEFKASTEN_STALL_TRACE_SECONDS is set.
+    ///
+    /// Print two of these a few seconds apart: what has NOT changed between them is the stall. A peer
+    /// with credit=0 and no grant arriving is waiting on its peer's consumption; a peer marked
+    /// GRANT_BLOCKED is waiting on the relay reserve, which only the completion of a forwarding send can
+    /// free.
+    [[nodiscard]] std::string describe() const {
+        std::ostringstream out;
+        out << "fc{enabled=" << enabled_ << " budget=" << budget_ << " relay_budget=" << relay_budget_
+            << " relay_outstanding=" << relay_outstanding_ << " proxy_allowance=" << proxy_allowance_
+            << " high_water=" << relay_high_water() << " base_window=" << base_window_
+            << " max_window=" << max_window_ << " pool=" << pool_ << " grants_sent=" << grants_sent_
+            << " grants_received=" << grants_received_ << " withheld=" << num_grants_withheld_
+            << " blocked_list=" << grant_blocked_.size() << " resend_list=" << resend_worklist_.size()
+            << " oversize=" << num_oversize_passes_ << " grows=" << num_window_grows_ << "}";
+        for (auto const& entry : peers_) {
+            Peer const& st = entry.second;
+            out << "\n    peer " << entry.first
+                << (st.link_class == LinkClass::to_proxy ? " PROXY" : " DEST ")
+                << " sent=" << st.sent << " limit=" << st.limit
+                << " credit=" << (st.limit - std::min(st.limit, st.sent)) << " granted=" << st.granted
+                << " consumed=" << st.consumed << " window=" << st.window
+                << (st.class_known ? "" : " CLASS_UNKNOWN") << (st.grant_blocked ? " GRANT_BLOCKED" : "")
+                << (st.resend_due ? " RESEND_DUE" : "")
+                << (st.request != MPI_REQUEST_NULL ? " GRANT_INFLIGHT" : "");
+        }
+        return out.str();
+    }
+
     void reset_counters() {
         num_oversize_passes_ = 0;
         num_window_grows_ = 0;
@@ -536,7 +569,14 @@ private:
     /// are global, and no further grant can be issued because no further payload is sent. Every rank
     /// executes the same number of rounds, because the decision comes out of the allreduce.
     void quiesce() {
+        std::size_t rounds = 0;
         while (true) {
+            // A stall here looks like a hang at the END of a phase, with no other symptom. Cheap to
+            // trace and impossible to diagnose otherwise.
+            if (++rounds % 1000 == 0) {
+                std::fprintf(stderr, "[bk-quiesce] round %zu sent=%zu received=%zu\n", rounds,
+                             grants_sent_, grants_received_);
+            }
             receive_grants();
             progress_resends();
             std::size_t outstanding = 0;
