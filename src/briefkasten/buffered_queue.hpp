@@ -1230,8 +1230,13 @@ private:
                 // A nested flush erased it (the drain and flush_largest_buffer both erase).
                 std::tie(it, std::ignore) = aggregation_buffers_.emplace(receiver, std::move(buffer));
             } else if (it->second.empty()) {
-                // The moved-from shell our own flush left behind. It carries no capacity, so swapping in
-                // the fresh buffer is what the straight-line version did and is still right.
+                // Recycle what is there before overwriting it. USUALLY this is the moved-from shell our
+                // own flush left behind, which carries no capacity and costs nothing to hand back -- but
+                // when the flush found the buffer already empty it left a REAL pool buffer with its
+                // capacity reserved, and overwriting that destroys it. The pool never learns, so the
+                // relay has to grow it to compensate: observed as relay_pool_growths climbing from 2660
+                // to 4873 across three iterations instead of plateauing.
+                recycle_buffer(std::move(it->second));
                 it->second = std::move(buffer);
             } else {
                 // Refilled by a relay handler while we polled. Its payload must survive, so the fresh
