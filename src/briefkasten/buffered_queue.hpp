@@ -153,7 +153,7 @@ public:
 
     /// Give each of \p num_peers peers a credit window of \p window_packets, and cap the buffer pool at
     /// \p buffers_per_peer per peer. \p window_packets must be the same on every rank, since the initial
-    /// windows are implicit. The relay may exceed the pool cap instead of blocking (see acquire_buffer).
+    /// windows are implicit. The proxy may exceed the pool cap instead of blocking (see acquire_buffer).
     void enable_flow_control(std::size_t window_packets, std::size_t buffers_per_peer,
                              std::size_t num_peers) {
         if (window_packets == 0) {
@@ -355,8 +355,8 @@ public:
             << "/" << buffer_limit() << " free=" << free_aggregation_buffers_.size()
             << " credit_deferrals=" << num_credit_deferrals_
             << " capacity_deferrals=" << num_capacity_deferrals_
-            << " relay_buffer_stalls=" << num_relay_buffer_stalls_
-            << " relay_overdraft=" << relay_overdraft_
+            << " relay_buffer_stalls=" << num_redirect_buffer_stalls_
+            << " relay_overdraft=" << redirect_overdraft_
             << " buffer_stalls=" << num_buffer_stalls_ << " sends=" << counts.send
             << " recvs=" << counts.receive << " term_calls=" << queue_.num_terminate_calls()
             << " term_drains=" << queue_.num_termination_drains()
@@ -397,7 +397,7 @@ public:
         auto before_next_message_counting_round_hook = [&] { drive(); };
         // Drain only right before counting, not on every termination attempt (most are aborted, and
         // draining forces out partially filled buffers). Buffered and parked payload is reported as
-        // `pending`, so termination cannot fire while a relay still holds data.
+        // `pending`, so termination cannot fire while a proxy still holds data.
         auto prepare_and_count = [&] {
             flush_all_buffers_blocking(
                 on_message, [&] { return termination_state() == TerminationState::active; }, drive);
@@ -431,7 +431,7 @@ public:
     void flush_all_buffers_blocking(MessageHandler<MessageType> auto&& on_message,
                                     std::predicate auto&& should_stop,
                                     std::invocable<> auto&& progress_hook) {
-        // iterate over a snapshot of the destinations: polling may run a relay handler that modifies
+        // iterate over a snapshot of the destinations: polling may run a redirection handler that modifies
         // aggregation_buffers_. Buffers created meanwhile are left for the next drain.
         KASSERT(!draining_, "flush_all_buffers_blocking is not re-entrant");
         draining_ = true;
@@ -460,7 +460,7 @@ public:
             }
             auto it = aggregation_buffers_.find(target);
             if (it == aggregation_buffers_.end()) {
-                continue;  // a nested relay post flushed it while we were polling
+                continue;  // a nested redirect flushed it while we were polling
             }
             // selective drain: skip buffers that grew since the last drain, they will fill up on their own
             if (selective_drain_) {
@@ -594,24 +594,24 @@ public:
     }
 
     /// Set by IndirectionAdapter from its routing scheme: whether packets from a peer may contain messages this
-    /// rank has to forward. If unset (flat queue), nothing is ever relayed.
-    void set_may_relay(std::function<bool(PEID)> may_relay) {
-        may_relay_ = std::move(may_relay);
-        may_relay_cache_.clear();
+    /// rank has to forward. If unset (flat queue), nothing is ever redirected.
+    void set_may_redirect(std::function<bool(PEID)> may_redirect) {
+        may_redirect_ = std::move(may_redirect);
+        may_redirect_cache_.clear();
     }
 
     /// Cached, so the std::function is called once per peer.
-    [[nodiscard]] bool may_relay(PEID peer) const {
-        if (!may_relay_) {
+    [[nodiscard]] bool may_redirect(PEID peer) const {
+        if (!may_redirect_) {
             return false;
         }
-        auto it = may_relay_cache_.find(peer);
-        if (it != may_relay_cache_.end()) {
+        auto it = may_redirect_cache_.find(peer);
+        if (it != may_redirect_cache_.end()) {
             return it->second;
         }
-        auto relay = may_relay_(peer);
-        may_relay_cache_.emplace(peer, relay);
-        return relay;
+        auto redirect = may_redirect_(peer);
+        may_redirect_cache_.emplace(peer, redirect);
+        return redirect;
     }
 
     /// Raise (or lower) the cap on concurrently held aggregation buffers. The cap only bounds lazy growth in
@@ -725,20 +725,20 @@ public:
         return parked_elements_;
     }
 
-    /// Relayed elements currently held for forwarding.
+    /// Redirected elements currently held for forwarding.
     [[nodiscard]] std::size_t relay_outstanding_elements() const {
-        return flow_.relay_held();
+        return flow_.redirect_held();
     }
 
-    /// Times the relay had to wait for a buffer; should be zero.
+    /// Times the proxy had to wait for a buffer; should be zero.
     [[nodiscard]] std::size_t num_relay_buffer_stalls() const {
-        return num_relay_buffer_stalls_;
+        return num_redirect_buffer_stalls_;
     }
 
     /// Upper bound on \ref relay_overdraft, in buffers.
     [[nodiscard]] std::size_t relay_pool_ceiling() const {
         auto const packet = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
-        return (flow_.relay_high_water() / packet) + num_peers_ + 1;
+        return (flow_.redirect_high_water() / packet) + num_peers_ + 1;
     }
 
     /// The credit window each peer holds, in elements.
@@ -746,9 +746,9 @@ public:
         return flow_.window();
     }
 
-    /// Buffers the relay allocated beyond the pool cap (the relay never waits for a buffer).
+    /// Buffers the proxy allocated beyond the pool cap (the proxy never waits for a buffer).
     [[nodiscard]] std::size_t relay_overdraft() const {
-        return relay_overdraft_;
+        return redirect_overdraft_;
     }
 
     [[nodiscard]] std::size_t num_grants_withheld() const {
@@ -837,7 +837,7 @@ public:
         num_drain_skips_ = 0;
         num_credit_deferrals_ = 0;
         num_capacity_deferrals_ = 0;
-        num_relay_buffer_stalls_ = 0;
+        num_redirect_buffer_stalls_ = 0;
         flow_.reset_counters();
         queue_.reset_counters();
     }
@@ -846,10 +846,10 @@ private:
     using BufferMap = std::unordered_map<PEID, BufferContainer>;
     using BufferList = std::vector<BufferContainer>;
 
-    /// \c relayed: how many of its elements are relayed, released from the relay reserve once sent.
+    /// \c redirected: how many of its elements are redirected, released from the redirect reserve once sent.
     struct ParkedPacket {
         BufferContainer buffer;
-        std::size_t relayed = 0;
+        std::size_t redirected = 0;
     };
 
     // Fan-out for the direct case is p: every rank is a potential destination.
@@ -871,7 +871,7 @@ private:
     }
 
     [[nodiscard]] std::size_t buffer_limit() const {
-        return max_num_aggregation_buffers_ + relay_overdraft_;
+        return max_num_aggregation_buffers_ + redirect_overdraft_;
     }
 
     void reserve_aggregation_buffers(std::size_t num_buffers) {
@@ -893,17 +893,17 @@ private:
         }
     }
 
-    /// \return a free buffer, or nullopt if the caller must wait for one. The relay never waits: it grows
-    /// the pool beyond the cap instead, since relayed payload is already bounded by the flow control.
+    /// \return a free buffer, or nullopt if the caller must wait for one. The proxy never waits: it grows
+    /// the pool beyond the cap instead, since redirected payload is already bounded by the flow control.
     auto acquire_buffer() -> std::optional<BufferContainer> {
-        bool const for_relay = relaying_depth_ > 0;
+        bool const for_redirect = redirecting_depth_ > 0;
         if (free_aggregation_buffers_.empty()) {
-            if (for_relay && num_aggregation_buffers_ >= max_num_aggregation_buffers_) {
-                KASSERT(relay_overdraft_ < relay_pool_ceiling(),
-                        "relay overdrew the buffer pool by " << relay_overdraft_
+            if (for_redirect && num_aggregation_buffers_ >= max_num_aggregation_buffers_) {
+                KASSERT(redirect_overdraft_ < relay_pool_ceiling(),
+                        "proxy overdrew the buffer pool by " << redirect_overdraft_
                             << " buffers, past the " << relay_pool_ceiling()
                             << " that credits should have bounded it to");
-                relay_overdraft_++;
+                redirect_overdraft_++;
             }
             if (num_aggregation_buffers_ < buffer_limit()) {
                 reserve_aggregation_buffers(1);
@@ -915,7 +915,7 @@ private:
                     flush_largest_buffer();
                 }
                 num_buffer_stalls_++;
-                num_relay_buffer_stalls_ += for_relay ? 1 : 0;
+                num_redirect_buffer_stalls_ += for_redirect ? 1 : 0;
                 return std::nullopt;
             }
         }
@@ -929,7 +929,7 @@ private:
     /// Note: messages have to be passed as rvalues. If you want to send static
     /// data without an additional copy, wrap it in a std::ranges::ref_view.
     ///
-    /// Both customization points may poll, which may run a relay handler that posts into this queue. So
+    /// Both customization points may poll, which may run a redirection handler that posts into this queue. So
     /// aggregation_buffers_ may change underneath, and `it` is looked up again after each such call.
     bool post_message_impl(InputMessageRange<MessageType> auto&& message,
                            PEID receiver,  // NOLINT(*-easily-swappable-parameters)
@@ -942,7 +942,7 @@ private:
         auto it = aggregation_buffers_.find(receiver);
         if (it == aggregation_buffers_.end()) {
             auto buffer = get_new_buffer();
-            // a relay handler may have created the entry meanwhile
+            // a redirection handler may have created the entry meanwhile
             it = aggregation_buffers_.find(receiver);
             if (it == aggregation_buffers_.end()) {
                 std::tie(it, std::ignore) = aggregation_buffers_.emplace(receiver, std::move(buffer));
@@ -954,7 +954,7 @@ private:
         auto envelope =
             MessageEnvelope{std::forward<decltype(message)>(message), envelope_sender, envelope_receiver, tag};
         bool overflow = false;
-        // loop: while we poll, a relay handler may refill this destination's buffer, so re-check
+        // loop: while we poll, a redirection handler may refill this destination's buffer, so re-check
         while (true) {
             size_t estimated_new_buffer_size = 0;
             if constexpr (aggregation::EstimatingMerger<Merger, MessageType, BufferContainer>) {
@@ -978,7 +978,7 @@ private:
                 recycle_buffer(std::move(it->second));
                 it->second = std::move(buffer);
             } else {
-                // refilled by a relay handler, keep its payload
+                // refilled by a redirection handler, keep its payload
                 recycle_buffer(std::move(buffer));
             }
         }
@@ -988,9 +988,9 @@ private:
         auto new_buffer_size = buffer.size();
         auto const merged = new_buffer_size - old_buffer_size;
         global_buffer_size_ += merged;
-        if (relaying_depth_ > 0 && merged > 0) {
-            relayed_in_buffer_[receiver] += merged;
-            flow_.hold_relayed(merged);
+        if (redirecting_depth_ > 0 && merged > 0) {
+            redirected_in_buffer_[receiver] += merged;
+            flow_.hold_redirected(merged);
         }
         return overflow;
     }
@@ -1015,7 +1015,7 @@ private:
         // we don't send if the cleanup has emptied the buffer
         if (buffer.empty()) {
             global_buffer_size_ -= pre_cleanup_buffer_size;
-            flow_.release_relayed(take_relayed(receiver));
+            flow_.release_redirected(take_redirected(receiver));
             if (erase) {
                 BufferContainer container = std::move(buffer_it->second);
                 auto next = aggregation_buffers_.erase(buffer_it);
@@ -1050,13 +1050,13 @@ private:
             return {buffer_it, false};
         }
         num_elements_flushed_ += elements;
-        auto const relayed = take_relayed(receiver);
+        auto const redirected = take_redirected(receiver);
         auto receipt = queue_.post_message(std::move(buffer_it->second), receiver);
         KASSERT(receipt.has_value(),
                 "We checked before that there is capacity, so posting the message should not fail.");
         flow_.track_send(receiver, elements);
-        if (relayed > 0) {
-            relayed_by_receipt_[*receipt] = relayed;
+        if (redirected > 0) {
+            redirected_by_receipt_[*receipt] = redirected;
         }
         global_buffer_size_ -= pre_cleanup_buffer_size;
         if (erase) {
@@ -1071,7 +1071,7 @@ private:
         if (queue_for_peer.empty()) {
             parked_peers_.push_back(receiver);
         }
-        queue_for_peer.push_back(ParkedPacket{.buffer = std::move(buffer), .relayed = take_relayed(receiver)});
+        queue_for_peer.push_back(ParkedPacket{.buffer = std::move(buffer), .redirected = take_redirected(receiver)});
         parked_elements_ += elements;
     }
 
@@ -1093,12 +1093,12 @@ private:
                 if (!flow_.has_credit(receiver, elements) || !queue_.has_send_capacity()) {
                     break;
                 }
-                auto const relayed = packets.front().relayed;
+                auto const redirected = packets.front().redirected;
                 auto receipt = queue_.post_message(std::move(packets.front().buffer), receiver);
                 KASSERT(receipt.has_value(), "capacity was checked, so posting must succeed");
                 flow_.track_send(receiver, elements);
-                if (relayed > 0) {
-                    relayed_by_receipt_[*receipt] = relayed;
+                if (redirected > 0) {
+                    redirected_by_receipt_[*receipt] = redirected;
                 }
                 num_elements_flushed_ += elements;
                 parked_elements_ -= elements;
@@ -1113,15 +1113,15 @@ private:
         parked_peers_.resize(kept);
     }
 
-    /// Relayed elements in \p receiver's current buffer; resets the count, since the buffer is being sent or parked.
-    std::size_t take_relayed(PEID receiver) {
-        auto it = relayed_in_buffer_.find(receiver);
-        if (it == relayed_in_buffer_.end()) {
+    /// Redirected elements in \p receiver's current buffer; resets the count, since the buffer is being sent or parked.
+    std::size_t take_redirected(PEID receiver) {
+        auto it = redirected_in_buffer_.find(receiver);
+        if (it == redirected_in_buffer_.end()) {
             return 0;
         }
-        auto const relayed = it->second;
-        relayed_in_buffer_.erase(it);
-        return relayed;
+        auto const redirected = it->second;
+        redirected_in_buffer_.erase(it);
+        return redirected;
     }
 
     /// if post_flush_hook return true, this breaks the loop
@@ -1178,20 +1178,20 @@ private:
             auto const source = buffer.sender;
             auto const posts_before = num_posts_;
             auto const elements = buffer.message.size();
-            // posts made while relaying_depth_ > 0 are forwards and are charged to the relay reserve
-            bool const relays = may_relay(source);
-            flow_.set_may_relay(source, relays);
-            relaying_depth_ += relays ? 1 : 0;
+            // posts made while redirecting_depth_ > 0 are forwards and are charged to the redirect reserve
+            bool const redirects = may_redirect(source);
+            flow_.set_may_redirect(source, redirects);
+            redirecting_depth_ += redirects ? 1 : 0;
             for (Envelope<MessageType> auto env : split(buffer.message, buffer.sender, queue_.rank())) {
                 on_message(std::move(env));
             }
-            relaying_depth_ -= relays ? 1 : 0;
+            redirecting_depth_ -= redirects ? 1 : 0;
             flow_.track_receive(source, elements);
-            // Handlers must not send, except for the relay forwarding. Otherwise flow control can deadlock.
-            KASSERT(may_relay(source) || num_posts_ == posts_before,
+            // Handlers must not send, except for the forwarding by the proxy. Otherwise flow control can deadlock.
+            KASSERT(may_redirect(source) || num_posts_ == posts_before,
                     "posted " << (num_posts_ - posts_before)
                               << " message(s) while handling a packet from rank " << source
-                              << ", which is not a relay source. Either the indirection scheme is wrong, or the "
+                              << ", which is not a may_redirect peer. Either the indirection scheme is wrong, or the "
                                  "application sends from inside a message handler.");
         };
     }
@@ -1203,13 +1203,13 @@ private:
         free_aggregation_buffers_.emplace_back(std::move(buffer));
     }
 
-    /// Called when a send completed; frees its relay reserve.
+    /// Called when a send completed; frees its redirect reserve.
     auto reclaim_aggregation_buffer(std::size_t receipt, BufferContainer&& buffer) {
         num_buffer_reclaims_++;
-        auto it = relayed_by_receipt_.find(receipt);
-        if (it != relayed_by_receipt_.end()) {
-            flow_.release_relayed(it->second);
-            relayed_by_receipt_.erase(it);
+        auto it = redirected_by_receipt_.find(receipt);
+        if (it != redirected_by_receipt_.end()) {
+            flow_.release_redirected(it->second);
+            redirected_by_receipt_.erase(it);
         }
         recycle_buffer(std::move(buffer));
     }
@@ -1223,7 +1223,7 @@ private:
         switch (flush_strategy_) {
             case FlushStrategy::local: {
                 if (current_buffer == aggregation_buffers_.end()) {
-                    // already flushed by a relay handler while we polled
+                    // already flushed by a redirection handler while we polled
                     return true;
                 }
                 auto ret = flush_buffer_impl(current_buffer, /*erase=*/false);
@@ -1249,8 +1249,8 @@ private:
                                    std::invocable<> auto&& progress_hook) {
         if (flow_.enabled()) {
             // the flush below parks instead of failing, so no need to wait. Poll once to make progress,
-            // but not from inside a relay handler, which would nest receive handling.
-            if (relaying_depth_ == 0) {
+            // but not from inside a redirection handler, which would nest receive handling.
+            if (redirecting_depth_ == 0) {
                 poll(std::forward<decltype(on_message)>(on_message));
                 progress_hook();
             }
@@ -1320,20 +1320,20 @@ private:
     std::vector<PEID> drain_targets_;                        ///< scratch for flush_all_buffers_blocking
     bool draining_ = false;
     std::size_t num_posts_ = 0;  ///< calls to post_message_impl, checked in split_handler
-    std::function<bool(PEID)> may_relay_;
-    mutable std::unordered_map<PEID, bool> may_relay_cache_;
+    std::function<bool(PEID)> may_redirect_;
+    mutable std::unordered_map<PEID, bool> may_redirect_cache_;
 
     internal::FlowController flow_;
     std::unordered_map<PEID, std::deque<ParkedPacket>> parked_;  ///< per destination, waiting for credit
     std::vector<PEID> parked_peers_;                             ///< destinations with parked packets
     std::size_t parked_elements_ = 0;
-    std::unordered_map<PEID, std::size_t> relayed_in_buffer_;         ///< relayed elements per filling buffer
-    std::unordered_map<std::size_t, std::size_t> relayed_by_receipt_;  ///< relayed elements per in-flight send
-    std::size_t relaying_depth_ = 0;  ///< nesting depth of handlers for packets from may_relay peers
+    std::unordered_map<PEID, std::size_t> redirected_in_buffer_;         ///< redirected elements per filling buffer
+    std::unordered_map<std::size_t, std::size_t> redirected_by_receipt_;  ///< redirected elements per in-flight send
+    std::size_t redirecting_depth_ = 0;  ///< nesting depth of handlers for packets from may_redirect peers
     std::size_t num_credit_deferrals_ = 0;
     std::size_t num_capacity_deferrals_ = 0;
-    std::size_t num_relay_buffer_stalls_ = 0;
-    std::size_t relay_overdraft_ = 0;
+    std::size_t num_redirect_buffer_stalls_ = 0;
+    std::size_t redirect_overdraft_ = 0;
     std::size_t num_peers_ = 0;
     std::size_t poll_throttle_count_ = 0;
     // only read by the stall tracer

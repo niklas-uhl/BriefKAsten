@@ -53,7 +53,7 @@ public:
 
     /// Whether packets from \p peer may contain messages this rank has to forward: true unless \p peer is in
     /// our own column, since a destination in the sender's column is always reached directly.
-    [[nodiscard]] bool may_relay(PEID peer) const {
+    [[nodiscard]] bool may_redirect(PEID peer) const {
         if (peer == rank()) {
             return false;
         }

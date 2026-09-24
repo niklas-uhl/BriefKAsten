@@ -51,7 +51,7 @@ public:
     }
 
     // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
-    [[nodiscard]] bool may_relay(PEID /*peer*/) const {
+    [[nodiscard]] bool may_redirect(PEID /*peer*/) const {
         return false;
     }
 

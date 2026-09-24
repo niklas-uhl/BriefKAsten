@@ -15,9 +15,9 @@
 namespace {
 constexpr std::size_t NUM_LOCAL_ELEMENTS = 200'000;
 
-/// An all-to-all over a relaying grid, driven to completion and checked for exact delivery.
+/// An all-to-all over a redirecting grid, driven to completion and checked for exact delivery.
 ///
-/// Exact delivery is the point. Relayed payload that has been received but not yet forwarded is counted as
+/// Exact delivery is the point. Redirected payload that has been received but not yet forwarded is counted as
 /// received and not as sent, so a termination protocol that looks only at the packet balance can fire while
 /// data is still sitting in a proxy's buffer -- silent message loss, invisible at verify-level 0, and the
 /// same class of bug as the grid_alltoallv data loss. A global count that comes up short is what catches it.
@@ -78,7 +78,7 @@ std::size_t global_sum(kamping::Communicator<> const& comm, std::size_t value) {
 }
 }  // namespace
 
-/// Flow control is on by default under indirection, and the relay must never block.
+/// Flow control is on by default under indirection, and the proxy must never block.
 TEST(FlowControlTest, indirect_alltoall_delivers_everything) {
     kamping::Communicator<> comm;
     auto outcome = run_alltoall(comm, briefkasten::Config{});
@@ -87,7 +87,7 @@ TEST(FlowControlTest, indirect_alltoall_delivers_everything) {
     EXPECT_EQ(global_sum(comm, outcome.received), NUM_LOCAL_ELEMENTS * comm.size());
     EXPECT_EQ(outcome.pending_at_end, 0U);
     // The whole point: with credits, nothing ever waits for send capacity. Both counters sit on blocking
-    // loops, and the overflow one is on the relay handler's path -- a relay spinning there is a receive
+    // loops, and the overflow one is on the redirection handler's path -- a proxy spinning there is a receive
     // slot left disarmed, which is the defect this exists to remove. They must be exactly zero, not small.
     EXPECT_EQ(outcome.overflow_capacity_waits, 0U);
     EXPECT_EQ(outcome.drain_capacity_waits, 0U);
@@ -118,7 +118,7 @@ TEST(FlowControlTest, deferral_under_a_tiny_budget_still_delivers_everything) {
     conf.credit_window_packets = 2;      // two packets of credit per peer: as tight as the design allows
     // Deliberately no polling while posting. A sender that services its own inbox between posts keeps its
     // peers' windows fed and never starves -- which is what happened at 2 ranks, where the grid degenerates
-    // to a single column and nothing is relayed. Withholding the poll is what forces packets to be parked,
+    // to a single column and nothing is redirected. Withholding the poll is what forces packets to be parked,
     // and it also exercises the intended backpressure: the sender ends up blocking on the buffer pool,
     // which is the one place it is still allowed to block.
     auto outcome = run_alltoall(comm, conf, /*poll_while_posting=*/false);
@@ -135,9 +135,9 @@ TEST(FlowControlTest, deferral_under_a_tiny_budget_still_delivers_everything) {
         EXPECT_GT(global_sum(comm, outcome.grants_sent), 0U);
     }
     // Parking, unlike granting, needs the sender to actually outrun its credit, and that cannot be forced
-    // at 2 ranks: round(sqrt(2)) is 1, so the grid is a single column, nothing is relayed, and the
+    // at 2 ranks: round(sqrt(2)) is 1, so the grid is a single column, nothing is redirected, and the
     // sender's own overflow poll refreshes its credit before it can run out. From 3 ranks up there is a
-    // relay hop and the round trip is long enough that packets really are parked. (Even here this is a
+    // redirect hop and the round trip is long enough that packets really are parked. (Even here this is a
     // one-node approximation of the real thing; section 8 of the takeover note is blunt that local runs
     // cannot validate this mechanism, only its correctness.)
     if (comm.size() >= 3) {

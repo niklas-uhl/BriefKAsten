@@ -29,22 +29,9 @@ namespace briefkasten::internal {
 struct MessageCounter {
     size_t send;
     size_t receive;
-    /// Payload accepted into an aggregation buffer but not yet handed to MPI.
-    ///
-    /// send/receive are counted per PACKET, at flush and at arrival. That makes a relayed message
-    /// sitting in a proxy's buffer invisible: the packet that carried it was sent once and received
-    /// once, so the counts balance while the data is still undelivered. Termination would fire and
-    /// the message would be lost. The old defence was to force-flush every relay buffer on every
-    /// termination attempt, which is correct but fragments the traffic -- 64% of relay packets at
-    /// p=608, at 5% fill (see notes/takeover_relay_backpressure.md).
-    ///
-    /// Counting the outstanding buffer contents instead makes the imbalance explicit, so
-    /// termination refuses on its own and flushing becomes a question of progress rather than of
-    /// correctness. Deliberately read from BufferedMessageQueue's existing global_buffer_size_
-    /// rather than tracked as a parallel per-message counter: that accounting already subtracts
-    /// the PRE-cleanup buffer size on flush, so anything a BufferCleaner discards is handled for
-    /// free. A separate merge-time counter would have needed every cleaner to report its
-    /// discards, and would have gone wrong silently when one did not.
+    /// Elements accepted into an aggregation buffer but not yet handed to MPI. send/receive count
+    /// packets, so without this a redirected message waiting in a proxy's buffer would let
+    /// termination fire.
     size_t pending = 0;
     auto operator<=>(const MessageCounter&) const = default;
 };

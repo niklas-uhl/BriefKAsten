@@ -81,14 +81,8 @@ private:
 
 /// @brief How deep receive handling nests, and how many receive slots are disarmed while it does.
 ///
-/// A slot whose receive completed stays disarmed until its handler returns and the receive is re-armed. Under
-/// IndirectionAdapter the first-hop handler relays by calling post_message_blocking, which polls this same receiver
-/// again while the outer handler is still running. Every nesting level therefore holds at least one slot disarmed,
-/// and a receiver whose slots are all disarmed cannot accept anything -- the relay goes deaf to its row while it
-/// waits on second-hop capacity. These counters measure that directly instead of inferring it from capacity waits.
-/// See notes/takeover_relay_backpressure.md.
-///
-/// Observed once per probe call (a few integer compares next to an MPI_Testsome), so the cost is not measurable.
+/// A slot stays disarmed until its handler returns. If a handler polls again (e.g. a blocking redirect), every
+/// nesting level holds a slot disarmed, and with all slots disarmed the rank cannot receive anything.
 /// Per-phase, unlike ReceiveArmCounter: reset by reset_nesting_counters().
 class ReceiveNestingCounter {
 public:
@@ -646,7 +640,7 @@ public:
         // the slot is reserved for the duration of on_message; a recursive probe_for_one_message call sees it as
         // occupied and uses the next free slot instead. Processing one message at a time (rather than batching all
         // receives before any handler call) is essential: batching N messages locks all N slots simultaneously,
-        // leaving none for recursive probes and causing a near-deadlock when the relay hop's send slots are exhausted.
+        // leaving none for recursive probes and causing a near-deadlock when the proxy hop's send slots are exhausted.
         bool received_any = false;
         for (std::size_t i = 0; i < max_receives; i++) {
             if (!probe_for_one_message(std::forward<decltype(on_message)>(on_message))) {

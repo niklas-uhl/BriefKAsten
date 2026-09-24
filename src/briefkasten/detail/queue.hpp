@@ -198,7 +198,7 @@ public:
             // Counted here rather than at start_message_counting: this loop can abort (below) before
             // ever launching an allreduce, and the hook has ALREADY run by then. Under IndirectionAdapter
             // the hook is what drains the sibling hop's buffers, so this -- not num_termination_rounds --
-            // is the number that multiplies the relay's forced flushes.
+            // is the number that multiplies the proxy's forced flushes.
             num_termination_drains_++;
             before_next_message_counting_round_hook();
             if (termination_state_ == TerminationState::active) {
@@ -371,10 +371,6 @@ public:
     /// ran. Strictly >= \ref num_termination_rounds, which only counts rounds that got as far as
     /// launching an allreduce -- an attempt aborted by an arriving message runs the hook and returns
     /// without ever counting a round.
-    ///
-    /// This gap is the point of the counter. Under IndirectionAdapter the hook force-flushes every
-    /// second-hop buffer at whatever fill it has, so a phase reporting num_termination_rounds = 3 can
-    /// still have drained the relay's buffers a thousand times. See notes/takeover_relay_backpressure.md.
     [[nodiscard]] std::size_t num_termination_drains() const {
         return num_termination_drains_;
     }

@@ -38,7 +38,7 @@ namespace briefkasten::internal {
 
 /// @brief Credit-based flow control: a rank only sends a packet if the receiving peer has made room for it.
 ///
-/// Per peer, all counts are totals in elements (not packets, because a relay re-aggregates what it forwards):
+/// Per peer, all counts are totals in elements (not packets, because a proxy re-aggregates what it forwards):
 ///   - sender:   may send a packet of n elements iff n <= total_allowed - total_sent.
 ///   - receiver: keeps total_granted - total_received <= window and sends a grant carrying total_granted
 ///               whenever at least half a window has freed up.
@@ -48,13 +48,13 @@ namespace briefkasten::internal {
 /// derives the same value from the config, so start-up needs no messages. Grants use their own tag and are
 /// not counted by termination detection.
 ///
-/// Relaying: packets from a may_relay peer may contain messages this rank has to forward. To such peers it
-/// only grants while relay_held_ + relay_allowed_ < relay_budget_, i.e. it never allows more than it can
+/// Redirection: packets from a may_redirect peer may contain messages this rank has to forward. To such peers it
+/// only grants while redirect_held_ + redirect_allowed_ < redirect_budget_, i.e. it never allows more than it can
 /// forward. This is what keeps the receive handler from blocking.
 class FlowController {
 public:
     struct Peer {
-        bool may_relay = false;  ///< packets from this peer may contain messages we have to forward
+        bool may_redirect = false;  ///< packets from this peer may contain messages we have to forward
         // send side
         std::size_t total_sent = 0;
         std::size_t total_allowed = 0;  ///< from the peer's latest grant
@@ -65,8 +65,8 @@ public:
         MPI_Request grant_request = MPI_REQUEST_NULL;
         std::uint64_t grant_value = 0;  ///< send buffer of grant_request
         bool grant_pending = false;     ///< a newer grant is waiting for grant_request to complete
-        bool grant_withheld = false;    ///< a grant is due, but the relay reserve is full
-        bool may_relay_known = false;
+        bool grant_withheld = false;    ///< a grant is due, but the redirect reserve is full
+        bool may_redirect_known = false;
     };
 
     // NOLINTBEGIN(*-easily-swappable-parameters)
@@ -84,8 +84,8 @@ public:
           receive_requests_(std::move(other.receive_requests_)),
           receive_buffers_(std::move(other.receive_buffers_)), peers_(std::move(other.peers_)),
           pending_grants_(std::move(other.pending_grants_)), window_(other.window_),
-          relay_budget_(other.relay_budget_), relay_allowed_(other.relay_allowed_),
-          relay_held_(other.relay_held_),
+          redirect_budget_(other.redirect_budget_), redirect_allowed_(other.redirect_allowed_),
+          redirect_held_(other.redirect_held_),
           withheld_grants_(std::move(other.withheld_grants_)), grants_sent_(other.grants_sent_),
           grants_received_(other.grants_received_), num_oversize_passes_(other.num_oversize_passes_),
            num_grants_withheld_(other.num_grants_withheld_) {
@@ -119,7 +119,7 @@ public:
         }
         KASSERT(peers_.empty(), "flow control must be rationed before the first message");
         window_ = window_elements;
-        relay_budget_ = window_elements * std::max<std::size_t>(1, num_peers);
+        redirect_budget_ = window_elements * std::max<std::size_t>(1, num_peers);
         if (!enabled_) {
             enabled_ = true;
             arm_receives();
@@ -134,9 +134,9 @@ public:
         return window_;
     }
 
-    /// Upper bound on relay_held_ + relay_allowed_: the budget, plus the one grant that reaches it.
-    [[nodiscard]] std::size_t relay_high_water() const {
-        return relay_budget_ + window_;
+    /// Upper bound on redirect_held_ + redirect_allowed_: the budget, plus the one grant that reaches it.
+    [[nodiscard]] std::size_t redirect_high_water() const {
+        return redirect_budget_ + window_;
     }
 
     /// May a packet of \p elements elements be sent to \p peer now? A packet larger than the whole window
@@ -171,23 +171,23 @@ public:
         }
         Peer& state = peer_state(peer);
         state.total_received += elements;
-        if (state.may_relay) {
-            // this part of the allowance now arrived and is accounted for by relay_held_
-            relay_allowed_ -= std::min(relay_allowed_, elements);
+        if (state.may_redirect) {
+            // this part of the allowance now arrived and is accounted for by redirect_held_
+            redirect_allowed_ -= std::min(redirect_allowed_, elements);
         }
         grant_if_due(peer, state);
     }
 
-    /// Relayed elements were merged into an outgoing buffer and occupy the relay reserve until sent.
-    void hold_relayed(std::size_t elements) {
-        relay_held_ += elements;
+    /// Redirected elements were merged into an outgoing buffer and occupy the redirect reserve until sent.
+    void hold_redirected(std::size_t elements) {
+        redirect_held_ += elements;
     }
 
-    /// Relayed elements were sent (or discarded); send the grants withheld while the reserve was full.
-    void release_relayed(std::size_t elements) {
-        KASSERT(relay_held_ >= elements, "relay reserve accounting underflowed");
-        relay_held_ -= std::min(relay_held_, elements);
-        if (!withheld_grants_.empty() && relay_held_ + relay_allowed_ < relay_budget_) {
+    /// Redirected elements were sent (or discarded); send the grants withheld while the reserve was full.
+    void release_redirected(std::size_t elements) {
+        KASSERT(redirect_held_ >= elements, "redirect reserve accounting underflowed");
+        redirect_held_ -= std::min(redirect_held_, elements);
+        if (!withheld_grants_.empty() && redirect_held_ + redirect_allowed_ < redirect_budget_) {
             auto withheld = std::move(withheld_grants_);
             withheld_grants_.clear();
             for (PEID peer : withheld) {
@@ -198,8 +198,8 @@ public:
         }
     }
 
-    [[nodiscard]] std::size_t relay_held() const {
-        return relay_held_;
+    [[nodiscard]] std::size_t redirect_held() const {
+        return redirect_held_;
     }
 
     /// Receive grants and send pending ones.
@@ -211,20 +211,20 @@ public:
         progress_grants();
     }
 
-    void set_may_relay(PEID peer, bool may_relay) {
+    void set_may_redirect(PEID peer, bool may_redirect) {
         if (!enabled_) {
             return;
         }
         Peer& state = peer_state(peer);
-        if (state.may_relay_known) {
-            KASSERT(state.may_relay == may_relay, "may_relay must not change for a peer");
+        if (state.may_redirect_known) {
+            KASSERT(state.may_redirect == may_redirect, "may_redirect must not change for a peer");
             return;
         }
-        state.may_relay_known = true;
-        state.may_relay = may_relay;
-        if (may_relay) {
-            // the implicit initial window was granted before may_relay was known
-            relay_allowed_ += state.total_granted - std::min(state.total_granted, state.total_received);
+        state.may_redirect_known = true;
+        state.may_redirect = may_redirect;
+        if (may_redirect) {
+            // the implicit initial window was granted before may_redirect was known
+            redirect_allowed_ += state.total_granted - std::min(state.total_granted, state.total_received);
         }
     }
 
@@ -247,9 +247,9 @@ public:
     /// Snapshot of all counters, for BufferedMessageQueue's stall tracer.
     [[nodiscard]] std::string describe() const {
         std::ostringstream out;
-        out << "fc{enabled=" << enabled_ << " budget=" << relay_budget_
-            << " relay_held=" << relay_held_ << " relay_allowed=" << relay_allowed_
-            << " high_water=" << relay_high_water() << " window=" << window_
+        out << "fc{enabled=" << enabled_ << " budget=" << redirect_budget_
+            << " redirect_held=" << redirect_held_ << " redirect_allowed=" << redirect_allowed_
+            << " high_water=" << redirect_high_water() << " window=" << window_
             << " grants_sent=" << grants_sent_
             << " grants_received=" << grants_received_ << " withheld=" << num_grants_withheld_
             << " withheld_list=" << withheld_grants_.size() << " pending_list=" << pending_grants_.size()
@@ -257,11 +257,11 @@ public:
         for (auto const& entry : peers_) {
             Peer const& st = entry.second;
             out << "\n    peer " << entry.first
-                << (st.may_relay ? " RELAY" : " DEST ")
+                << (st.may_redirect ? " RELAY" : " DEST ")
                 << " total_sent=" << st.total_sent << " total_allowed=" << st.total_allowed
                 << " credit=" << (st.total_allowed - std::min(st.total_allowed, st.total_sent))
                 << " total_granted=" << st.total_granted << " total_received=" << st.total_received
-                << (st.may_relay_known ? "" : " MAY_RELAY_UNKNOWN") << (st.grant_withheld ? " GRANT_WITHHELD" : "")
+                << (st.may_redirect_known ? "" : " MAY_RELAY_UNKNOWN") << (st.grant_withheld ? " GRANT_WITHHELD" : "")
                 << (st.grant_pending ? " GRANT_PENDING" : "")
                 << (st.grant_request != MPI_REQUEST_NULL ? " GRANT_INFLIGHT" : "");
         }
@@ -286,15 +286,15 @@ private:
         return peers_.emplace(peer, fresh).first->second;
     }
 
-    /// Grant once at least half the window has freed up. On a relay link, withhold the grant while the
-    /// relay reserve is full; release_relayed() retries it.
+    /// Grant once at least half the window has freed up. On a may_redirect link, withhold the grant while the
+    /// redirect reserve is full; release_redirected() retries it.
     void grant_if_due(PEID peer, Peer& state) {
         auto const new_total_granted = state.total_received + window_;
         if (new_total_granted <= state.total_granted) {
             return;
         }
-        if (state.may_relay &&
-            relay_held_ + relay_allowed_ >= relay_budget_) {
+        if (state.may_redirect &&
+            redirect_held_ + redirect_allowed_ >= redirect_budget_) {
             if (!state.grant_withheld) {
                 state.grant_withheld = true;
                 withheld_grants_.push_back(peer);
@@ -306,14 +306,14 @@ private:
         if (freed * 2 < window_) {
             return;
         }
-        if (state.may_relay) {
-            relay_allowed_ += new_total_granted - state.total_granted;
+        if (state.may_redirect) {
+            redirect_allowed_ += new_total_granted - state.total_granted;
         }
         state.total_granted = new_total_granted;
         send_grant(peer, state);
-        KASSERT(relay_held_ + relay_allowed_ <= relay_high_water(),
-                "relay reserve overshot its high-water mark: held=" << relay_held_
-                    << " allowed=" << relay_allowed_ << " bound=" << relay_high_water());
+        KASSERT(redirect_held_ + redirect_allowed_ <= redirect_high_water(),
+                "redirect reserve overshot its high-water mark: held=" << redirect_held_
+                    << " allowed=" << redirect_allowed_ << " bound=" << redirect_high_water());
     }
 
     /// At most one grant per peer is in flight; a newer one waits in pending_grants_.
@@ -433,9 +433,9 @@ private:
     std::unordered_map<PEID, Peer> peers_;
     std::vector<PEID> pending_grants_;
     std::size_t window_ = 0;
-    std::size_t relay_budget_ = 0;
-    std::size_t relay_allowed_ = 0;  ///< granted to may_relay peers but not yet received
-    std::size_t relay_held_ = 0;     ///< received from may_relay peers, merged for forwarding, not yet sent
+    std::size_t redirect_budget_ = 0;
+    std::size_t redirect_allowed_ = 0;  ///< granted to may_redirect peers but not yet received
+    std::size_t redirect_held_ = 0;     ///< received from may_redirect peers, merged for forwarding, not yet sent
     std::vector<PEID> withheld_grants_;
     std::size_t grants_sent_ = 0;
     std::size_t grants_received_ = 0;

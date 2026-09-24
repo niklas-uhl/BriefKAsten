@@ -36,11 +36,11 @@ concept IndirectionScheme = requires(T scheme, MPI_Comm comm, PEID sender, PEID 
     { scheme.group_size() } -> std::convertible_to<std::size_t>;
     { scheme.num_groups() } -> std::convertible_to<std::size_t>;
     // Whether packets from `sender` may contain messages this rank has to forward.
-    { scheme.may_relay(sender) } -> std::same_as<bool>;
+    { scheme.may_redirect(sender) } -> std::same_as<bool>;
 };
 
 /// Routes every message over at most two hops of \p Indirector. Both hops use the same underlying queue: a
-/// relay forwards from inside the receive handler by posting back into it.
+/// proxy forwards from inside the receive handler by posting back into it.
 template <IndirectionScheme Indirector, typename BufferedQueueType>
 class IndirectionAdapter {
 private:
@@ -56,7 +56,7 @@ public:
         auto cfg = apply_fan_out_defaults(queue_.config(), fan_out(indirection_));
         queue_.max_num_aggregation_buffers(cfg.max_num_aggregation_buffers.value());
         queue_.send_backlog_capacity(cfg.send_backlog_capacity.value());
-        queue_.set_may_relay([this](PEID peer) { return indirection_.may_relay(peer); });
+        queue_.set_may_redirect([this](PEID peer) { return indirection_.may_redirect(peer); });
         // re-configure flow control (already enabled by the queue) for the smaller peer count
         auto const window = queue_.config().credit_window_packets.value_or(DEFAULT_CREDIT_WINDOW_PACKETS);
         auto const buffers = queue_.config().buffers_per_peer.value_or(DEFAULT_BUFFERS_PER_PEER);
@@ -82,8 +82,7 @@ public:
                       PEID envelope_receiver,
                       int tag,
                       bool direct_send = false) {
-        // `direct_send` is the relay path: the caller is a receive handler forwarding an already-proxied
-        // message to its final destination, so the next hop is the destination itself.
+        // direct_send: the proxy forwards a redirected message to its final destination
         PEID next_hop = direct_send ? receiver : indirection_.next_hop(envelope_sender, envelope_receiver);
         return queue_.post_message(std::forward<decltype(message)>(message), next_hop, envelope_sender,
                                    envelope_receiver, tag);
@@ -158,13 +157,7 @@ public:
     /// (not necessarily the underlying data) is moved to the handler when
     /// called.
     ///
-    /// A single, ordinary termination over a single queue. Relayed payload that has been received but not
-    /// yet forwarded is visible to the decision through MessageCounter::pending, exactly as locally
-    /// originated payload is: the relay merged it into one of this queue's aggregation buffers, so it is
-    /// counted by global_buffer_size_. That is what used to require the two hops' counts to be fused into
-    /// one allreduce, and it is why the fuse can go -- there is only one count now, so the class of bug in
-    /// notes/takeover_briefkasten_tokens.md section 5 (counted as received, not as sent, data still
-    /// undelivered) has nowhere left to hide.
+    /// Redirected messages not yet forwarded are counted as pending, so termination waits for them.
     [[nodiscard]] bool terminate(MessageHandler<typename queue_type::message_type> auto&& on_message) {
         return queue_.terminate(redirection_handler(on_message));
     }
