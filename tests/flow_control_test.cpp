@@ -23,8 +23,8 @@ constexpr std::size_t NUM_LOCAL_ELEMENTS = 200'000;
 /// same class of bug as the grid_alltoallv data loss. A global count that comes up short is what catches it.
 struct Outcome {
     std::size_t received = 0;
-    std::size_t credit_deferrals = 0;
-    std::size_t relay_buffer_stalls = 0;
+    std::size_t parked_for_credit = 0;
+    std::size_t redirect_buffer_stalls = 0;
     std::size_t overflow_capacity_waits = 0;
     std::size_t drain_capacity_waits = 0;
     std::size_t grants_sent = 0;
@@ -63,8 +63,8 @@ Outcome run_alltoall(kamping::Communicator<> const& comm, briefkasten::Config co
     }
 
     auto const& q = queue.queue();
-    outcome.credit_deferrals = q.num_credit_deferrals();
-    outcome.relay_buffer_stalls = q.num_relay_buffer_stalls();
+    outcome.parked_for_credit = q.num_parked_for_credit();
+    outcome.redirect_buffer_stalls = q.num_redirect_buffer_stalls();
     outcome.overflow_capacity_waits = q.num_overflow_capacity_waits();
     outcome.drain_capacity_waits = q.num_drain_capacity_waits();
     outcome.grants_sent = q.num_grants_sent();
@@ -91,7 +91,7 @@ TEST(FlowControlTest, indirect_alltoall_delivers_everything) {
     // slot left disarmed, which is the defect this exists to remove. They must be exactly zero, not small.
     EXPECT_EQ(outcome.overflow_capacity_waits, 0U);
     EXPECT_EQ(outcome.drain_capacity_waits, 0U);
-    EXPECT_EQ(outcome.relay_buffer_stalls, 0U);
+    EXPECT_EQ(outcome.redirect_buffer_stalls, 0U);
 }
 
 /// The A/B control: an explicit budget of 0 turns credits off and restores the blocking behaviour. It must
@@ -107,11 +107,9 @@ TEST(FlowControlTest, indirect_alltoall_without_flow_control) {
     EXPECT_EQ(outcome.pending_at_end, 0U);
 }
 
-/// A budget deliberately too small for the traffic, so that packets really are parked and really do have to
-/// wait for grants. Section 5 of notes/takeover_briefkasten_tokens.md asks for exactly this: a test that
-/// defers on purpose, because a deferred packet is the state in which termination is most likely to fire
-/// early and lose data.
-TEST(FlowControlTest, deferral_under_a_tiny_budget_still_delivers_everything) {
+/// A window small enough that packets are parked and have to wait for grants. A parked packet is the state in
+/// which termination would most likely fire early and lose data.
+TEST(FlowControlTest, parking_under_a_tiny_window_still_delivers_everything) {
     kamping::Communicator<> comm;
     briefkasten::Config conf;
     conf.local_threshold_bytes = 1024;   // 256 elements per packet
@@ -126,7 +124,7 @@ TEST(FlowControlTest, deferral_under_a_tiny_budget_still_delivers_everything) {
     EXPECT_TRUE(outcome.flow_control);
     EXPECT_EQ(global_sum(comm, outcome.received), NUM_LOCAL_ELEMENTS * comm.size());
     EXPECT_EQ(outcome.pending_at_end, 0U);
-    EXPECT_EQ(outcome.relay_buffer_stalls, 0U);
+    EXPECT_EQ(outcome.redirect_buffer_stalls, 0U);
     EXPECT_EQ(outcome.overflow_capacity_waits, 0U);
     // Grants are volume-driven, not timing-driven -- one falls due every time half a window is consumed --
     // so any run with a peer and this much traffic must have sent some. This is what proves the protocol
@@ -137,10 +135,8 @@ TEST(FlowControlTest, deferral_under_a_tiny_budget_still_delivers_everything) {
     // Parking, unlike granting, needs the sender to actually outrun its credit, and that cannot be forced
     // at 2 ranks: round(sqrt(2)) is 1, so the grid is a single column, nothing is redirected, and the
     // sender's own overflow poll refreshes its credit before it can run out. From 3 ranks up there is a
-    // redirect hop and the round trip is long enough that packets really are parked. (Even here this is a
-    // one-node approximation of the real thing; section 8 of the takeover note is blunt that local runs
-    // cannot validate this mechanism, only its correctness.)
+    // redirect hop and the round trip is long enough that packets really are parked.
     if (comm.size() >= 3) {
-        EXPECT_GT(global_sum(comm, outcome.credit_deferrals), 0U);
+        EXPECT_GT(global_sum(comm, outcome.parked_for_credit), 0U);
     }
 }

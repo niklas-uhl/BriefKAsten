@@ -353,10 +353,10 @@ public:
             << " buffered=" << global_buffer_size_ << " parked=" << parked_elements_
             << " parked_peers=" << parked_peers_.size() << " buffers=" << num_aggregation_buffers_
             << "/" << buffer_limit() << " free=" << free_aggregation_buffers_.size()
-            << " credit_deferrals=" << num_credit_deferrals_
-            << " capacity_deferrals=" << num_capacity_deferrals_
-            << " relay_buffer_stalls=" << num_redirect_buffer_stalls_
-            << " relay_overdraft=" << redirect_overdraft_
+            << " parked_for_credit=" << num_parked_for_credit_
+            << " parked_for_capacity=" << num_parked_for_capacity_
+            << " redirect_buffer_stalls=" << num_redirect_buffer_stalls_
+            << " redirect_overdraft=" << redirect_overdraft_
             << " buffer_stalls=" << num_buffer_stalls_ << " sends=" << counts.send
             << " recvs=" << counts.receive << " term_calls=" << queue_.num_terminate_calls()
             << " term_drains=" << queue_.num_termination_drains()
@@ -711,43 +711,38 @@ public:
     }
 
     /// Packets parked because no request slot was free.
-    [[nodiscard]] std::size_t num_capacity_deferrals() const {
-        return num_capacity_deferrals_;
+    [[nodiscard]] std::size_t num_parked_for_capacity() const {
+        return num_parked_for_capacity_;
     }
 
     /// Packets parked because the receiver had not granted enough credit.
-    [[nodiscard]] std::size_t num_credit_deferrals() const {
-        return num_credit_deferrals_;
+    [[nodiscard]] std::size_t num_parked_for_credit() const {
+        return num_parked_for_credit_;
     }
 
     /// Elements currently parked.
-    [[nodiscard]] std::size_t deferred_elements() const {
+    [[nodiscard]] std::size_t parked_elements() const {
         return parked_elements_;
     }
 
     /// Redirected elements currently held for forwarding.
-    [[nodiscard]] std::size_t relay_outstanding_elements() const {
+    [[nodiscard]] std::size_t redirect_held_elements() const {
         return flow_.redirect_held();
     }
 
     /// Times the proxy had to wait for a buffer; should be zero.
-    [[nodiscard]] std::size_t num_relay_buffer_stalls() const {
+    [[nodiscard]] std::size_t num_redirect_buffer_stalls() const {
         return num_redirect_buffer_stalls_;
     }
 
-    /// Upper bound on \ref relay_overdraft, in buffers.
-    [[nodiscard]] std::size_t relay_pool_ceiling() const {
+    /// Upper bound on \ref redirect_overdraft, in buffers.
+    [[nodiscard]] std::size_t redirect_pool_ceiling() const {
         auto const packet = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
         return (flow_.redirect_high_water() / packet) + num_peers_ + 1;
     }
 
-    /// The credit window each peer holds, in elements.
-    [[nodiscard]] std::size_t flow_control_window_elements() const {
-        return flow_.window();
-    }
-
     /// Buffers the proxy allocated beyond the pool cap (the proxy never waits for a buffer).
-    [[nodiscard]] std::size_t relay_overdraft() const {
+    [[nodiscard]] std::size_t redirect_overdraft() const {
         return redirect_overdraft_;
     }
 
@@ -772,6 +767,7 @@ public:
         return flow_.enabled();
     }
 
+    /// Credit window per peer, in elements.
     [[nodiscard]] std::size_t flow_control_window() const {
         return flow_.window();
     }
@@ -835,8 +831,8 @@ public:
         num_forced_flushes_ = 0;
         num_forced_flush_elements_ = 0;
         num_drain_skips_ = 0;
-        num_credit_deferrals_ = 0;
-        num_capacity_deferrals_ = 0;
+        num_parked_for_credit_ = 0;
+        num_parked_for_capacity_ = 0;
         num_redirect_buffer_stalls_ = 0;
         flow_.reset_counters();
         queue_.reset_counters();
@@ -899,9 +895,9 @@ private:
         bool const for_redirect = redirecting_depth_ > 0;
         if (free_aggregation_buffers_.empty()) {
             if (for_redirect && num_aggregation_buffers_ >= max_num_aggregation_buffers_) {
-                KASSERT(redirect_overdraft_ < relay_pool_ceiling(),
+                KASSERT(redirect_overdraft_ < redirect_pool_ceiling(),
                         "proxy overdrew the buffer pool by " << redirect_overdraft_
-                            << " buffers, past the " << relay_pool_ceiling()
+                            << " buffers, past the " << redirect_pool_ceiling()
                             << " that credits should have bounded it to");
                 redirect_overdraft_++;
             }
@@ -1035,9 +1031,9 @@ private:
             bool const no_credit = !flow_.has_credit(receiver, elements);
             if (no_credit || !queue_.has_send_capacity()) {
                 if (no_credit) {
-                    num_credit_deferrals_++;
+                    num_parked_for_credit_++;
                 } else {
-                    num_capacity_deferrals_++;
+                    num_parked_for_capacity_++;
                 }
                 park_packet(receiver, std::move(buffer_it->second));
                 global_buffer_size_ -= pre_cleanup_buffer_size;
@@ -1330,8 +1326,8 @@ private:
     std::unordered_map<PEID, std::size_t> redirected_in_buffer_;         ///< redirected elements per filling buffer
     std::unordered_map<std::size_t, std::size_t> redirected_by_receipt_;  ///< redirected elements per in-flight send
     std::size_t redirecting_depth_ = 0;  ///< nesting depth of handlers for packets from may_redirect peers
-    std::size_t num_credit_deferrals_ = 0;
-    std::size_t num_capacity_deferrals_ = 0;
+    std::size_t num_parked_for_credit_ = 0;
+    std::size_t num_parked_for_capacity_ = 0;
     std::size_t num_redirect_buffer_stalls_ = 0;
     std::size_t redirect_overdraft_ = 0;
     std::size_t num_peers_ = 0;

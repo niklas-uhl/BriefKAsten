@@ -257,11 +257,11 @@ public:
         for (auto const& entry : peers_) {
             Peer const& st = entry.second;
             out << "\n    peer " << entry.first
-                << (st.may_redirect ? " RELAY" : " DEST ")
+                << (st.may_redirect ? " REDIRECT" : " DEST ")
                 << " total_sent=" << st.total_sent << " total_allowed=" << st.total_allowed
                 << " credit=" << (st.total_allowed - std::min(st.total_allowed, st.total_sent))
                 << " total_granted=" << st.total_granted << " total_received=" << st.total_received
-                << (st.may_redirect_known ? "" : " MAY_RELAY_UNKNOWN") << (st.grant_withheld ? " GRANT_WITHHELD" : "")
+                << (st.may_redirect_known ? "" : " MAY_REDIRECT_UNKNOWN") << (st.grant_withheld ? " GRANT_WITHHELD" : "")
                 << (st.grant_pending ? " GRANT_PENDING" : "")
                 << (st.grant_request != MPI_REQUEST_NULL ? " GRANT_INFLIGHT" : "");
         }
