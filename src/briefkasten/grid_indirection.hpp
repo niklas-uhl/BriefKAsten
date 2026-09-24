@@ -26,7 +26,6 @@
 #include <kassert/kassert.hpp>
 
 #include "./detail/definitions.hpp"
-#include "./detail/link_class.hpp"
 
 namespace briefkasten {
 
@@ -52,20 +51,13 @@ public:
         return grid_size_;
     }
 
-    /// Which obligation a link to \p peer puts on its far end; see LinkClass.
-    ///
-    /// Same column means terminal: get_proxy reaches a destination in our own column in one hop (the
-    /// natural proxy {our row, their column} is then us, and the `proxy == from_pos` branch redirects
-    /// straight to the destination), so a same-column link never carries first-hop traffic. Everything
-    /// else -- our own row, and the ragged fallback {our column, their column} -- may have to be relayed.
-    /// Symmetric, as LinkClass requires: "same column" is the same relation read from either end.
-    [[nodiscard]] LinkClass link_class(PEID peer) const {
+    /// Whether packets from \p peer may contain messages this rank has to forward: true unless \p peer is in
+    /// our own column, since a destination in the sender's column is always reached directly.
+    [[nodiscard]] bool may_relay(PEID peer) const {
         if (peer == rank()) {
-            return LinkClass::to_destination;  // not a link; never classified in anger
+            return false;
         }
-        return rank_to_grid_position(peer).column == rank_to_grid_position(rank()).column
-                   ? LinkClass::to_destination
-                   : LinkClass::to_proxy;
+        return rank_to_grid_position(peer).column != rank_to_grid_position(rank()).column;
     }
 
     /// Size of a column-group (number of rows), i.e. the second-hop fan-out: a proxy forwards within a column to every

@@ -24,7 +24,6 @@
 #include "./buffered_queue.hpp"   // IWYU pragma: keep
 #include "./detail/concepts.hpp"  // IWYU pragma: keep
 #include "./detail/definitions.hpp"
-#include "./detail/link_class.hpp"
 
 namespace briefkasten {
 template <typename T>
@@ -36,22 +35,12 @@ concept IndirectionScheme = requires(T scheme, MPI_Comm comm, PEID sender, PEID 
     // the fan-out and drive the buffering defaults (see fan_out below).
     { scheme.group_size() } -> std::convertible_to<std::size_t>;
     { scheme.num_groups() } -> std::convertible_to<std::size_t>;
-    // Which obligation a link to `receiver` puts on its far end. Must be a property of the LINK alone --
-    // not of the record travelling over it -- and both endpoints must agree on it; see detail/link_class.hpp.
-    { scheme.link_class(receiver) } -> std::same_as<LinkClass>;
+    // Whether packets from `sender` may contain messages this rank has to forward.
+    { scheme.may_relay(sender) } -> std::same_as<bool>;
 };
 
-/// Routes every message over at most two hops of \p Indirector, using a SINGLE underlying queue.
-///
-/// ONE QUEUE, NOT TWO, and that is what makes it safe for a relay to forward from inside a receive
-/// handler: the relay posts back into the same queue it is being polled from, so there is no sibling
-/// queue left to starve while this one blocks. The price is that every loop in BufferedMessageQueue which
-/// can poll must treat `aggregation_buffers_` as mutable underneath it; see the re-entrancy notes there.
-///
-/// One queue also means a peer has exactly one link, and that link exactly one class (see
-/// detail/link_class.hpp) -- which is what makes a single credit counter per peer sufficient.
-///
-/// The relay still blocks on send capacity here. Not blocking is what the flow controller is for.
+/// Routes every message over at most two hops of \p Indirector. Both hops use the same underlying queue: a
+/// relay forwards from inside the receive handler by posting back into it.
 template <IndirectionScheme Indirector, typename BufferedQueueType>
 class IndirectionAdapter {
 private:
@@ -63,22 +52,12 @@ private:
 public:
     IndirectionAdapter(BufferedQueueType queue, Indirector indirector)
         : queue_(std::move(queue)), indirection_(std::move(indirector)) {
-        // The queue was built and moved in by the caller, sized for a fan-out of p (every rank a potential
-        // destination). Resize it to what indirection actually bounds the distinct destinations to: the
-        // peers in our row (one proxy per column) plus the peers in our column (the relay hop's receivers),
-        // which is O(sqrt p) for a square grid.
+        // the queue was sized for a fan-out of p; resize it for the O(sqrt p) peers of the grid
         auto cfg = apply_fan_out_defaults(queue_.config(), fan_out(indirection_));
         queue_.max_num_aggregation_buffers(cfg.max_num_aggregation_buffers.value());
         queue_.send_backlog_capacity(cfg.send_backlog_capacity.value());
-        // One buffer and one class per peer. The queue caches this, so the scheme is consulted once per
-        // peer rather than once per message.
-        queue_.link_classifier([this](PEID peer) { return indirection_.link_class(peer); });
-        // NOT the switch that turns flow control on -- the queue's own constructor already did that, for
-        // every queue, flat or not. This RE-RATIONS it to indirection's fan_out peers instead of p, and,
-        // because it re-runs the backlog rule, resets the backlog the line above set to fan_out back to 0,
-        // which is the shipped value. An explicit window of 0 turns flow control off everywhere: the call
-        // returns immediately and the fan_out sizing above is what stands -- the pre-credit shape, and the
-        // A/B control.
+        queue_.set_may_relay([this](PEID peer) { return indirection_.may_relay(peer); });
+        // re-configure flow control (already enabled by the queue) for the smaller peer count
         auto const window = queue_.config().credit_window_packets.value_or(DEFAULT_CREDIT_WINDOW_PACKETS);
         auto const buffers = queue_.config().buffers_per_peer.value_or(DEFAULT_BUFFERS_PER_PEER);
         queue_.enable_flow_control(window, buffers, fan_out(indirection_));
