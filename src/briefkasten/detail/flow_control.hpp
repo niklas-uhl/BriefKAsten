@@ -51,10 +51,23 @@ namespace internal {
 /// winners included, sat pinned at its cap (128, 512, 1024, 4096, 16384), and the correct constant is both
 /// family- and p-dependent. Credits replace the constant with an agreement.
 ///
-/// UNIT: ELEMENTS, not packets. Termination drains send *partial* packets, and the selective drain exists
-/// precisely because they do, so a packet is not a fixed quantity of anything and a packet-denominated
-/// credit is not conserved. Elements here are buffer elements -- the same unit as buffer.size(),
-/// global_buffer_size_ and MessageCounter::pending -- so all four accountings agree.
+/// UNIT: ELEMENTS, not packets, and the relay is what forces it. Forwarded payload is re-aggregated --
+/// IndirectionAdapter posts it back into this same queue, where it merges into the next hop's buffer
+/// alongside this rank's own application payload (which is why relayed_in_buffer_ has to count ELEMENTS
+/// of a filling buffer, not packets). So packets are not conserved across a hop: several arrivals can
+/// leave in one packet and one arrival can leave in several. Payload is conserved, so the reserve that
+/// reserve-on-grant has to set aside can only be denominated in payload.
+///
+/// Secondarily, a packet is not a fixed quantity anyway -- termination drains flush partial packets, and
+/// the selective drain exists precisely because they do. Elements here are buffer elements, the same unit
+/// as buffer.size(), global_buffer_size_ and MessageCounter::pending, so all four accountings agree.
+///
+/// WHAT THIS DOES NOT BOUND: the number of MESSAGES in flight towards a peer, which is what drives the
+/// receiver's UMQ/PRQ matching cost. A window of w packets' worth of payload is w messages only while
+/// packets are full; partial ones make it more. That is a steady-state argument, not a guarantee --
+/// buffers are flushed at the threshold, and the drain that produces partial packets now runs fused into
+/// prepare_and_count. A hard bound would need a second per-peer cap on outstanding packets; it does not
+/// trade against this one.
 ///
 /// THE PROTOCOL, per peer:
 ///   - the sender tracks `sent` (cumulative elements handed to MPI) against `limit` (cumulative elements

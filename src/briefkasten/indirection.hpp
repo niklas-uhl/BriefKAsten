@@ -43,28 +43,15 @@ concept IndirectionScheme = requires(T scheme, MPI_Comm comm, PEID sender, PEID 
 
 /// Routes every message over at most two hops of \p Indirector, using a SINGLE underlying queue.
 ///
-/// ONE QUEUE, NOT TWO. Until 2026-09-18 this class ran two BufferedMessageQueues on two communicators, one
-/// per hop, and a relay forwarded from inside the first hop's receive handler by blocking on the second
-/// hop's send capacity. That shape is what produced the async-grid stall: a persistent receive is re-armed
-/// only after its handler returns, so a relay blocked inside the handler stopped accepting from its row
-/// entirely (4.09M fully deaf polls per iteration on rmat p=768). See notes/takeover_briefkasten_tokens.md.
+/// ONE QUEUE, NOT TWO, and that is what makes it safe for a relay to forward from inside a receive
+/// handler: the relay posts back into the same queue it is being polled from, so there is no sibling
+/// queue left to starve while this one blocks. The price is that every loop in BufferedMessageQueue which
+/// can poll must treat `aggregation_buffers_` as mutable underneath it; see the re-entrancy notes there.
 ///
-/// Collapsing to one queue deletes, rather than fixes, most of the machinery that grew around that shape:
-/// the second communicator, the fused sibling-hop termination (two sequential per-hop terminations
-/// deadlock, so the second hop's counts had to be folded into the first hop's counting round via
-/// `additional_counts`), the second hop's forced flushes, the `relay_drains_first_hop` progress hook, and
-/// the frame chain `hop2 resolve_overflow_blocking -> progress_hook -> first_hop.poll ->
-/// redirection_handler`. It also removes the one blocking loop that never took a progress hook at all
-/// (MessageQueue::poll_until_no_outstanding_sends, which polled hop 1 only): with a single queue there is
-/// no sibling left to starve.
+/// One queue also means a peer has exactly one link, and that link exactly one class (see
+/// detail/link_class.hpp) -- which is what makes a single credit counter per peer sufficient.
 ///
-/// What makes one queue safe -- and what made it unsafe before -- is that a relay now posts back into the
-/// same queue it is being polled from. Every loop in BufferedMessageQueue that can poll therefore treats
-/// `aggregation_buffers_` as mutable underneath it; see the re-entrancy notes there.
-///
-/// The relay still blocks on send capacity here. Not blocking is what the flow controller is for; this
-/// class is what makes a single credit counter per peer sufficient, because with one queue a peer has
-/// exactly one link and that link has exactly one class (see detail/link_class.hpp).
+/// The relay still blocks on send capacity here. Not blocking is what the flow controller is for.
 template <IndirectionScheme Indirector, typename BufferedQueueType>
 class IndirectionAdapter {
 private:
@@ -79,17 +66,19 @@ public:
         // The queue was built and moved in by the caller, sized for a fan-out of p (every rank a potential
         // destination). Resize it to what indirection actually bounds the distinct destinations to: the
         // peers in our row (one proxy per column) plus the peers in our column (the relay hop's receivers),
-        // which is O(sqrt p) for a square grid. Both hops now share this one queue, so this is a single
-        // fan-out rather than the two per-hop ones the split version derived.
+        // which is O(sqrt p) for a square grid.
         auto cfg = apply_fan_out_defaults(queue_.config(), fan_out(indirection_));
         queue_.max_num_aggregation_buffers(cfg.max_num_aggregation_buffers.value());
         queue_.send_backlog_capacity(cfg.send_backlog_capacity.value());
         // One buffer and one class per peer. The queue caches this, so the scheme is consulted once per
         // peer rather than once per message.
         queue_.link_classifier([this](PEID peer) { return indirection_.link_class(peer); });
-        // Flow control defaults ON here and only here. This is the class that relays, and relaying is what
-        // makes a blocked send block a receive handler; a flat queue's handler is terminal and cannot
-        // block. An explicit budget of 0 in the config turns it off, which is the A/B control.
+        // NOT the switch that turns flow control on -- the queue's own constructor already did that, for
+        // every queue, flat or not. This RE-RATIONS it to indirection's fan_out peers instead of p, and,
+        // because it re-runs the backlog rule, resets the backlog the line above set to fan_out back to 0,
+        // which is the shipped value. An explicit window of 0 turns flow control off everywhere: the call
+        // returns immediately and the fan_out sizing above is what stands -- the pre-credit shape, and the
+        // A/B control.
         auto const window = queue_.config().credit_window_packets.value_or(DEFAULT_CREDIT_WINDOW_PACKETS);
         auto const buffers = queue_.config().buffers_per_peer.value_or(DEFAULT_BUFFERS_PER_PEER);
         queue_.enable_flow_control(window, buffers, fan_out(indirection_));

@@ -45,15 +45,13 @@
 #include "./detail/link_class.hpp"
 #include "./detail/queue.hpp"
 
-/// Compiled in only with BRIEFKASTEN_STALL_TRACE (cmake: -DBRIEFKASTEN_STALL_TRACE=ON). Off by
-/// default so that no diagnostic scaffolding sits in the hot path of a production build, and so that a
-/// stray environment variable cannot enable it there.
+/// Compiled in only with BRIEFKASTEN_STALL_TRACE (cmake: -DBRIEFKASTEN_STALL_TRACE=ON). Off by default
+/// so that no diagnostic scaffolding sits in the hot path of a production build, and so that a stray
+/// environment variable cannot enable it there.
 ///
-/// WORTH KNOWING BEFORE YOU NEED IT: with this off, diagnosing a stall costs a rebuild and a requeue.
-/// That loop is what the tracer was built to avoid -- phase-end counters are useless against a stall,
-/// because the phase never ends -- and it found every bug in the flow-control work. If a run hangs,
-/// rebuild with -DBRIEFKASTEN_STALL_TRACE=ON and set BRIEFKASTEN_STALL_TRACE_SECONDS=5 before doing
-/// anything else. See notes/flow-control-findings.md in KaCCv2.
+/// IF A RUN HANGS, this is the first thing to reach for -- phase-end counters are useless against a
+/// stall, because the phase never ends. Rebuild with -DBRIEFKASTEN_STALL_TRACE=ON and set
+/// BRIEFKASTEN_STALL_TRACE_SECONDS=5. See notes/flow-control-findings.md in KaCCv2.
 #ifdef BRIEFKASTEN_STALL_TRACE
 #define BRIEFKASTEN_STALL_TRACE_TICK() stall_trace_tick()
 #else
@@ -72,26 +70,19 @@ static constexpr std::size_t DEFAULT_BUFFER_THRESHOLD = 32ULL * 1024;
 static constexpr std::size_t DEFAULT_CREDIT_WINDOW_PACKETS = 8;
 /// Aggregation buffers per peer: the pool cap is this times the peer count, plus the request slots.
 ///
-/// 2 = one filling buffer per destination plus one parked, i.e. twice the measured working set.
+/// 2 = one filling buffer per destination plus one parked, i.e. twice the measured working set. Peak
+/// allocation is almost exactly ONE buffer per peer everywhere -- 55 of 56 peers at p=768, 110 of 111 at
+/// p=3072, and 12,286 of 12,288 on a flat queue at p=12288 -- and the application never once hit the cap
+/// (buffer_stalls = 0 on every arm of every sweep). 1 is the true floor, and is not shipped because the
+/// first parked packet would then block the application.
 ///
-/// MEASURED. Peak allocation is almost exactly ONE buffer per peer, everywhere: 55 of 56 peers at
-/// p=768, 110 of 111 at p=3072, and -- the same law with a different peer count -- 12,286 of 12,288 on
-/// a FLAT queue at p=12288. The application never once hit the cap (buffer_stalls = 0 on every arm of
-/// every sweep), and raising the coefficient to 9 left the working set unchanged at 10% utilisation.
-/// So the pool was 3x oversized and 2x is still double the headroom anything has ever used. 1 is the
-/// true floor -- the filling set itself -- and is not shipped, because the first parked packet would
-/// then block the application.
-///
-/// It also makes the rule UNIFORM. A flat queue's existing default was 2*p + slots, so a flat and an
-/// indirected queue now size their pools by the same expression; only the peer count differs, p against
-/// O(sqrt p). That is the whole of what indirection changes here, and it is worth a number: at
+/// The rule is the same flat or indirected and only the peer count differs, p against O(sqrt p): at
 /// p=12288 a flat queue allocates 12,286 buffers against an indirected one's 221.
 ///
-/// NOT a per-peer reservation. The pool is shared and nothing tracks per-peer usage, so a hot
-/// destination takes many buffers and a quiet one none. It is an aggregate cap with a per-peer scaling
-/// coefficient, and the scaling is justified by UNIFORM traffic, where every peer is active at once.
-/// Skew (rmat) concentrates on a few destinations and the shared pool absorbs it -- measured as 0.9
-/// buffers per peer on rmat against 1.0 on gnm.
+/// NOT a per-peer reservation. The pool is shared and nothing tracks per-peer usage, so a hot destination
+/// takes many buffers and a quiet one none -- an aggregate cap with a per-peer scaling coefficient. The
+/// scaling is justified by UNIFORM traffic, where every peer is active at once; skew (rmat) concentrates
+/// on a few destinations and the shared pool absorbs it (0.9 buffers per peer on rmat against 1.0 on gnm).
 static constexpr std::size_t DEFAULT_BUFFERS_PER_PEER = 2;
 
 enum class FlushStrategy : std::uint8_t { local, global, random, largest };
@@ -122,27 +113,26 @@ struct Config {
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
-/// destinations, leaving any field that was set explicitly (i.e. differs from Config{}) untouched.
+/// destinations, leaving any field that was set explicitly untouched.
 ///
-/// Sizes for double buffering so a destination never stalls on a premature flush:
+/// THIS IS THE NO-CREDITS SHAPE. With flow control on -- the default, flat or indirected --
+/// enable_flow_control overrides both fields below: the backlog goes to 0 and the pool is re-derived per
+/// peer. What is computed here survives only when the credit window is an explicit 0.
+///
 ///   send_backlog_capacity       = fan_out   (absorbs up to fan_out concurrent flushes without blocking)
 ///   max_num_aggregation_buffers = send_backlog_capacity + fan_out + num_request_slots
 ///                               = backlog + fan_out (filling) + num_request_slots (in flight)
 ///
-/// The buffer pool is derived from the *backlog*, not from fan_out a second time, because a backlogged
-/// send owns its aggregation buffer until it is actually posted. Sizing the pool at 2*fan_out while the
-/// caller raised send_backlog_capacity leaves the backlog unreachable: the pool runs dry first, so every
-/// wait for send capacity simply becomes a buffer stall at an unchanged total in-flight capacity, and the
-/// knob looks inert. Observed directly in relay-backpressure_26_09_15 (rmat n18 p76: 375,806 capacity
-/// waits -> 375,786 buffer stalls, runtime unchanged to the millisecond).
+/// The pool is derived from the *backlog*, not from fan_out a second time, because a backlogged send owns
+/// its aggregation buffer until it is actually posted. Size the pool at 2*fan_out while the caller raised
+/// the backlog and the backlog becomes unreachable: the pool runs dry first, so every wait for send
+/// capacity simply becomes a buffer stall at an unchanged total in-flight capacity, and the knob looks
+/// inert (rmat n18 p76: 375,806 capacity waits -> 375,786 buffer stalls, runtime unchanged).
 ///
-/// At the default (send_backlog_capacity == fan_out) this is exactly the old 2*fan_out + num_request_slots,
-/// so nothing changes unless the caller sets the backlog explicitly.
-///
-/// Buffers are allocated lazily, so sparse workloads pay only for their active destinations.
-/// For large fan_out, startup overhead (MPI connection setup, NIC resources) grows with the number
-/// of distinct partners — buffer sizing cannot address that. Use IndirectionAdapter to reduce live
-/// partners to O(sqrt(p)) when startup overhead dominates.
+/// Buffers are allocated lazily, so sparse workloads pay only for their active destinations. For large
+/// fan_out, startup overhead (MPI connection setup, NIC resources) grows with the number of distinct
+/// partners — buffer sizing cannot address that. Use IndirectionAdapter to reduce live partners to
+/// O(sqrt(p)) when startup overhead dominates.
 inline Config apply_fan_out_defaults(Config config, std::size_t fan_out) {
     if (!config.send_backlog_capacity) {
         config.send_backlog_capacity = fan_out;
@@ -195,17 +185,17 @@ public:
             stall_trace_last_ = std::chrono::steady_clock::now();
         }
 #endif
-        // ON BY DEFAULT, flat or not. A flat queue never relays, so it cannot suffer the defect credits
-        // were built for -- a handler blocking and going deaf -- but it spins in the application's own
-        // post path instead, and credits replace that too: measured 3.3-5.4M overflow_capacity_waits
-        // per phase at p=768..3072 on a flat queue, against EXACTLY ZERO with credits, and worth
-        // 2.11x -> 1.31x on gnm and 1.45x -> 0.91x on rmat at p=3072 (flow-control-uniform_26_09_18).
+        // ON BY DEFAULT, FLAT OR NOT. A flat queue never relays, so it cannot go deaf the way a relay
+        // can, but it spins in the application's own post path instead and credits replace that too:
+        // 3.3-5.4M overflow_capacity_waits per phase at p=768..3072 without credits, against exactly
+        // zero with them, worth 2.11x -> 1.31x on gnm and 1.45x -> 0.91x on rmat at p=3072.
         //
-        // The peer count is the only thing that differs: p here, O(sqrt p) under IndirectionAdapter,
-        // which re-rations on top of this. That is the point -- one mechanism, one buffer rule, and
-        // indirection as a parameter rather than a special case.
+        // WHERE IT IS NOT A WIN: above p=6144 on gnm credits cost the flat path (2.23x -> 2.51x at 6144,
+        // 7.85x -> 9.82x at 12288). That is a regime where a flat queue is the wrong mode anyway --
+        // indirection wins by 2-5x there -- so the default is chosen for the range where flat is right.
         //
-        // An explicit 0 still turns it off everywhere, which is the A/B control.
+        // IndirectionAdapter re-rations this with its own peer count; the mechanism is identical and only
+        // p against O(sqrt p) differs. An explicit window of 0 turns it off everywhere (the A/B control).
         if (effective_config_.credit_window_packets.value_or(DEFAULT_CREDIT_WINDOW_PACKETS) > 0) {
             int comm_size = 0;
             MPI_Comm_size(comm, &comm_size);
@@ -219,37 +209,32 @@ public:
     /// Give each of \p num_peers peers a credit window of \p window_packets, and cap the buffer pool at
     /// \p buffers_per_peer per peer.
     ///
-    /// TWO NUMBERS, TWO DIFFERENT JOBS, and they do not trade against each other -- measured:
+    /// TWO NUMBERS, TWO DIFFERENT JOBS, and they do not trade against each other:
     ///
     ///   window_packets     PROTOCOL. What each peer may have in flight towards us, and so (every rank
-    ///                      running the same config) what we may have in flight towards it. Must be
-    ///                      identical on every rank, because the initial windows are implicit and
-    ///                      unexchanged. Sets how fast the wire moves: after a window we wait for a grant.
+    ///                      running the same config) what we may have in flight towards it. MUST be
+    ///                      identical on every rank -- the initial windows are implicit and unexchanged.
+    ///                      Sets how fast the wire moves: after a window we wait for a grant.
     ///   buffers_per_peer   LOCAL. The pool cap, which is what the application blocks against. Purely a
     ///                      memory policy; a rank could pick its own and nothing would break.
     ///
-    /// The 2x2 sweep (w in {2,8} x buffers in {3,9}, p=384..3072, rmat and gnm) showed credit deferrals
-    /// per send are a pure function of w -- identical to three decimals across the buffer counts -- and
-    /// that a larger pool neither rescues a small window nor improves a healthy one. So parking cannot
-    /// substitute for credit, which is what the design says: parking does not make a peer accept faster.
+    /// Measured over w in {2,8} x buffers in {3,9}, p=384..3072, rmat and gnm: credit deferrals per send
+    /// are a pure function of w, and a larger pool neither rescues a small window nor improves a healthy
+    /// one. Parking cannot substitute for credit -- it does not make a peer accept faster.
     ///
-    /// WHAT IS BOUNDED, AND BY WHAT. These are different quantities and conflating them overstates the
-    /// footprint by 4x, which an earlier version of this comment did:
+    /// WHAT IS BOUNDED, AND BY WHAT. Two different quantities; conflating them overstates the footprint:
     ///
-    ///     pool cap (enforced)   = buffers_per_peer * peers + request slots      2.6 MiB at p=12288
-    ///     worst-case ceiling    = (buffers_per_peer + window + 1) * peers       10.4 MiB at p=12288
-    ///     measured              = at the cap on MultiStep reachability; relay_overdraft 0 there
+    ///     pool cap (enforced)   = buffers_per_peer * num_peers + request slots
+    ///     worst-case ceiling    = (buffers_per_peer + window_packets + 1) * num_peers
     ///
-    /// THAT LAST LINE IS PER-WORKLOAD, NOT UNIVERSAL -- it read "relay_overdraft was 0 on every arm
-    /// of every sweep" until 2026-09-18, when standalone label propagation on rmat became the first
-    /// workload to draw on the overdraft at all (KaCCv2 coloring-mode-rederive_26_09_18: 2.5x fan_out
-    /// allocated, overdraft 32/732/106 at p=1536/6144/12288). That is the mechanism working, not a
-    /// leak -- it stayed far under relay_pool_ceiling() and num_relay_buffer_stalls stayed 0 -- but
-    /// the calibration above was done on reachability, where the per-peer traffic is far less skewed.
-    /// Skewed degree makes relay peers hot enough to need the growth the overdraft exists to provide.
+    /// Both linear in num_peers, which is the requirement. The ceiling is what credits would permit if a
+    /// relay held everything it had granted at once, and has never been approached.
     ///
-    /// The ceiling is what credits would permit if a relay were holding everything it had granted at
-    /// once. It has never been approached. Both are linear in the peer count, which is the requirement.
+    /// The relay OVERDRAWS the pool cap rather than blocking. Calibrate that on a SKEWED workload: the
+    /// draw was zero on every reachability sweep, and standalone label propagation on rmat is the first
+    /// thing to use it at all (overdraft 32/732/106 at p=1536/6144/12288, still far under
+    /// relay_pool_ceiling(), with num_relay_buffer_stalls at 0). Skewed degree makes relay peers hot
+    /// enough to need the growth the overdraft exists to provide.
     void enable_flow_control(std::size_t window_packets, std::size_t buffers_per_peer,
                              std::size_t num_peers) {
         if (window_packets == 0) {
@@ -258,12 +243,12 @@ public:
         num_peers_ = num_peers;
         auto const packet_elements = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
         flow_.configure(window_packets * packet_elements, num_peers);
-        // THE SEND BACKLOG IS 0, where MessageQueue started before apply_fan_out_defaults raised it to
-        // fan_out during the bug hunt. At 0, has_send_capacity() is just "is a request slot free":
-        // plain double buffering, with everything else waiting in its destination's deferred queue.
-        // That is the right waiting room -- the Sender's backlog is a single FIFO, so a packet for a
-        // slow destination head-of-line blocks every packet behind it regardless of where they are
-        // going, which is the structure credits exist to replace.
+        // THE SEND BACKLOG IS 0 under credits, overriding the fan_out that apply_fan_out_defaults
+        // derived. At 0, has_send_capacity() is just "is a request slot free": plain double buffering,
+        // with everything else waiting in its destination's deferred queue. That is the right waiting
+        // room -- the Sender's backlog is a single FIFO, so a packet for a slow destination head-of-line
+        // blocks every packet behind it regardless of where they are going, which is exactly the
+        // structure credits exist to replace. An explicit backlog from the caller still wins.
         if (!user_config_.send_backlog_capacity) {
             queue_.set_send_backlog_capacity(0);
         }
@@ -956,34 +941,29 @@ public:
     /// Waits inside \ref resolve_overflow_blocking, i.e. the *steady-state* post path: an aggregation
     /// buffer filled up and the flush that must precede the merge could not get send capacity.
     ///
-    /// Under a single-queue IndirectionAdapter this is where the relay's blocking shows up: the relay
-    /// handler reaches it through post_message_blocking(direct_send=true). It no longer separates the relay
-    /// from the application the way the two-hop split did (both now report into one counter); what the
-    /// stall investigation needed that split for is instead answered by the flow controller's own
-    /// counters. See notes/takeover_briefkasten_tokens.md.
+    /// Under IndirectionAdapter the relay's own blocking lands in this same counter -- it reaches the path
+    /// through post_message_blocking(direct_send=true) -- so this does not separate relay traffic from
+    /// application traffic. The flow controller's own counters are what distinguish them.
     [[nodiscard]] std::size_t num_overflow_capacity_waits() const {
         return num_overflow_capacity_waits_;
     }
 
-    /// Packets parked because no request slot was free, rather than because the peer had granted no
-    /// room.
+    /// Packets parked because no request slot was free, rather than because the peer had granted no room.
     ///
     /// EXPECTED TO BE LARGE, and that is not a fault. Under flow control the send backlog is 0, so a
-    /// packet goes out only when one of the request slots is free and everything else waits in its
-    /// destination's deferred queue -- which is the designed waiting room, because it is per
-    /// destination and credit-aware, unlike the Sender's single FIFO. Parking is cheap: the budget
-    /// sweep showed that eliminating deferral entirely bought ~5%.
+    /// packet goes out only when a request slot is free and everything else waits in its destination's
+    /// deferred queue -- the designed waiting room, because it is per destination and credit-aware,
+    /// unlike the Sender's single FIFO. Parking is cheap: eliminating deferral entirely bought ~5%.
     ///
-    /// Read it against \ref num_credit_deferrals, which is the one that says the peer is the
-    /// constraint, and against peak_send_backlog, which should now be 0.
+    /// Read it against \ref num_credit_deferrals (the peer is the constraint) and against
+    /// peak_send_backlog, which should be 0.
     [[nodiscard]] std::size_t num_capacity_deferrals() const {
         return num_capacity_deferrals_;
     }
 
-    /// Payload parked because its destination had granted no room. The
-    /// number to read against runtime: it is what the protocol costs, where \ref num_send_capacity_waits
-    /// was what having no protocol cost. A deferral is cheap -- it is a move and a poll away from being
-    /// sent -- whereas a capacity wait was a spin inside a receive handler.
+    /// Payload parked because its destination had granted no room: what the protocol costs. Read it
+    /// against \ref num_capacity_deferrals, which says the request pool rather than the peer is the
+    /// constraint. A deferral is cheap -- a move and a poll away from being sent.
     [[nodiscard]] std::size_t num_credit_deferrals() const {
         return num_credit_deferrals_;
     }
