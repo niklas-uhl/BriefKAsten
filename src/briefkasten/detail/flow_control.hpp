@@ -61,7 +61,6 @@ public:
         // receive side
         std::size_t total_received = 0;
         std::size_t total_granted = 0;
-        std::size_t window = 0;
         // grant transport
         MPI_Request grant_request = MPI_REQUEST_NULL;
         std::uint64_t grant_value = 0;  ///< send buffer of grant_request
@@ -151,7 +150,7 @@ public:
         if (elements <= credit) {
             return true;
         }
-        if (credit > 0 && elements > state.window) {
+        if (credit > 0 && elements > window_) {
             num_oversize_passes_++;
             return true;
         }
@@ -262,7 +261,6 @@ public:
                 << " total_sent=" << st.total_sent << " total_allowed=" << st.total_allowed
                 << " credit=" << (st.total_allowed - std::min(st.total_allowed, st.total_sent))
                 << " total_granted=" << st.total_granted << " total_received=" << st.total_received
-                << " window=" << st.window
                 << (st.may_relay_known ? "" : " MAY_RELAY_UNKNOWN") << (st.grant_withheld ? " GRANT_WITHHELD" : "")
                 << (st.grant_pending ? " GRANT_PENDING" : "")
                 << (st.grant_request != MPI_REQUEST_NULL ? " GRANT_INFLIGHT" : "");
@@ -283,7 +281,6 @@ private:
         }
         // implicit initial window, identical on both ends
         Peer fresh;
-        fresh.window = window_;
         fresh.total_allowed = window_;
         fresh.total_granted = window_;
         return peers_.emplace(peer, fresh).first->second;
@@ -292,7 +289,7 @@ private:
     /// Grant once at least half the window has freed up. On a relay link, withhold the grant while the
     /// relay reserve is full; release_relayed() retries it.
     void grant_if_due(PEID peer, Peer& state) {
-        auto const new_total_granted = state.total_received + state.window;
+        auto const new_total_granted = state.total_received + window_;
         if (new_total_granted <= state.total_granted) {
             return;
         }
@@ -306,8 +303,7 @@ private:
             return;
         }
         auto const freed = new_total_granted - state.total_granted;
-        bool blocked = state.total_granted <= state.total_received;
-        if (!blocked && freed * 2 < state.window) {
+        if (freed * 2 < window_) {
             return;
         }
         if (state.may_relay) {
