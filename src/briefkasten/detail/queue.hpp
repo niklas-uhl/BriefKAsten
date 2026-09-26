@@ -211,7 +211,7 @@ public:
                 return false;
             }
             // additional_counts() contributes the caller's own not-yet-handed-to-MPI payload (BufferedMessageQueue's
-            // aggregation buffers) to the counting round. It used to also fold a sibling queue's packet counts in, back
+            // aggregation buffers) to the counting round. It used to also fold a sibling queue's buffer counts in, back
             // when IndirectionAdapter ran one queue per hop; that is gone with the two-hop collapse.
             termination_.start_message_counting(additional_counts());
             // poll at least once, so we don't miss any messages

@@ -36,10 +36,10 @@
 
 namespace briefkasten::internal {
 
-/// @brief Credit-based flow control: a rank only sends a packet if the receiving peer has made room for it.
+/// @brief Credit-based flow control: a rank only sends a buffer if the receiving peer has made room for it.
 ///
-/// Per peer, all counts are totals in elements (not packets, because a proxy re-aggregates what it forwards):
-///   - sender:   may send a packet of n elements iff n <= total_allowed - total_sent.
+/// Per peer, all counts are totals in elements (not buffers, because a proxy re-aggregates what it forwards):
+///   - sender:   may send a buffer of n elements iff n <= total_allowed - total_sent.
 ///   - receiver: keeps total_granted - total_received <= window and sends a grant carrying total_granted
 ///               whenever at least half a window has freed up.
 ///
@@ -48,13 +48,13 @@ namespace briefkasten::internal {
 /// derives the same value from the config, so start-up needs no messages. Grants use their own tag and are
 /// not counted by termination detection.
 ///
-/// Redirection: packets from a may_redirect peer may contain messages this rank has to forward. To such peers it
-/// only grants while redirect_held_ + redirect_allowed_ < redirect_budget_, i.e. it never allows more than it can
-/// forward. This is what keeps the receive handler from blocking.
+/// Redirection: buffers from a may_redirect peer may contain messages this rank has to forward. To such peers it
+/// only grants while num_redirect_elements_buffered_ + num_redirect_elements_granted_ < max_num_redirect_elements,
+/// i.e. it never allows more than it can forward. This is what keeps the receive handler from blocking.
 class FlowController {
 public:
     struct Peer {
-        bool may_redirect = false;  ///< packets from this peer may contain messages we have to forward
+        bool may_redirect = false;  ///< buffers from this peer may contain messages we have to forward
         // send side
         std::size_t total_sent = 0;
         std::size_t total_allowed = 0;  ///< from the peer's latest grant
@@ -65,8 +65,14 @@ public:
         MPI_Request grant_request = MPI_REQUEST_NULL;
         std::uint64_t grant_value = 0;  ///< send buffer of grant_request
         bool grant_pending = false;     ///< a newer grant is waiting for grant_request to complete
-        bool grant_withheld = false;    ///< a grant is due, but the redirect reserve is full
+        bool grant_withheld = false;    ///< a grant is due, but the redirect limit is reached
         bool may_redirect_known = false;
+    };
+
+    /// Set by configure(), fixed afterwards.
+    struct Limits {
+        std::size_t num_window_elements = 0;        ///< credit per peer
+        std::size_t max_num_redirect_elements = 0;  ///< num_window_elements * num_peers
     };
 
     // NOLINTBEGIN(*-easily-swappable-parameters)
@@ -80,15 +86,21 @@ public:
 
     /// Leaves \p other disabled, so that its destructor does not take part in quiesce(), which is collective.
     FlowController(FlowController&& other) noexcept
-        : comm_(other.comm_), tag_(other.tag_), enabled_(other.enabled_),
+        : comm_(other.comm_),
+          tag_(other.tag_),
+          enabled_(other.enabled_),
           receive_requests_(std::move(other.receive_requests_)),
-          receive_buffers_(std::move(other.receive_buffers_)), peers_(std::move(other.peers_)),
-          pending_grants_(std::move(other.pending_grants_)), window_(other.window_),
-          redirect_budget_(other.redirect_budget_), redirect_allowed_(other.redirect_allowed_),
-          redirect_held_(other.redirect_held_),
-          withheld_grants_(std::move(other.withheld_grants_)), grants_sent_(other.grants_sent_),
-          grants_received_(other.grants_received_), num_oversize_passes_(other.num_oversize_passes_),
-           num_grants_withheld_(other.num_grants_withheld_) {
+          receive_buffers_(std::move(other.receive_buffers_)),
+          peers_(std::move(other.peers_)),
+          pending_grants_(std::move(other.pending_grants_)),
+          limits_(other.limits_),
+          num_redirect_elements_granted_(other.num_redirect_elements_granted_),
+          num_redirect_elements_buffered_(other.num_redirect_elements_buffered_),
+          withheld_grants_(std::move(other.withheld_grants_)),
+          grants_sent_(other.grants_sent_),
+          grants_received_(other.grants_received_),
+          num_oversize_passes_(other.num_oversize_passes_),
+          num_grants_withheld_(other.num_grants_withheld_) {
         other.enabled_ = false;
         other.receive_requests_.clear();
         other.receive_buffers_.clear();
@@ -111,15 +123,15 @@ public:
         }
     }
 
-    /// Give every peer a window of \p window_elements and arm the grant receives. May be called again to
+    /// Give every peer a window of \p num_window_elements and arm the grant receives. May be called again to
     /// change the peer count (IndirectionAdapter does), but only before the first message.
-    void configure(std::size_t window_elements, std::size_t num_peers) {
-        if (window_elements == 0) {
+    void configure(std::size_t num_window_elements, std::size_t num_peers) {
+        if (num_window_elements == 0) {
             return;
         }
         KASSERT(peers_.empty(), "flow control must be rationed before the first message");
-        window_ = window_elements;
-        redirect_budget_ = window_elements * std::max<std::size_t>(1, num_peers);
+        limits_.num_window_elements = num_window_elements;
+        limits_.max_num_redirect_elements = num_window_elements * std::max<std::size_t>(1, num_peers);
         if (!enabled_) {
             enabled_ = true;
             arm_receives();
@@ -130,16 +142,17 @@ public:
         return enabled_;
     }
 
-    [[nodiscard]] std::size_t window() const {
-        return window_;
+    [[nodiscard]] std::size_t num_window_elements() const {
+        return limits_.num_window_elements;
     }
 
-    /// Upper bound on redirect_held_ + redirect_allowed_: the budget, plus the one grant that reaches it.
+    /// Upper bound on num_redirect_elements_buffered_ + num_redirect_elements_granted_: the limit, plus the one grant
+    /// that reaches it.
     [[nodiscard]] std::size_t redirect_high_water() const {
-        return redirect_budget_ + window_;
+        return limits_.max_num_redirect_elements + limits_.num_window_elements;
     }
 
-    /// May a packet of \p elements elements be sent to \p peer now? A packet larger than the whole window
+    /// May a buffer of \p elements elements be sent to \p peer now? A buffer larger than the whole window
     /// is let through as soon as any credit is left, since it could otherwise never be sent.
     [[nodiscard]] bool has_credit(PEID peer, std::size_t elements) {
         if (!enabled_) {
@@ -150,7 +163,7 @@ public:
         if (elements <= credit) {
             return true;
         }
-        if (credit > 0 && elements > window_) {
+        if (credit > 0 && elements > limits_.num_window_elements) {  // does not happen in normal operation
             num_oversize_passes_++;
             return true;
         }
@@ -164,30 +177,31 @@ public:
         peer_state(peer).total_sent += elements;
     }
 
-    /// A packet of \p elements elements from \p peer has been handled; grant more if due.
+    /// A buffer of \p elements elements from \p peer has been handled; grant more if due.
     void track_receive(PEID peer, std::size_t elements) {
         if (!enabled_) {
             return;
         }
         Peer& state = peer_state(peer);
         state.total_received += elements;
-        if (state.may_redirect) {
-            // this part of the allowance now arrived and is accounted for by redirect_held_
-            redirect_allowed_ -= std::min(redirect_allowed_, elements);
+        if (state.may_redirect) {  // message from the peer may contain data that we have to forward
+            // the granted credit is used up: what we forward of it is now counted as buffered (hold_redirected)
+            num_redirect_elements_granted_ -= std::min(num_redirect_elements_granted_, elements);
         }
         grant_if_due(peer, state);
     }
 
-    /// Redirected elements were merged into an outgoing buffer and occupy the redirect reserve until sent.
+    /// Redirected elements were merged into an outgoing buffer and count as buffered until sent.
     void hold_redirected(std::size_t elements) {
-        redirect_held_ += elements;
+        num_redirect_elements_buffered_ += elements;
     }
 
-    /// Redirected elements were sent (or discarded); send the grants withheld while the reserve was full.
+    /// Redirected elements were sent (or discarded); send the grants withheld while the redirect limit was reached.
     void release_redirected(std::size_t elements) {
-        KASSERT(redirect_held_ >= elements, "redirect reserve accounting underflowed");
-        redirect_held_ -= std::min(redirect_held_, elements);
-        if (!withheld_grants_.empty() && redirect_held_ + redirect_allowed_ < redirect_budget_) {
+        KASSERT(num_redirect_elements_buffered_ >= elements, "redirect accounting underflowed");
+        num_redirect_elements_buffered_ -= std::min(num_redirect_elements_buffered_, elements);
+        if (!withheld_grants_.empty() &&
+            num_redirect_elements_buffered_ + num_redirect_elements_granted_ < limits_.max_num_redirect_elements) {
             auto withheld = std::move(withheld_grants_);
             withheld_grants_.clear();
             for (PEID peer : withheld) {
@@ -198,8 +212,8 @@ public:
         }
     }
 
-    [[nodiscard]] std::size_t redirect_held() const {
-        return redirect_held_;
+    [[nodiscard]] std::size_t num_redirect_elements_buffered() const {
+        return num_redirect_elements_buffered_;
     }
 
     /// Receive grants and send pending ones.
@@ -224,7 +238,7 @@ public:
         state.may_redirect = may_redirect;
         if (may_redirect) {
             // the implicit initial window was granted before may_redirect was known
-            redirect_allowed_ += state.total_granted - std::min(state.total_granted, state.total_received);
+            num_redirect_elements_granted_ += state.total_granted - std::min(state.total_granted, state.total_received);
         }
     }
 
@@ -247,13 +261,13 @@ public:
     /// Snapshot of all counters, for BufferedMessageQueue's stall tracer.
     [[nodiscard]] std::string describe() const {
         std::ostringstream out;
-        out << "fc{enabled=" << enabled_ << " budget=" << redirect_budget_
-            << " redirect_held=" << redirect_held_ << " redirect_allowed=" << redirect_allowed_
-            << " high_water=" << redirect_high_water() << " window=" << window_
-            << " grants_sent=" << grants_sent_
+        out << "fc{enabled=" << enabled_ << " max_redirect=" << limits_.max_num_redirect_elements
+            << " redirect_buffered=" << num_redirect_elements_buffered_
+            << " redirect_granted=" << num_redirect_elements_granted_ << " high_water=" << redirect_high_water()
+            << " window=" << limits_.num_window_elements << " grants_sent=" << grants_sent_
             << " grants_received=" << grants_received_ << " withheld=" << num_grants_withheld_
             << " withheld_list=" << withheld_grants_.size() << " pending_list=" << pending_grants_.size()
-            << " oversize=" << num_oversize_passes_ <<  "}";
+            << " oversize=" << num_oversize_passes_ << "}";
         for (auto const& entry : peers_) {
             Peer const& st = entry.second;
             out << "\n    peer " << entry.first
@@ -281,20 +295,20 @@ private:
         }
         // implicit initial window, identical on both ends
         Peer fresh;
-        fresh.total_allowed = window_;
-        fresh.total_granted = window_;
+        fresh.total_allowed = limits_.num_window_elements;
+        fresh.total_granted = limits_.num_window_elements;
         return peers_.emplace(peer, fresh).first->second;
     }
 
     /// Grant once at least half the window has freed up. On a may_redirect link, withhold the grant while the
-    /// redirect reserve is full; release_redirected() retries it.
+    /// redirect limit is reached; release_redirected() retries it.
     void grant_if_due(PEID peer, Peer& state) {
-        auto const new_total_granted = state.total_received + window_;
+        auto const new_total_granted = state.total_received + limits_.num_window_elements;
         if (new_total_granted <= state.total_granted) {
             return;
         }
         if (state.may_redirect &&
-            redirect_held_ + redirect_allowed_ >= redirect_budget_) {
+            num_redirect_elements_buffered_ + num_redirect_elements_granted_ >= limits_.max_num_redirect_elements) {
             if (!state.grant_withheld) {
                 state.grant_withheld = true;
                 withheld_grants_.push_back(peer);
@@ -303,17 +317,18 @@ private:
             return;
         }
         auto const freed = new_total_granted - state.total_granted;
-        if (freed * 2 < window_) {
+        if (freed * 2 < limits_.num_window_elements) {
             return;
         }
         if (state.may_redirect) {
-            redirect_allowed_ += new_total_granted - state.total_granted;
+            num_redirect_elements_granted_ += new_total_granted - state.total_granted;
         }
         state.total_granted = new_total_granted;
         send_grant(peer, state);
-        KASSERT(redirect_held_ + redirect_allowed_ <= redirect_high_water(),
-                "redirect reserve overshot its high-water mark: held=" << redirect_held_
-                    << " allowed=" << redirect_allowed_ << " bound=" << redirect_high_water());
+        KASSERT(num_redirect_elements_buffered_ + num_redirect_elements_granted_ <= redirect_high_water(),
+                "redirect elements overshot their high-water mark: buffered="
+                    << num_redirect_elements_buffered_ << " granted=" << num_redirect_elements_granted_
+                    << " bound=" << redirect_high_water());
     }
 
     /// At most one grant per peer is in flight; a newer one waits in pending_grants_.
@@ -432,10 +447,11 @@ private:
     std::vector<MPI_Status> statuses_;
     std::unordered_map<PEID, Peer> peers_;
     std::vector<PEID> pending_grants_;
-    std::size_t window_ = 0;
-    std::size_t redirect_budget_ = 0;
-    std::size_t redirect_allowed_ = 0;  ///< granted to may_redirect peers but not yet received
-    std::size_t redirect_held_ = 0;     ///< received from may_redirect peers, merged for forwarding, not yet sent
+    Limits limits_;
+    /// granted to may_redirect peers but not yet received
+    std::size_t num_redirect_elements_granted_ = 0;
+    /// received from may_redirect peers, merged for forwarding, not yet sent
+    std::size_t num_redirect_elements_buffered_ = 0;
     std::vector<PEID> withheld_grants_;
     std::size_t grants_sent_ = 0;
     std::size_t grants_received_ = 0;

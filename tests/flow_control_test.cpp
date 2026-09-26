@@ -18,7 +18,7 @@ constexpr std::size_t NUM_LOCAL_ELEMENTS = 200'000;
 /// An all-to-all over a redirecting grid, driven to completion and checked for exact delivery.
 ///
 /// Exact delivery is the point. Redirected payload that has been received but not yet forwarded is counted as
-/// received and not as sent, so a termination protocol that looks only at the packet balance can fire while
+/// received and not as sent, so a termination protocol that looks only at the buffer balance can fire while
 /// data is still sitting in a proxy's buffer -- silent message loss, invisible at verify-level 0, and the
 /// same class of bug as the grid_alltoallv data loss. A global count that comes up short is what catches it.
 struct Outcome {
@@ -99,7 +99,7 @@ TEST(FlowControlTest, indirect_alltoall_delivers_everything) {
 TEST(FlowControlTest, indirect_alltoall_without_flow_control) {
     kamping::Communicator<> comm;
     briefkasten::Config conf;
-    conf.credit_window_packets = 0;
+    conf.num_credit_buffers = 0;
     auto outcome = run_alltoall(comm, conf);
 
     EXPECT_FALSE(outcome.flow_control);
@@ -107,16 +107,16 @@ TEST(FlowControlTest, indirect_alltoall_without_flow_control) {
     EXPECT_EQ(outcome.pending_at_end, 0U);
 }
 
-/// A window small enough that packets are parked and have to wait for grants. A parked packet is the state in
+/// A window small enough that buffers are parked and have to wait for grants. A parked buffer is the state in
 /// which termination would most likely fire early and lose data.
 TEST(FlowControlTest, parking_under_a_tiny_window_still_delivers_everything) {
     kamping::Communicator<> comm;
     briefkasten::Config conf;
-    conf.local_threshold_bytes = 1024;   // 256 elements per packet
-    conf.credit_window_packets = 2;      // two packets of credit per peer: as tight as the design allows
+    conf.local_threshold_bytes = 1024;  // 256 elements per buffer
+    conf.num_credit_buffers = 2;        // two buffers of credit per peer: as tight as the design allows
     // Deliberately no polling while posting. A sender that services its own inbox between posts keeps its
     // peers' windows fed and never starves -- which is what happened at 2 ranks, where the grid degenerates
-    // to a single column and nothing is redirected. Withholding the poll is what forces packets to be parked,
+    // to a single column and nothing is redirected. Withholding the poll is what forces buffers to be parked,
     // and it also exercises the intended backpressure: the sender ends up blocking on the buffer pool,
     // which is the one place it is still allowed to block.
     auto outcome = run_alltoall(comm, conf, /*poll_while_posting=*/false);
@@ -135,7 +135,7 @@ TEST(FlowControlTest, parking_under_a_tiny_window_still_delivers_everything) {
     // Parking, unlike granting, needs the sender to actually outrun its credit, and that cannot be forced
     // at 2 ranks: round(sqrt(2)) is 1, so the grid is a single column, nothing is redirected, and the
     // sender's own overflow poll refreshes its credit before it can run out. From 3 ranks up there is a
-    // redirect hop and the round trip is long enough that packets really are parked.
+    // redirect hop and the round trip is long enough that buffers really are parked.
     if (comm.size() >= 3) {
         EXPECT_GT(global_sum(comm, outcome.parked_for_credit), 0U);
     }

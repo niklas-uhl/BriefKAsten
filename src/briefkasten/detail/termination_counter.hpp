@@ -30,7 +30,7 @@ struct MessageCounter {
     size_t send;
     size_t receive;
     /// Elements accepted into an aggregation buffer but not yet handed to MPI. send/receive count
-    /// packets, so without this a redirected message waiting in a proxy's buffer would let
+    /// buffers, so without this a redirected message waiting in a proxy's buffer would let
     /// termination fire.
     size_t pending = 0;
     auto operator<=>(const MessageCounter&) const = default;

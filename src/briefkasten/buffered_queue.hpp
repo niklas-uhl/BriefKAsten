@@ -56,8 +56,8 @@ namespace briefkasten {
 
 static constexpr std::size_t DEFAULT_NUM_REQUEST_SLOTS = 8;
 static constexpr std::size_t DEFAULT_BUFFER_THRESHOLD = 32ULL * 1024;
-/// Credit window per peer, in packets. 8 is the smallest value that did not cost performance.
-static constexpr std::size_t DEFAULT_CREDIT_WINDOW_PACKETS = 8;
+/// Credit window per peer, in buffers. 8 is the smallest value that did not cost performance.
+static constexpr std::size_t DEFAULT_NUM_CREDIT_BUFFERS = 8;
 /// Aggregation buffers per peer (one filling, one parked). The pool is shared, not reserved per peer.
 static constexpr std::size_t DEFAULT_BUFFERS_PER_PEER = 2;
 
@@ -70,8 +70,8 @@ struct Config {
     size_t global_threshold_bytes = std::numeric_limits<size_t>::max();
     std::size_t local_threshold_bytes = DEFAULT_BUFFER_THRESHOLD;
     std::optional<std::size_t> send_backlog_capacity = std::nullopt;
-    /// Credit window per peer, in packets. nullopt: DEFAULT_CREDIT_WINDOW_PACKETS, 0: flow control off.
-    std::optional<std::size_t> credit_window_packets = std::nullopt;
+    /// Credit window per peer, in buffers. nullopt: DEFAULT_NUM_CREDIT_BUFFERS, 0: flow control off.
+    std::optional<std::size_t> num_credit_buffers = std::nullopt;
     /// Aggregation buffer pool cap = buffers_per_peer * #peers + num_request_slots (only with flow control).
     /// nullopt: DEFAULT_BUFFERS_PER_PEER.
     std::optional<std::size_t> buffers_per_peer = std::nullopt;
@@ -141,28 +141,26 @@ public:
         }
 #endif
         // flow control is on by default; IndirectionAdapter re-configures it for its smaller peer count
-        if (effective_config_.credit_window_packets.value_or(DEFAULT_CREDIT_WINDOW_PACKETS) > 0) {
+        if (effective_config_.num_credit_buffers.value_or(DEFAULT_NUM_CREDIT_BUFFERS) > 0) {
             int comm_size = 0;
             MPI_Comm_size(comm, &comm_size);
-            enable_flow_control(
-                effective_config_.credit_window_packets.value_or(DEFAULT_CREDIT_WINDOW_PACKETS),
-                effective_config_.buffers_per_peer.value_or(DEFAULT_BUFFERS_PER_PEER),
-                static_cast<std::size_t>(comm_size));
+            enable_flow_control(effective_config_.num_credit_buffers.value_or(DEFAULT_NUM_CREDIT_BUFFERS),
+                                effective_config_.buffers_per_peer.value_or(DEFAULT_BUFFERS_PER_PEER),
+                                static_cast<std::size_t>(comm_size));
         }
     }
 
-    /// Give each of \p num_peers peers a credit window of \p window_packets, and cap the buffer pool at
-    /// \p buffers_per_peer per peer. \p window_packets must be the same on every rank, since the initial
+    /// Give each of \p num_peers peers a credit window of \p num_credit_buffers buffers, and cap the buffer pool
+    /// at \p buffers_per_peer per peer. \p num_credit_buffers must be the same on every rank, since the initial
     /// windows are implicit. The proxy may exceed the pool cap instead of blocking (see acquire_buffer).
-    void enable_flow_control(std::size_t window_packets, std::size_t buffers_per_peer,
-                             std::size_t num_peers) {
-        if (window_packets == 0) {
+    void enable_flow_control(std::size_t num_credit_buffers, std::size_t buffers_per_peer, std::size_t num_peers) {
+        if (num_credit_buffers == 0) {
             return;
         }
         num_peers_ = num_peers;
-        auto const packet_elements = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
-        flow_.configure(window_packets * packet_elements, num_peers);
-        // packets wait in per-destination parking queues instead of the sender's single FIFO backlog
+        auto const buffer_size = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
+        flow_.configure(num_credit_buffers * buffer_size, num_peers);
+        // buffers wait in per-destination parking queues instead of the sender's single FIFO backlog
         if (!user_config_.send_backlog_capacity) {
             queue_.set_send_backlog_capacity(0);
         }
@@ -318,7 +316,7 @@ public:
         return result;
     }
 
-    /// Only every \p poll_skip_threshold-th call polls; this throttles grants and parked packets too.
+    /// Only every \p poll_skip_threshold-th call polls; this throttles grants and parked buffers too.
     auto poll_throttled(MessageHandler<MessageType> auto&& on_message,
                         std::size_t poll_skip_threshold = DEFAULT_POLL_SKIP_THRESHOLD)
         -> std::optional<std::pair<bool, bool>> {
@@ -368,11 +366,11 @@ public:
             << " reclaims=" << num_buffer_reclaims_ << "\n    " << flow_.describe();
         for (auto const& entry : parked_) {
             std::size_t elements = 0;
-            for (auto const& packet : entry.second) {
-                elements += packet.buffer.size();
+            for (auto const& parked : entry.second) {
+                elements += parked.buffer.size();
             }
-            out << "\n    PARKED to " << entry.first << ": " << entry.second.size() << " packets, "
-                << elements << " elements";
+            out << "\n    PARKED to " << entry.first << ": " << entry.second.size() << " buffers, " << elements
+                << " elements";
         }
         for (auto const& entry : aggregation_buffers_) {
             if (!entry.second.empty()) {
@@ -387,7 +385,7 @@ public:
 
     [[nodiscard]] bool terminate(MessageHandler<MessageType> auto&& on_message, std::invocable<> auto&& progress_hook) {
         BRIEFKASTEN_STALL_TRACE_TICK();
-        // MessageQueue::terminate polls the underlying queue only, so grants and parked packets are
+        // MessageQueue::terminate polls the underlying queue only, so grants and parked buffers are
         // progressed here
         auto drive = [&] {
             flow_.poll();
@@ -411,7 +409,7 @@ public:
             before_next_message_counting_round_hook, drive, prepare_and_count);
     }
 
-    /// Underlying packet counts plus this queue's buffered payload.
+    /// Underlying buffer counts plus this queue's buffered payload.
     [[nodiscard]] internal::MessageCounter message_counts() const {
         auto counts = queue_.message_counts();
         counts.pending += pending_elements();
@@ -593,7 +591,7 @@ public:
         return user_config_;
     }
 
-    /// Set by IndirectionAdapter from its routing scheme: whether packets from a peer may contain messages this
+    /// Set by IndirectionAdapter from its routing scheme: whether buffers from a peer may contain messages this
     /// rank has to forward. If unset (flat queue), nothing is ever redirected.
     void set_may_redirect(std::function<bool(PEID)> may_redirect) {
         may_redirect_ = std::move(may_redirect);
@@ -710,12 +708,12 @@ public:
         return num_overflow_capacity_waits_;
     }
 
-    /// Packets parked because no request slot was free.
+    /// Buffers parked because no request slot was free.
     [[nodiscard]] std::size_t num_parked_for_capacity() const {
         return num_parked_for_capacity_;
     }
 
-    /// Packets parked because the receiver had not granted enough credit.
+    /// Buffers parked because the receiver had not granted enough credit.
     [[nodiscard]] std::size_t num_parked_for_credit() const {
         return num_parked_for_credit_;
     }
@@ -726,8 +724,8 @@ public:
     }
 
     /// Redirected elements currently held for forwarding.
-    [[nodiscard]] std::size_t redirect_held_elements() const {
-        return flow_.redirect_held();
+    [[nodiscard]] std::size_t num_redirect_elements_buffered() const {
+        return flow_.num_redirect_elements_buffered();
     }
 
     /// Times the proxy had to wait for a buffer; should be zero.
@@ -737,8 +735,8 @@ public:
 
     /// Upper bound on \ref redirect_overdraft, in buffers.
     [[nodiscard]] std::size_t redirect_pool_ceiling() const {
-        auto const packet = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
-        return (flow_.redirect_high_water() / packet) + num_peers_ + 1;
+        auto const buffer_size = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
+        return (flow_.redirect_high_water() / buffer_size) + num_peers_ + 1;
     }
 
     /// Buffers the proxy allocated beyond the pool cap (the proxy never waits for a buffer).
@@ -758,7 +756,7 @@ public:
         return flow_.num_grants_received();
     }
 
-    /// Packets larger than a whole window, sent anyway (see FlowController::has_credit).
+    /// Buffers larger than a whole window, sent anyway (see FlowController::has_credit).
     [[nodiscard]] std::size_t num_oversize_passes() const {
         return flow_.num_oversize_passes();
     }
@@ -768,8 +766,8 @@ public:
     }
 
     /// Credit window per peer, in elements.
-    [[nodiscard]] std::size_t flow_control_window() const {
-        return flow_.window();
+    [[nodiscard]] std::size_t flow_control_num_window_elements() const {
+        return flow_.num_window_elements();
     }
 
     [[nodiscard]] std::size_t num_polls() const {
@@ -842,8 +840,8 @@ private:
     using BufferMap = std::unordered_map<PEID, BufferContainer>;
     using BufferList = std::vector<BufferContainer>;
 
-    /// \c redirected: how many of its elements are redirected, released from the redirect reserve once sent.
-    struct ParkedPacket {
+    /// \c redirected: how many of its elements are redirected, no longer counted as buffered once sent.
+    struct ParkedBuffer {
         BufferContainer buffer;
         std::size_t redirected = 0;
     };
@@ -1025,7 +1023,7 @@ private:
             num_forced_flushes_++;
             num_forced_flush_elements_ += elements;
         }
-        // With flow control a flush never fails: without credit or a free send slot, the packet is parked
+        // With flow control a flush never fails: without credit or a free send slot, the buffer is parked
         // and send_parked() sends it later.
         if (flow_.enabled()) {
             bool const no_credit = !flow_.has_credit(receiver, elements);
@@ -1035,7 +1033,7 @@ private:
                 } else {
                     num_parked_for_capacity_++;
                 }
-                park_packet(receiver, std::move(buffer_it->second));
+                park_buffer(receiver, std::move(buffer_it->second));
                 global_buffer_size_ -= pre_cleanup_buffer_size;
                 if (erase) {
                     return {aggregation_buffers_.erase(buffer_it), true};
@@ -1061,17 +1059,17 @@ private:
         return {++buffer_it, true};
     }
 
-    void park_packet(PEID receiver, BufferContainer&& buffer) {
+    void park_buffer(PEID receiver, BufferContainer&& buffer) {
         auto const elements = buffer.size();
         auto& queue_for_peer = parked_[receiver];
         if (queue_for_peer.empty()) {
             parked_peers_.push_back(receiver);
         }
-        queue_for_peer.push_back(ParkedPacket{.buffer = std::move(buffer), .redirected = take_redirected(receiver)});
+        queue_for_peer.push_back(ParkedBuffer{.buffer = std::move(buffer), .redirected = take_redirected(receiver)});
         parked_elements_ += elements;
     }
 
-    /// Send parked packets for which there is now credit and a free send slot.
+    /// Send parked buffers for which there is now credit and a free send slot.
     void send_parked() {
         if (parked_peers_.empty()) {
             return;
@@ -1083,14 +1081,14 @@ private:
             if (it == parked_.end()) {
                 continue;
             }
-            auto& packets = it->second;
-            while (!packets.empty()) {
-                auto const elements = packets.front().buffer.size();
+            auto& parked = it->second;
+            while (!parked.empty()) {
+                auto const elements = parked.front().buffer.size();
                 if (!flow_.has_credit(receiver, elements) || !queue_.has_send_capacity()) {
                     break;
                 }
-                auto const redirected = packets.front().redirected;
-                auto receipt = queue_.post_message(std::move(packets.front().buffer), receiver);
+                auto const redirected = parked.front().redirected;
+                auto receipt = queue_.post_message(std::move(parked.front().buffer), receiver);
                 KASSERT(receipt.has_value(), "capacity was checked, so posting must succeed");
                 flow_.track_send(receiver, elements);
                 if (redirected > 0) {
@@ -1098,9 +1096,9 @@ private:
                 }
                 num_elements_flushed_ += elements;
                 parked_elements_ -= elements;
-                packets.pop_front();
+                parked.pop_front();
             }
-            if (packets.empty()) {
+            if (parked.empty()) {
                 parked_.erase(it);
             } else {
                 parked_peers_[kept++] = receiver;
@@ -1168,13 +1166,13 @@ private:
         return true;
     }
 
-    /// Splits an arriving packet into messages and calls \p on_message on each.
+    /// Splits an arriving buffer into messages and calls \p on_message on each.
     auto split_handler(MessageHandler<MessageType> auto&& on_message) {
         return [&](Envelope<BufferType> auto buffer) {
             auto const source = buffer.sender;
             auto const posts_before = num_posts_;
             auto const elements = buffer.message.size();
-            // posts made while redirecting_depth_ > 0 are forwards and are charged to the redirect reserve
+            // posts made while redirecting_depth_ > 0 are forwards and are counted as buffered redirect elements
             bool const redirects = may_redirect(source);
             flow_.set_may_redirect(source, redirects);
             redirecting_depth_ += redirects ? 1 : 0;
@@ -1185,8 +1183,8 @@ private:
             flow_.track_receive(source, elements);
             // Handlers must not send, except for the forwarding by the proxy. Otherwise flow control can deadlock.
             KASSERT(may_redirect(source) || num_posts_ == posts_before,
-                    "posted " << (num_posts_ - posts_before)
-                              << " message(s) while handling a packet from rank " << source
+                    "posted " << (num_posts_ - posts_before) << " message(s) while handling a buffer from rank "
+                              << source
                               << ", which is not a may_redirect peer. Either the indirection scheme is wrong, or the "
                                  "application sends from inside a message handler.");
         };
@@ -1199,7 +1197,7 @@ private:
         free_aggregation_buffers_.emplace_back(std::move(buffer));
     }
 
-    /// Called when a send completed; frees its redirect reserve.
+    /// Called when a send completed; releases its redirected elements.
     auto reclaim_aggregation_buffer(std::size_t receipt, BufferContainer&& buffer) {
         num_buffer_reclaims_++;
         auto it = redirected_by_receipt_.find(receipt);
@@ -1320,12 +1318,12 @@ private:
     mutable std::unordered_map<PEID, bool> may_redirect_cache_;
 
     internal::FlowController flow_;
-    std::unordered_map<PEID, std::deque<ParkedPacket>> parked_;  ///< per destination, waiting for credit
-    std::vector<PEID> parked_peers_;                             ///< destinations with parked packets
+    std::unordered_map<PEID, std::deque<ParkedBuffer>> parked_;  ///< per destination, waiting for credit
+    std::vector<PEID> parked_peers_;                             ///< destinations with parked buffers
     std::size_t parked_elements_ = 0;
     std::unordered_map<PEID, std::size_t> redirected_in_buffer_;         ///< redirected elements per filling buffer
     std::unordered_map<std::size_t, std::size_t> redirected_by_receipt_;  ///< redirected elements per in-flight send
-    std::size_t redirecting_depth_ = 0;  ///< nesting depth of handlers for packets from may_redirect peers
+    std::size_t redirecting_depth_ = 0;  ///< nesting depth of handlers for buffers from may_redirect peers
     std::size_t num_parked_for_credit_ = 0;
     std::size_t num_parked_for_capacity_ = 0;
     std::size_t num_redirect_buffer_stalls_ = 0;

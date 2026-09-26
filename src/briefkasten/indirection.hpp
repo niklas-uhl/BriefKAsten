@@ -35,7 +35,7 @@ concept IndirectionScheme = requires(T scheme, MPI_Comm comm, PEID sender, PEID 
     // the fan-out and drive the buffering defaults (see fan_out below).
     { scheme.group_size() } -> std::convertible_to<std::size_t>;
     { scheme.num_groups() } -> std::convertible_to<std::size_t>;
-    // Whether packets from `sender` may contain messages this rank has to forward.
+    // Whether buffers from `sender` may contain messages this rank has to forward.
     { scheme.may_redirect(sender) } -> std::same_as<bool>;
 };
 
@@ -58,9 +58,9 @@ public:
         queue_.send_backlog_capacity(cfg.send_backlog_capacity.value());
         queue_.set_may_redirect([this](PEID peer) { return indirection_.may_redirect(peer); });
         // re-configure flow control (already enabled by the queue) for the smaller peer count
-        auto const window = queue_.config().credit_window_packets.value_or(DEFAULT_CREDIT_WINDOW_PACKETS);
+        auto const num_credit_buffers = queue_.config().num_credit_buffers.value_or(DEFAULT_NUM_CREDIT_BUFFERS);
         auto const buffers = queue_.config().buffers_per_peer.value_or(DEFAULT_BUFFERS_PER_PEER);
-        queue_.enable_flow_control(window, buffers, fan_out(indirection_));
+        queue_.enable_flow_control(num_credit_buffers, buffers, fan_out(indirection_));
     }
 
     /// Enable the selective termination drain; see BufferedMessageQueue::flush_all_buffers_blocking.
