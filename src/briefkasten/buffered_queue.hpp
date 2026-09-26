@@ -1174,7 +1174,7 @@ private:
             auto const elements = buffer.message.size();
             // posts made while redirecting_depth_ > 0 are forwards and are counted as buffered redirect elements
             bool const redirects = may_redirect(source);
-            flow_.set_may_redirect(source, redirects);
+            flow_.set_proxied(source, redirects);
             redirecting_depth_ += redirects ? 1 : 0;
             for (Envelope<MessageType> auto env : split(buffer.message, buffer.sender, queue_.rank())) {
                 on_message(std::move(env));
