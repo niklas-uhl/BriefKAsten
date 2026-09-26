@@ -38,6 +38,8 @@ namespace briefkasten::internal {
 
 /// @brief Credit-based flow control: a rank only sends a buffer if the receiving peer has made room for it.
 ///
+/// Directions are always seen from this rank: in/inbound = peer -> this rank, out/outbound = this rank -> peer.
+///
 /// Per peer, all counts are totals in elements (not buffers, because a proxy re-aggregates what it forwards):
 ///   - sender:   may send a buffer of n elements iff n <= out_allowed - out_sent.
 ///   - receiver: keeps in_granted - in_received <= window and sends a grant carrying in_granted
