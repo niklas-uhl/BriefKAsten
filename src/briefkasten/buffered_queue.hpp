@@ -84,9 +84,10 @@ struct Config {
     /// Aggregation buffer pool cap = buffers_per_peer * #peers + num_request_slots (only with flow control).
     /// nullopt: DEFAULT_BUFFERS_PER_PEER.
     std::optional<std::size_t> buffers_per_peer = std::nullopt;
-    /// nullopt: IdleFlush::all, except under IndirectionAdapter, which picks IdleFlush::off because relayed
-    /// payload shares the per-destination buffers and an idle flush would fragment it.
-    std::optional<IdleFlush> idle_flush = std::nullopt;
+    /// IdleFlush::all for flat and IndirectionAdapter alike: with round robin it was the best async setting for
+    /// ruler chasing on SuperMUC-NG up to 3072 cores (kascade, 2026-11-05); for the grid IdleFlush::stale tied.
+    /// IdleFlush::off gives the fullest relay packets but leaves latency-bound workloads waiting for the drain.
+    IdleFlush idle_flush = IdleFlush::all;
     /// Resume each idle flush at the destination where the previous one ran out of send slots, instead of at
     /// the start of the buffer map. Without it the same destinations go first every time and the rest only
     /// leave through the threshold or the termination drain.
@@ -149,7 +150,7 @@ public:
           split(std::move(splitter)),
           pre_send_cleanup(std::move(cleaner)),
           flush_strategy_(effective_config_.flush_strategy) {
-        idle_flush_ = effective_config_.idle_flush.value_or(IdleFlush::all);
+        idle_flush_ = effective_config_.idle_flush;
         idle_flush_round_robin_ = effective_config_.idle_flush_round_robin;
         reserve_aggregation_buffers(effective_config_.num_request_slots);
 #ifdef BRIEFKASTEN_STALL_TRACE

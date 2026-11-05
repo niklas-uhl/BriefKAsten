@@ -77,7 +77,15 @@ void check_counters(auto const& queue, briefkasten::IdleFlush mode) {
     }
 }
 
-class IdleFlushTest : public ::testing::TestWithParam<briefkasten::IdleFlush> {};
+/// Every test starts with a barrier: all queues share the world communicator, so a rank that already posts
+/// in the next test could otherwise hit a persistent receive of a slower rank's queue that is still being
+/// destroyed (the barrier at the end of a test runs before the queue's destructor).
+class IdleFlushTest : public ::testing::TestWithParam<briefkasten::IdleFlush> {
+protected:
+    void SetUp() override {
+        kamping::Communicator<>{}.barrier();
+    }
+};
 }  // namespace
 
 TEST_P(IdleFlushTest, flat_chains_complete) {
@@ -95,7 +103,7 @@ TEST_P(IdleFlushTest, grid_chains_complete) {
     briefkasten::Config conf;
     conf.idle_flush = GetParam();
     auto queue = make_grid_queue(conf, comm);
-    EXPECT_EQ(queue.idle_flush(), GetParam());  // an explicit choice survives the adapter's default
+    EXPECT_EQ(queue.idle_flush(), GetParam());
     EXPECT_EQ(run_chains(queue, comm), NUM_CHAINS * comm.size());
     check_counters(queue.queue(), GetParam());
     comm.barrier();
@@ -176,12 +184,15 @@ INSTANTIATE_TEST_SUITE_P(Modes,
                                            briefkasten::IdleFlush::all,
                                            briefkasten::IdleFlush::stale));
 
-TEST(IdleFlushDefaults, flat_flushes_all_grid_flushes_nothing) {
+TEST(IdleFlushDefaults, flat_and_grid_flush_all) {
     kamping::Communicator<> comm;
-    briefkasten::Config conf;
-    auto flat = make_flat_queue(conf);
-    EXPECT_EQ(flat.idle_flush(), briefkasten::IdleFlush::all);
-    auto grid = make_grid_queue(conf, comm);
-    EXPECT_EQ(grid.idle_flush(), briefkasten::IdleFlush::off);
+    {
+        briefkasten::Config conf;
+        auto flat = make_flat_queue(conf);
+        EXPECT_EQ(flat.idle_flush(), briefkasten::IdleFlush::all);
+        auto grid = make_grid_queue(conf, comm);
+        EXPECT_EQ(grid.idle_flush(), briefkasten::IdleFlush::all);
+    }
+    comm.barrier();  // see IdleFlushTest
 }
 // NOLINTEND(*-magic-numbers)
