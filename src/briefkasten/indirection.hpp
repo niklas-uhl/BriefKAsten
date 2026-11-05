@@ -61,6 +61,20 @@ public:
         auto const num_credit_buffers = queue_.config().num_credit_buffers.value_or(DEFAULT_NUM_CREDIT_BUFFERS);
         auto const buffers = queue_.config().buffers_per_peer.value_or(DEFAULT_BUFFERS_PER_PEER);
         queue_.enable_flow_control(num_credit_buffers, buffers, fan_out(indirection_));
+        // relayed payload shares the per-destination buffers, so an idle flush would also force out relay
+        // buffers at low fill (the fragmentation c188018 removed); callers opt in via Config::idle_flush
+        if (!queue_.config().idle_flush) {
+            queue_.idle_flush(IdleFlush::off);
+        }
+    }
+
+    /// \copydoc BufferedMessageQueue::idle_flush(IdleFlush)
+    void idle_flush(IdleFlush mode) {
+        queue_.idle_flush(mode);
+    }
+
+    [[nodiscard]] IdleFlush idle_flush() const {
+        return queue_.idle_flush();
     }
 
     /// Enable the selective termination drain; see BufferedMessageQueue::flush_all_buffers_blocking.
