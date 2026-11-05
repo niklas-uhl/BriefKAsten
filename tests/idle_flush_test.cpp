@@ -116,6 +116,48 @@ TEST_P(IdleFlushTest, grid_chains_complete_under_credit_pressure) {
     comm.barrier();
 }
 
+TEST_P(IdleFlushTest, flat_chains_complete_with_one_send_slot) {
+    // one request slot: every idle flush with more than one non-empty buffer runs out of slots and stops, so
+    // the resume point is exercised on every attempt, with and without round robin
+    for (bool round_robin : {true, false}) {
+        kamping::Communicator<> comm;
+        briefkasten::Config conf;
+        conf.idle_flush = GetParam();
+        conf.idle_flush_round_robin = round_robin;
+        conf.num_request_slots = 1;
+        auto queue = make_flat_queue(conf);
+        EXPECT_EQ(run_chains(queue, comm), NUM_CHAINS * comm.size()) << "round_robin=" << round_robin;
+        if (GetParam() == briefkasten::IdleFlush::all && comm.size() > 1) {
+            EXPECT_GT(queue.num_idle_flush_stops(), 0) << "round_robin=" << round_robin;
+        }
+        comm.barrier();
+    }
+}
+
+TEST_P(IdleFlushTest, grid_chains_complete_with_one_send_slot) {
+    for (bool round_robin : {true, false}) {
+        kamping::Communicator<> comm;
+        briefkasten::Config conf;
+        conf.idle_flush = GetParam();
+        conf.idle_flush_round_robin = round_robin;
+        conf.num_request_slots = 1;
+        auto queue = make_grid_queue(conf, comm);
+        EXPECT_EQ(run_chains(queue, comm), NUM_CHAINS * comm.size()) << "round_robin=" << round_robin;
+        comm.barrier();
+    }
+}
+
+TEST_P(IdleFlushTest, flat_chains_complete_with_send_backlog) {
+    // an explicit backlog survives flow control, so flushes queue behind the slots instead of stopping
+    kamping::Communicator<> comm;
+    briefkasten::Config conf;
+    conf.idle_flush = GetParam();
+    conf.send_backlog_capacity = comm.size();
+    auto queue = make_flat_queue(conf);
+    EXPECT_EQ(run_chains(queue, comm), NUM_CHAINS * comm.size());
+    comm.barrier();
+}
+
 TEST_P(IdleFlushTest, flat_chains_complete_without_flow_control) {
     // without credits a flush can fail for lack of a send slot; the idle flush must stop, not spin
     kamping::Communicator<> comm;

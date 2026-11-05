@@ -87,6 +87,10 @@ struct Config {
     /// nullopt: IdleFlush::all, except under IndirectionAdapter, which picks IdleFlush::off because relayed
     /// payload shares the per-destination buffers and an idle flush would fragment it.
     std::optional<IdleFlush> idle_flush = std::nullopt;
+    /// Resume each idle flush at the destination where the previous one ran out of send slots, instead of at
+    /// the start of the buffer map. Without it the same destinations go first every time and the rest only
+    /// leave through the threshold or the termination drain.
+    bool idle_flush_round_robin = true;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -146,6 +150,7 @@ public:
           pre_send_cleanup(std::move(cleaner)),
           flush_strategy_(effective_config_.flush_strategy) {
         idle_flush_ = effective_config_.idle_flush.value_or(IdleFlush::all);
+        idle_flush_round_robin_ = effective_config_.idle_flush_round_robin;
         reserve_aggregation_buffers(effective_config_.num_request_slots);
 #ifdef BRIEFKASTEN_STALL_TRACE
         if (char const* trace = std::getenv("BRIEFKASTEN_STALL_TRACE_SECONDS")) {
@@ -515,6 +520,7 @@ public:
     void idle_flush(IdleFlush mode) {
         idle_flush_ = mode;
         idle_last_size_.clear();
+        idle_resume_.reset();
     }
 
     [[nodiscard]] IdleFlush idle_flush() const {
@@ -535,10 +541,14 @@ public:
         return num_idle_flush_skips_;
     }
 
-    /// Buffers the idle flush left in place because they could not be sent right away (no credit for the
-    /// destination, or no free send slot, which ends the attempt).
+    /// Buffers the idle flush left in place because their destination had no credit.
     [[nodiscard]] std::size_t num_idle_flush_deferred() const {
         return num_idle_flush_deferred_;
+    }
+
+    /// Idle flushes that ended early because no send slot was free; the rest waits for the next attempt.
+    [[nodiscard]] std::size_t num_idle_flush_stops() const {
+        return num_idle_flush_stops_;
     }
 
     /// Buffers the selective drain declined to force out because they were still filling.
@@ -880,6 +890,7 @@ public:
         num_idle_flush_elements_ = 0;
         num_idle_flush_skips_ = 0;
         num_idle_flush_deferred_ = 0;
+        num_idle_flush_stops_ = 0;
         num_parked_for_credit_ = 0;
         num_parked_for_capacity_ = 0;
         num_redirect_buffer_stalls_ = 0;
@@ -1120,18 +1131,33 @@ private:
     /// buffers -- credits bound elements, not buffers, so the pool, and a proxy's overdraft, would grow past
     /// what the credit window accounts for.
     void flush_idle_buffers() {
-        if (idle_flush_ == IdleFlush::off) {
+        if (idle_flush_ == IdleFlush::off || aggregation_buffers_.empty()) {
             return;
         }
+        // Walk the buffer map as a ring, starting where the previous idle flush ran out of send slots. Each
+        // step either advances or erases the current entry (unordered_map::erase invalidates nothing else and
+        // never rehashes), and nothing polls, so nothing is inserted: `remaining` steps visit every entry that
+        // existed on entry exactly once.
         auto it = aggregation_buffers_.begin();
-        while (it != aggregation_buffers_.end()) {
+        if (idle_flush_round_robin_ && idle_resume_) {
+            if (auto resume = aggregation_buffers_.find(*idle_resume_); resume != aggregation_buffers_.end()) {
+                it = resume;
+            }
+        }
+        idle_resume_.reset();
+        auto advance = [&](auto next) {
+            return next == aggregation_buffers_.end() ? aggregation_buffers_.begin() : next;
+        };
+        for (std::size_t remaining = aggregation_buffers_.size(); remaining > 0; --remaining) {
             if (!queue_.has_send_capacity()) {
-                num_idle_flush_deferred_++;
-                break;  // the remaining buffers wait for the next attempt or the termination drain
+                num_idle_flush_stops_++;
+                idle_resume_ = it->first;  // the rest waits for the next attempt or the termination drain
+                return;
             }
             auto const size = it->second.size();
             if (size == 0) {
-                ++it;  // keep the entry and its pool buffer, the destination is likely to be used again
+                // keep the entry and its pool buffer, the destination is likely to be used again
+                it = advance(std::next(it));
                 continue;
             }
             if (idle_flush_ == IdleFlush::stale) {
@@ -1140,20 +1166,23 @@ private:
                 if (size > last_seen) {
                     last_seen = size;
                     num_idle_flush_skips_++;
-                    ++it;
+                    it = advance(std::next(it));
                     continue;
                 }
             }
             if (flow_.enabled() && !flow_.has_credit(it->first, size)) {
                 num_idle_flush_deferred_++;
-                ++it;
+                it = advance(std::next(it));
                 continue;
             }
             auto [next, flushed] = flush_buffer_impl(it, /*erase=*/true);
             KASSERT(flushed, "send capacity and credit were checked, so the flush must succeed");
             num_idle_flushes_++;
             num_idle_flush_elements_ += size;
-            it = next;
+            if (aggregation_buffers_.empty()) {
+                return;
+            }
+            it = advance(next);
         }
     }
 
@@ -1414,6 +1443,9 @@ private:
     std::size_t num_idle_flush_elements_ = 0;
     std::size_t num_idle_flush_skips_ = 0;
     std::size_t num_idle_flush_deferred_ = 0;
+    std::size_t num_idle_flush_stops_ = 0;
+    bool idle_flush_round_robin_ = true;
+    std::optional<PEID> idle_resume_;  ///< destination the previous idle flush stopped at (round robin)
     bool forced_flush_ = false;                              ///< set while the termination drain flushes
     std::vector<PEID> drain_targets_;                        ///< scratch for flush_all_buffers_blocking
     bool draining_ = false;
