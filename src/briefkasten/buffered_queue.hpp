@@ -63,6 +63,15 @@ static constexpr std::size_t DEFAULT_BUFFERS_PER_PEER = 2;
 
 enum class FlushStrategy : std::uint8_t { local, global, random, largest };
 
+/// What terminate() flushes on entry, i.e. whenever the caller has run out of local work, before it checks
+/// for arrivals. Independent of the termination drain, which only runs on attempts that reach a counting round.
+enum class IdleFlush : std::uint8_t {
+    off,    ///< leave partially filled buffers to the threshold and the termination drain (best packet fill)
+    all,    ///< every non-empty buffer, as in v0.2.1 (lowest latency, smallest packets)
+    stale,  ///< only buffers that did not grow since the previous terminate() call: a still-filling buffer
+            ///< waits for its threshold, a tail goes out one idle attempt later
+};
+
 struct Config {
     size_t num_request_slots = DEFAULT_NUM_REQUEST_SLOTS;
     std::optional<std::size_t> max_num_aggregation_buffers = std::nullopt;
@@ -75,6 +84,9 @@ struct Config {
     /// Aggregation buffer pool cap = buffers_per_peer * #peers + num_request_slots (only with flow control).
     /// nullopt: DEFAULT_BUFFERS_PER_PEER.
     std::optional<std::size_t> buffers_per_peer = std::nullopt;
+    /// nullopt: IdleFlush::all, except under IndirectionAdapter, which picks IdleFlush::off because relayed
+    /// payload shares the per-destination buffers and an idle flush would fragment it.
+    std::optional<IdleFlush> idle_flush = std::nullopt;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -133,6 +145,7 @@ public:
           split(std::move(splitter)),
           pre_send_cleanup(std::move(cleaner)),
           flush_strategy_(effective_config_.flush_strategy) {
+        idle_flush_ = effective_config_.idle_flush.value_or(IdleFlush::all);
         reserve_aggregation_buffers(effective_config_.num_request_slots);
 #ifdef BRIEFKASTEN_STALL_TRACE
         if (char const* trace = std::getenv("BRIEFKASTEN_STALL_TRACE_SECONDS")) {
@@ -385,6 +398,10 @@ public:
 
     [[nodiscard]] bool terminate(MessageHandler<MessageType> auto&& on_message, std::invocable<> auto&& progress_hook) {
         BRIEFKASTEN_STALL_TRACE_TICK();
+        // Ahead of every abort check: an attempt cancelled by an arrival still gets the caller's tail out.
+        // The drain below runs only on attempts that reach a counting round, which under steady traffic
+        // may be none for a long time, so without this a partially filled buffer waits for global quiet.
+        flush_idle_buffers();
         // MessageQueue::terminate polls the underlying queue only, so grants and parked buffers are
         // progressed here
         auto drive = [&] {
@@ -492,6 +509,36 @@ public:
 
     [[nodiscard]] bool selective_drain() const {
         return selective_drain_;
+    }
+
+    /// See IdleFlush. Takes effect at the next terminate() call.
+    void idle_flush(IdleFlush mode) {
+        idle_flush_ = mode;
+        idle_last_size_.clear();
+    }
+
+    [[nodiscard]] IdleFlush idle_flush() const {
+        return idle_flush_;
+    }
+
+    /// Buffers sent (or parked for credit) by the idle flush, and the elements they carried.
+    [[nodiscard]] std::size_t num_idle_flushes() const {
+        return num_idle_flushes_;
+    }
+
+    [[nodiscard]] std::size_t num_idle_flush_elements() const {
+        return num_idle_flush_elements_;
+    }
+
+    /// Buffers IdleFlush::stale left in place because they grew since the previous attempt.
+    [[nodiscard]] std::size_t num_idle_flush_skips() const {
+        return num_idle_flush_skips_;
+    }
+
+    /// Buffers the idle flush left in place because they could not be sent right away (no credit for the
+    /// destination, or no free send slot, which ends the attempt).
+    [[nodiscard]] std::size_t num_idle_flush_deferred() const {
+        return num_idle_flush_deferred_;
     }
 
     /// Buffers the selective drain declined to force out because they were still filling.
@@ -829,6 +876,10 @@ public:
         num_forced_flushes_ = 0;
         num_forced_flush_elements_ = 0;
         num_drain_skips_ = 0;
+        num_idle_flushes_ = 0;
+        num_idle_flush_elements_ = 0;
+        num_idle_flush_skips_ = 0;
+        num_idle_flush_deferred_ = 0;
         num_parked_for_credit_ = 0;
         num_parked_for_capacity_ = 0;
         num_redirect_buffer_stalls_ = 0;
@@ -994,6 +1045,10 @@ private:
         -> std::pair<typename BufferMap::iterator, bool> {
         KASSERT(buffer_it != aggregation_buffers_.end(), "Trying to flush non-existing buffer.");
         auto& [receiver, buffer] = *buffer_it;
+        if (idle_flush_ == IdleFlush::stale) {
+            // whatever fills this destination next starts a new buffer, which IdleFlush::stale must see grow
+            idle_last_size_.erase(receiver);
+        }
         if (buffer.empty()) {
             if (erase) {
                 // back to the pool: an empty entry may still own a buffer
@@ -1057,6 +1112,49 @@ private:
             return {aggregation_buffers_.erase(buffer_it), true};
         }
         return {++buffer_it, true};
+    }
+
+    /// The idle flush (see IdleFlush). Never blocks, never polls, and never parks: a buffer goes out only if it
+    /// can be sent right now, otherwise it stays in place and keeps filling. Parking it would gain nothing (it
+    /// waits for the same credit either way) and would let one destination accumulate several partially filled
+    /// buffers -- credits bound elements, not buffers, so the pool, and a proxy's overdraft, would grow past
+    /// what the credit window accounts for.
+    void flush_idle_buffers() {
+        if (idle_flush_ == IdleFlush::off) {
+            return;
+        }
+        auto it = aggregation_buffers_.begin();
+        while (it != aggregation_buffers_.end()) {
+            if (!queue_.has_send_capacity()) {
+                num_idle_flush_deferred_++;
+                break;  // the remaining buffers wait for the next attempt or the termination drain
+            }
+            auto const size = it->second.size();
+            if (size == 0) {
+                ++it;  // keep the entry and its pool buffer, the destination is likely to be used again
+                continue;
+            }
+            if (idle_flush_ == IdleFlush::stale) {
+                // an unseen destination reads 0 and so counts as grown: every buffer waits at least one attempt
+                auto& last_seen = idle_last_size_[it->first];
+                if (size > last_seen) {
+                    last_seen = size;
+                    num_idle_flush_skips_++;
+                    ++it;
+                    continue;
+                }
+            }
+            if (flow_.enabled() && !flow_.has_credit(it->first, size)) {
+                num_idle_flush_deferred_++;
+                ++it;
+                continue;
+            }
+            auto [next, flushed] = flush_buffer_impl(it, /*erase=*/true);
+            KASSERT(flushed, "send capacity and credit were checked, so the flush must succeed");
+            num_idle_flushes_++;
+            num_idle_flush_elements_ += size;
+            it = next;
+        }
     }
 
     void park_buffer(PEID receiver, BufferContainer&& buffer) {
@@ -1310,6 +1408,12 @@ private:
     std::size_t num_drain_skips_ = 0;
     bool selective_drain_ = false;
     std::unordered_map<PEID, std::size_t> last_drain_size_;  ///< buffer size at the previous drain
+    IdleFlush idle_flush_ = IdleFlush::all;
+    std::unordered_map<PEID, std::size_t> idle_last_size_;  ///< IdleFlush::stale: size at the previous attempt
+    std::size_t num_idle_flushes_ = 0;
+    std::size_t num_idle_flush_elements_ = 0;
+    std::size_t num_idle_flush_skips_ = 0;
+    std::size_t num_idle_flush_deferred_ = 0;
     bool forced_flush_ = false;                              ///< set while the termination drain flushes
     std::vector<PEID> drain_targets_;                        ///< scratch for flush_all_buffers_blocking
     bool draining_ = false;
