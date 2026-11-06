@@ -1,9 +1,0 @@
-[submodule "extern/graph-io"]
-	path = extern/graph-io
-	url = https://github.com/niklas-uhl/graph-io
-[submodule "extern/backward-cpp"]
-	path = extern/backward-cpp
-	url = https://github.com/niklas-uhl/backward-cpp
-[submodule "extern/cli11"]
-	path = extern/cli11
-	url = https://github.com/CLIUtils/ClI11

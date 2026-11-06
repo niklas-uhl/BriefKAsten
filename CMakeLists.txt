@@ -12,16 +12,34 @@ find_package(Boost REQUIRED COMPONENTS mpi )
 #set (CMAKE_LINKER_FLAGS "${CMAKE_LINKER_FLAGS} -fno-omit-frame-pointer -fsanitize=address ")
 
 
-#set(GRAPH_IO_GENERATORS OFF)
+include(FetchContent)
+
+# Dependencies are only fetched if the parent project does not provide them.
 if (NOT TARGET graph-io)
-  add_subdirectory(extern/graph-io)
+  FetchContent_Declare(
+    graph-io
+    GIT_REPOSITORY https://github.com/niklas-uhl/graph-io
+    GIT_TAG        fix-modern-toolchain
+    GIT_SUBMODULES_RECURSE TRUE
+  )
+  FetchContent_MakeAvailable(graph-io)
 endif()
 
 if (NOT TARGET backward)
-  add_subdirectory(extern/backward-cpp)
+  FetchContent_Declare(
+    backward-cpp
+    GIT_REPOSITORY https://github.com/niklas-uhl/backward-cpp
+    GIT_TAG        master
+  )
+  FetchContent_MakeAvailable(backward-cpp)
 endif()
 if (NOT TARGET CLI11)
-  add_subdirectory(extern/cli11)
+  FetchContent_Declare(
+    cli11
+    GIT_REPOSITORY https://github.com/CLIUtils/CLI11
+    GIT_TAG        v2.4.2
+  )
+  FetchContent_MakeAvailable(cli11)
 endif()
 
 add_library(message-queue INTERFACE)
