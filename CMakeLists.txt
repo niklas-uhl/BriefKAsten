@@ -7,7 +7,6 @@ option(MESSAGE_QUEUE_MATCHED_RECV "Use MPI_Mrecv" OFF)
 message(STATUS BLOCKING_RECEIVE ${MESSAGE_QUEUE_BLOCKING_RECEIVE})
 
 find_package(MPI REQUIRED)
-find_package(Boost REQUIRED COMPONENTS mpi )
 
 #set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer -fsanitize=address ")
 #set (CMAKE_LINKER_FLAGS "${CMAKE_LINKER_FLAGS} -fno-omit-frame-pointer -fsanitize=address ")
@@ -15,7 +14,19 @@ find_package(Boost REQUIRED COMPONENTS mpi )
 
 add_library(message-queue INTERFACE)
 target_include_directories(message-queue INTERFACE include)
-target_link_libraries(message-queue INTERFACE MPI::MPI_CXX Boost::mpi)
+# MPI datatype mapping (kamping-types, part of the KaMPIng ecosystem), fetched if the
+# parent project does not provide it
+if (NOT TARGET kamping::types)
+  include(FetchContent)
+  FetchContent_Declare(
+    kamping_types
+    GIT_REPOSITORY https://github.com/kamping-site/kamping
+    GIT_TAG 001f21510a7edef33248a9d4063073a7b05b5696
+    SOURCE_SUBDIR kamping-types
+    SYSTEM)
+  FetchContent_MakeAvailable(kamping_types)
+endif()
+target_link_libraries(message-queue INTERFACE MPI::MPI_CXX kamping::types)
 target_compile_options(message-queue INTERFACE -std=c++17)
 if (MESSAGE_QUEUE_BLOCKING_RECEIVE)
   target_compile_definitions(message-queue INTERFACE MESSAGE_QUEUE_BLOCKING_RECEIVE)

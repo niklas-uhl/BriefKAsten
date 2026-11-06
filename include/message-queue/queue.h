@@ -11,7 +11,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-#include <boost/mpi/datatype.hpp>
+#include <kamping/types/mpi_type_traits.hpp>
 #include "debug_print.h"
 #include "message-queue/debug_print.h"
 #include "message-queue/message_statistics.h"
@@ -23,7 +23,8 @@ class MessageQueue {
     friend class BufferedMessageQueue;
     template <class U, class Merger, class Splitter>
     friend class ConcurrentBufferedMessageQueue;
-    static_assert(boost::mpi::is_mpi_builtin_datatype<T>::value, "Only builtin MPI types are supported");
+    static_assert(kamping::types::has_static_type_v<T> && !kamping::types::mpi_type_traits<T>::has_to_be_committed,
+                  "Only builtin MPI types are supported");
 
     enum class State { posted, initiated, completed };
 
@@ -66,7 +67,7 @@ class MessageQueue {
 
         void initiate_send() {
             // atomic_debug(this->request_id);
-            int err = MPI_Isend(this->message.data(), this->message.size(), boost::mpi::get_mpi_datatype<S>(),
+            int err = MPI_Isend(this->message.data(), this->message.size(), kamping::types::mpi_type_traits<S>::data_type(),
                                 receiver, this->tag, MPI_COMM_WORLD, &this->request);
             check_mpi_error(err, __FILE__, __LINE__);
             this->state = State::initiated;
@@ -91,10 +92,10 @@ class MessageQueue {
             this->state = State::initiated;
             this->message.resize(this->message_size);
 #ifdef MESSAGE_QUEUE_MATCHED_RECV
-            MPI_Imrecv(this->message.data(), this->message.size(), boost::mpi::get_mpi_datatype<S>(),
+            MPI_Imrecv(this->message.data(), this->message.size(), kamping::types::mpi_type_traits<S>::data_type(),
                        &matched_message, &(this->request));
 #else
-            MPI_Irecv(this->message.data(), this->message.size(), boost::mpi::get_mpi_datatype<S>(),
+            MPI_Irecv(this->message.data(), this->message.size(), kamping::types::mpi_type_traits<S>::data_type(),
                       this->sender, this->tag, MPI_COMM_WORLD, &(this->request));
 #endif
         }
@@ -105,10 +106,10 @@ class MessageQueue {
             }
             this->message.resize(this->message_size);
 #ifdef MESSAGE_QUEUE_MATCHED_RECV
-            MPI_Mrecv(this->message.data(), this->message.size(), boost::mpi::get_mpi_datatype<S>(),
+            MPI_Mrecv(this->message.data(), this->message.size(), kamping::types::mpi_type_traits<S>::data_type(),
                        &this->matched_message, MPI_STATUS_IGNORE);
 #else
-            MPI_Recv(this->message.data(), this->message.size(), boost::mpi::get_mpi_datatype<S>(), this->sender,
+            MPI_Recv(this->message.data(), this->message.size(), kamping::types::mpi_type_traits<S>::data_type(), this->sender,
                      this->tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 #endif
             this->state = State::completed;
@@ -128,7 +129,7 @@ class MessageQueue {
         ReceiveHandlePtr<S> handle() {
             auto handle = std::make_unique<ReceiveHandle<S>>();
             int message_size;
-            MPI_Get_count(&status, boost::mpi::get_mpi_datatype<S>(), &message_size);
+            MPI_Get_count(&status, kamping::types::mpi_type_traits<S>::data_type(), &message_size);
             handle->message_size = message_size;
 #ifdef MESSAGE_QUEUE_MATCHED_RECV
             handle->matched_message = matched_message;
@@ -306,7 +307,7 @@ public:
             std::pair<size_t, size_t> local_count = {stats_.sent_messages, stats_.received_messages};
             std::pair<size_t, size_t> reduced_count;
             MPI_Request reduce_request;
-            MPI_Iallreduce(&local_count, &reduced_count, 2, boost::mpi::get_mpi_datatype<size_t>(), MPI_SUM,
+            MPI_Iallreduce(&local_count, &reduced_count, 2, kamping::types::mpi_type_traits<size_t>::data_type(), MPI_SUM,
                            MPI_COMM_WORLD, &reduce_request);
             wave_count++;
             int reduce_finished = false;
@@ -352,7 +353,7 @@ public:
             if (termination_request == MPI_REQUEST_NULL) {
                 local_count = {stats_.sent_messages, stats_.received_messages};
                 // atomic_debug("Start reduce");
-                MPI_Iallreduce(&local_count, &reduced_count, 2, boost::mpi::get_mpi_datatype<size_t>(), MPI_SUM,
+                MPI_Iallreduce(&local_count, &reduced_count, 2, kamping::types::mpi_type_traits<size_t>::data_type(), MPI_SUM,
                                MPI_COMM_WORLD, &termination_request);
             }
             wave_count++;
