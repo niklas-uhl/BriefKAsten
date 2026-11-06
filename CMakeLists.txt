@@ -13,7 +13,9 @@ find_package(Boost REQUIRED COMPONENTS mpi )
 
 
 #set(GRAPH_IO_GENERATORS OFF)
-add_subdirectory(extern/graph-io)
+if (NOT TARGET graph-io)
+  add_subdirectory(extern/graph-io)
+endif()
 
 if (NOT TARGET backward)
   add_subdirectory(extern/backward-cpp)
