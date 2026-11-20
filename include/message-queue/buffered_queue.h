@@ -29,9 +29,12 @@ public:
           merge(merge),
           split(split) {}
 
-    void post_message(std::vector<T>&& message, PEID receiver, int tag = 0) {
+    /// `message` is handed to the merger as is: any type the merger accepts (e.g. a std::vector<T>, or a view of a
+    /// message that is sent to several receivers, which the merger appends without an intermediate copy).
+    template <typename Message>
+    void post_message(Message&& message, PEID receiver, int tag = 0) {
         auto& buffer = buffers_[receiver];
-        size_t added_elements = merge(buffer, std::forward<std::vector<T>>(message), tag);
+        size_t added_elements = merge(buffer, std::forward<Message>(message), tag);
         buffer_ocupacy_ += added_elements;
         if (buffer_ocupacy_ > threshold_) {
             overflows_++;
