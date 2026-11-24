@@ -73,6 +73,16 @@ Outcome run(kamping::Communicator<> const& comm, Queue& queue) {
     }
     while (!queue.terminate(on_message)) {
     }
+    // Only large messages make buffers larger than half the credit window, and each is sent once, so it can pass
+    // at most once (counted at the send, not at every credit check while it waits for a slot).
+    auto const& base = [&]() -> auto const& {
+        if constexpr (requires { queue.queue(); }) {
+            return queue.queue();
+        } else {
+            return queue;
+        }
+    }();
+    EXPECT_LE(base.num_oversize_passes(), base.num_large_messages());
     return outcome;
 }
 
