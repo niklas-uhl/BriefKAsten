@@ -14,6 +14,10 @@ option(
   "Compile in the stall tracer (runtime-gated by BRIEFKASTEN_STALL_TRACE_SECONDS). Off by default: no diagnostic scaffolding in a production hot path. Turn it ON to diagnose a hang -- phase-end counters cannot see a stall, because the phase never ends."
   OFF)
 option(
+  BRIEFKASTEN_CHECK_BUFFERS
+  "Check that memory handed to MPI stays put until MPI is done with it (send buffers unchanged until completion, no send slot reused or destroyed in flight, armed persistent receive buffers not moved). Off by default: checksums every send buffer twice. Turn it ON to diagnose transport errors such as Intel MPI's cma_read_nbytes == size."
+  OFF)
+option(
   BRIEFKASTEN_USE_CXX23
   "Use C++23. Default is ON, when OFF, this library uses C++20 and depends on range-v3."
   ON)
@@ -81,6 +85,11 @@ endif()
 if(BRIEFKASTEN_STALL_TRACE)
   target_compile_definitions(BriefKAsten_BriefKAsten INTERFACE BRIEFKASTEN_STALL_TRACE)
   message(STATUS "BriefKAsten: stall tracer compiled in; set BRIEFKASTEN_STALL_TRACE_SECONDS to enable")
+endif()
+
+if(BRIEFKASTEN_CHECK_BUFFERS)
+  target_compile_definitions(BriefKAsten_BriefKAsten INTERFACE BRIEFKASTEN_CHECK_BUFFERS)
+  message(STATUS "BriefKAsten: buffer lifetime checks compiled in")
 endif()
 
 add_library(BriefKAsten::BriefKAsten ALIAS BriefKAsten_BriefKAsten)

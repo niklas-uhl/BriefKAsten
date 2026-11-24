@@ -30,6 +30,9 @@
 
 #include "./concepts.hpp"
 #include "./request_pool.hpp"
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+#include "./buffer_check.hpp"
+#endif
 
 namespace briefkasten {
 template <MPIBuffer MessageContainer>
@@ -43,7 +46,36 @@ public:
         : comm_(comm),
           request_pool_(num_send_slots),
           active_sends_(num_send_slots),
-          send_backlog_capacity_(send_backlog_capacity) {}
+          send_backlog_capacity_(send_backlog_capacity) {
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+        send_records_.resize(num_send_slots);
+#endif
+    }
+
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+    // A Sender destroyed or overwritten with a send in flight frees the send's buffer under MPI.
+    Sender(Sender const&) = delete;
+    Sender& operator=(Sender const&) = delete;
+    Sender(Sender&&) noexcept = default;  // leaves `other` without sends (moved-from vectors are empty)
+    Sender& operator=(Sender&& other) noexcept {
+        check_no_sends_in_flight("Sender overwritten (move assignment)");
+        comm_ = other.comm_;
+        request_pool_ = std::move(other.request_pool_);
+        active_sends_ = std::move(other.active_sends_);
+        send_records_ = std::move(other.send_records_);
+        send_backlog_ = std::move(other.send_backlog_);
+        send_backlog_capacity_ = other.send_backlog_capacity_;
+        next_receipt_id_ = other.next_receipt_id_;
+        num_immediate_sends_ = other.num_immediate_sends_;
+        num_backlogged_sends_ = other.num_backlogged_sends_;
+        num_send_capacity_misses_ = other.num_send_capacity_misses_;
+        peak_send_backlog_ = other.peak_send_backlog_;
+        return *this;
+    }
+    ~Sender() {
+        check_no_sends_in_flight("Sender destroyed");
+    }
+#endif
 
     std::optional<std::size_t> enqueue_for_sending(MessageContainer&& message, PEID destination, int tag) {
         drain_send_backlog();  // try to send as many as possible
@@ -79,6 +111,9 @@ public:
         bool any_completed = request_pool_.test_any([&](int completed_request_index) {
             std::optional<ActiveSend>& completed_send = active_sends_[completed_request_index];
             KASSERT(completed_send.has_value());
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+            check_completed_send(completed_request_index);
+#endif
             std::size_t receipt = completed_send->receipt;
             MessageContainer buffer = std::move(completed_send->message);
             completed_send.reset();
@@ -161,6 +196,11 @@ private:
                     MPI_Request& request,
                     std::size_t request_index) {
         auto& active_send = active_sends_[request_index];
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+        if (active_send.has_value() || request != MPI_REQUEST_NULL) {
+            internal::buffer_check_failed("send slot reused while its send is in flight: its buffer is freed under MPI");
+        }
+#endif
         active_send = std::move(msg.send);
 #if MPI_VERSION >= 4
         MPI_Isend_c(active_send->message.data(), active_send->message.size(),
@@ -169,7 +209,40 @@ private:
         MPI_Isend(active_send->message.data(), static_cast<int>(active_send->message.size()),
                   kamping::mpi_datatype<value_type>(), msg.destination, msg.tag, comm_, &request);
 #endif
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+        send_records_[request_index] = internal::BufferRecord{.data = active_send->message.data(),
+                                                              .size = active_send->message.size(),
+                                                              .checksum = internal::buffer_checksum(active_send->message)};
+#endif
     }
+
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+    /// The send of slot \p index completed: MPI must have released the request, and the buffer must be the one given to
+    /// MPI_Isend, unchanged.
+    void check_completed_send(int index) {
+        auto const slot = static_cast<std::size_t>(index);
+        if (request_pool_.is_active(index)) {
+            internal::buffer_check_failed("send reported complete while MPI still holds its request");
+        }
+        auto const& message = active_sends_[slot]->message;
+        auto const& record = send_records_[slot];
+        if (static_cast<void const*>(message.data()) != record.data || message.size() != record.size) {
+            internal::buffer_check_failed("send buffer moved or resized while in flight");
+        }
+        if (internal::buffer_checksum(message) != record.checksum) {
+            internal::buffer_check_failed("send buffer modified while in flight");
+        }
+        send_records_[slot] = {};
+    }
+
+    void check_no_sends_in_flight(char const* what) const {
+        for (std::size_t slot = 0; slot < active_sends_.size(); ++slot) {
+            if (active_sends_[slot].has_value() && request_pool_.is_active(static_cast<int>(slot))) {
+                internal::buffer_check_failed(what);
+            }
+        }
+    }
+#endif
 
     void drain_send_backlog() {
         while (!send_backlog_.empty() && request_pool_.inactive_requests() > 0) {
@@ -183,6 +256,9 @@ private:
     MPI_Comm comm_;
     internal::RequestPool request_pool_;
     std::vector<std::optional<ActiveSend>> active_sends_;
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+    std::vector<internal::BufferRecord> send_records_;  ///< per slot, what was given to MPI_Isend
+#endif
     std::deque<PendingSend> send_backlog_;
     std::size_t send_backlog_capacity_;
     int next_receipt_id_ = 0;

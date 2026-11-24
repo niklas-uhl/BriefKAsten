@@ -184,6 +184,11 @@ public:
         return static_cast<bool>(flag);
     }
 
+    /// Whether MPI still owns the request of slot \p index (it is not MPI_REQUEST_NULL).
+    [[nodiscard]] bool is_active(int index) const {
+        return requests[static_cast<std::size_t>(index)] != MPI_REQUEST_NULL;
+    }
+
     [[nodiscard]] std::size_t active_requests() const {
         return active_requests_;
     }

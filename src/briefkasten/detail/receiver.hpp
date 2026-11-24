@@ -31,6 +31,9 @@
 
 #include "./concepts.hpp"
 #include "./termination_counter.hpp"
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+#include "./buffer_check.hpp"
+#endif
 
 #ifdef BRIEFKASTEN_CXX20
 #include <range/v3/view/zip.hpp>
@@ -189,6 +192,9 @@ public:
                           &request                              // request
             );
 #endif
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+            record_armed(buffer);
+#endif
             MPI_Start(&request);
             count_receive_arm();
         }
@@ -245,8 +251,14 @@ public:
         termination_->track_receive();
         disarmed_slots_++;
         ReceiveBufferContainer& buffer = receive_buffers_[index];
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+        check_armed(buffer, "persistent receive buffer moved or resized while armed");
+#endif
         auto envelope = build_envelope(buffer, status, rank_);
         on_message(std::move(envelope));
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+        check_armed(buffer, "persistent receive buffer moved or resized by its handler, before re-arming");
+#endif
         MPI_Start(&receive_requests_[index]);
         count_receive_arm();
         disarmed_slots_--;
@@ -288,8 +300,14 @@ public:
 #endif
         for (auto [buffer, status, request] : views::zip(buffers, statuses, requests)) {
             termination_->track_receive();
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+            check_armed(buffer, "persistent receive buffer moved or resized while armed");
+#endif
             auto envelope = internal::build_envelope(buffer, status, rank_);
             on_message(std::move(envelope));
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+            check_armed(buffer, "persistent receive buffer moved or resized by its handler, before re-arming");
+#endif
             MPI_Start(&request);
             count_receive_arm();
             disarmed_slots_--;
@@ -338,6 +356,9 @@ public:
                           &request                              // request
             );
 #endif
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+            record_armed(buffer);
+#endif
         }
     }
 
@@ -346,6 +367,24 @@ public:
     }
 
 private:
+#ifdef BRIEFKASTEN_CHECK_BUFFERS
+    /// The slot of \p buffer, one of receive_buffers_.
+    std::size_t slot_of(ReceiveBufferContainer const& buffer) const {
+        return static_cast<std::size_t>(&buffer - receive_buffers_.data());
+    }
+    void record_armed(ReceiveBufferContainer const& buffer) {
+        armed_buffers_.resize(receive_buffers_.size());
+        armed_buffers_[slot_of(buffer)] = internal::BufferRecord{.data = buffer.data(), .size = buffer.size()};
+    }
+    void check_armed(ReceiveBufferContainer const& buffer, char const* what) const {
+        auto const& record = armed_buffers_[slot_of(buffer)];
+        if (static_cast<void const*>(buffer.data()) != record.data || buffer.size() != record.size) {
+            internal::buffer_check_failed(what);
+        }
+    }
+    std::vector<internal::BufferRecord> armed_buffers_;  ///< per slot, what MPI_Recv_init was given
+#endif
+
     auto step_probe_recursion() -> std::tuple<std::vector<MPI_Status>&, std::vector<int>&> {
         probe_recursion_depth_++;
         if (probe_recursion_depth_ >= static_cast<int>(statuses_.size())) {
