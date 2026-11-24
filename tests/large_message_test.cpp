@@ -1,6 +1,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <kamping/collectives/allreduce.hpp>
+#include <kamping/collectives/barrier.hpp>
 #include <kamping/communicator.hpp>
 
 #include <cstddef>
@@ -17,8 +18,10 @@ namespace {
 constexpr std::size_t THRESHOLD_BYTES = 1024;
 constexpr std::size_t BUFFER_ELEMENTS = THRESHOLD_BYTES / sizeof(int);
 constexpr std::size_t FITS_EXACTLY = BUFFER_ELEMENTS - 2;
+// With flow control the credit window is DEFAULT_NUM_CREDIT_BUFFERS (8) buffers = 2048 elements: 5 and 7 buffers lie
+// between half the window and the window, 100 buffers beyond it.
 const std::vector<std::size_t> MESSAGE_SIZES = {1, 100, FITS_EXACTLY, FITS_EXACTLY + 1, 2 * BUFFER_ELEMENTS,
-                                                100 * BUFFER_ELEMENTS};
+                                                5 * BUFFER_ELEMENTS, 7 * BUFFER_ELEMENTS, 100 * BUFFER_ELEMENTS};
 
 /// The message from `sender` of length `size`: [sender, size, 0, 1, ...], so the receiver can check it whole.
 std::vector<int> make_message(int sender, std::size_t size) {
@@ -57,6 +60,9 @@ Outcome run(kamping::Communicator<> const& comm, Queue& queue) {
         }
         outcome.bad_messages += ok ? 0 : 1;
     };
+    // The tests share the communicator and the tags: wait until every rank has destroyed the previous test's queue,
+    // or its persistent receives may match this test's first messages.
+    comm.barrier();
     for (std::size_t round = 0; round < 3; ++round) {
         for (std::size_t size : MESSAGE_SIZES) {
             for (int receiver = 0; receiver < comm.size_signed(); ++receiver) {
