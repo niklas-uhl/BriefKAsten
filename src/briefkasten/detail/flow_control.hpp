@@ -169,18 +169,20 @@ public:
         if (elements <= credit) {
             return true;
         }
-        if (credit > 0 && elements > limits_.num_window_elements / 2) {
-            num_oversize_passes_++;
-            return true;
-        }
-        return false;
+        // counted in track_send: a buffer may be checked again and again while it waits for a send slot
+        return credit > 0 && elements > limits_.num_window_elements / 2;
     }
 
     void track_send(PEID peer, std::size_t elements) {
         if (!enabled_) {
             return;
         }
-        peer_state(peer).out_sent += elements;
+        Peer& state = peer_state(peer);
+        auto const credit = state.out_allowed - std::min(state.out_allowed, state.out_sent);
+        if (elements > credit) {  // let through by has_credit as an oversize buffer
+            num_oversize_passes_++;
+        }
+        state.out_sent += elements;
     }
 
     /// A buffer of \p elements elements from \p peer has been handled; grant more if due.
