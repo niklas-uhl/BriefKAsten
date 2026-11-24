@@ -186,10 +186,12 @@ public:
             return;
         }
         Peer& state = peer_state(peer);
+        auto const outstanding_before = outstanding_credit(state);
         state.in_received += elements;
         if (state.proxied) {  // message from the peer may contain data that we have to forward
-            // the granted credit is used up: what we forward of it is now counted as buffered (hold_redirected)
-            sum_proxied_in_credit_ -= std::min(sum_proxied_in_credit_, elements);
+            // the granted credit is used up: what we forward of it is now counted as buffered (hold_redirected).
+            // Only the credit this peer had outstanding: an oversize pass (has_credit) receives more than that.
+            sum_proxied_in_credit_ -= outstanding_before - outstanding_credit(state);
         }
         grant_if_due(peer, state);
     }
@@ -302,6 +304,11 @@ private:
         return peers_.emplace(peer, fresh).first->second;
     }
 
+    /// The credit granted to \p state's peer and not yet used: in_granted - in_received, 0 after an oversize pass.
+    [[nodiscard]] static std::size_t outstanding_credit(Peer const& state) {
+        return state.in_granted - std::min(state.in_granted, state.in_received);
+    }
+
     /// Grant once at least half the window has freed up. On a proxied link, withhold the grant while the
     /// redirect limit is reached; release_redirected() retries it.
     void grant_if_due(PEID peer, Peer& state) {
@@ -323,11 +330,17 @@ private:
             return;
         }
         if (state.proxied) {
-            sum_proxied_in_credit_ += new_in_granted - state.in_granted;
+            // the new outstanding credit is the whole window: after an oversize pass in_received exceeds the
+            // old grant, and that excess was never credit
+            sum_proxied_in_credit_ += new_in_granted - std::max(state.in_granted, state.in_received);
         }
         state.in_granted = new_in_granted;
         send_grant(peer, state);
-        KASSERT(num_redirect_elements_buffered_ + sum_proxied_in_credit_ <= redirect_high_water(),
+        // Only a grant on a proxied link adds to what this rank may have to forward. A grant to any other peer is
+        // unrelated to the redirect limit; the limit can be exceeded while an oversize buffer (has_credit) is being
+        // forwarded, and that must not hold back grants to peers that send nothing to forward.
+        KASSERT(!state.proxied ||
+                    num_redirect_elements_buffered_ + sum_proxied_in_credit_ <= redirect_high_water(),
                 "redirect elements overshot their high-water mark: buffered=" << num_redirect_elements_buffered_
                                                                               << " credit=" << sum_proxied_in_credit_
                                                                               << " bound=" << redirect_high_water());

@@ -92,6 +92,10 @@ struct Config {
     /// the start of the buffer map. Without it the same destinations go first every time and the rest only
     /// leave through the threshold or the termination drain.
     bool idle_flush_round_robin = true;
+    /// A message that does not fit an empty aggregation buffer (local threshold) is merged into its destination's
+    /// buffer, which is then sent at once as a large message (its own tag, received by probing into a buffer of the
+    /// probed size). Costs every poll one extra MPI_Improbe for that tag. false: such a message throws.
+    bool allow_large_messages = true;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -152,6 +156,7 @@ public:
           flush_strategy_(effective_config_.flush_strategy) {
         idle_flush_ = effective_config_.idle_flush;
         idle_flush_round_robin_ = effective_config_.idle_flush_round_robin;
+        queue_.allow_large_messages(effective_config_.allow_large_messages);
         reserve_aggregation_buffers(effective_config_.num_request_slots);
 #ifdef BRIEFKASTEN_STALL_TRACE
         if (char const* trace = std::getenv("BRIEFKASTEN_STALL_TRACE_SECONDS")) {
@@ -721,6 +726,15 @@ public:
         return num_overflows_;
     }
 
+    /// Messages that did not fit an empty aggregation buffer and were sent with their buffer at once (see
+    /// Config::allow_large_messages), and their elements.
+    [[nodiscard]] std::size_t num_large_messages() const {
+        return num_large_messages_;
+    }
+    [[nodiscard]] std::size_t num_large_message_elements() const {
+        return num_large_message_elements_;
+    }
+
     [[nodiscard]] std::size_t num_elements_flushed() const {
         return num_elements_flushed_;
     }
@@ -880,6 +894,8 @@ public:
 
     void reset_stats() {
         num_overflows_ = 0;
+        num_large_messages_ = 0;
+        num_large_message_elements_ = 0;
         num_elements_flushed_ = 0;
         num_buffer_stalls_ = 0;
         num_drain_capacity_waits_ = 0;
@@ -1011,21 +1027,8 @@ private:
         auto envelope =
             MessageEnvelope{std::forward<decltype(message)>(message), envelope_sender, envelope_receiver, tag};
         bool overflow = false;
-        // loop: while we poll, a redirection handler may refill this destination's buffer, so re-check
-        while (true) {
-            size_t estimated_new_buffer_size = 0;
-            if constexpr (aggregation::EstimatingMerger<Merger, MessageType, BufferContainer>) {
-                estimated_new_buffer_size =
-                    merge.estimate_new_buffer_size(it->second, receiver, queue_.rank(), envelope);
-            } else {
-                estimated_new_buffer_size = it->second.size() + envelope.message.size();
-            }
-            if (!check_for_buffer_overflow(it->second, estimated_new_buffer_size - it->second.size())) {
-                break;
-            }
-            overflow = true;
-            num_overflows_++;
-            handle_overflow(it);             // may poll, `it` is invalid afterwards
+        // The destination's buffer after a flush: a fresh one from the pool. May poll; `it` is valid afterwards.
+        auto replace_flushed_buffer = [&] {
             auto buffer = get_new_buffer();  // may poll
             it = aggregation_buffers_.find(receiver);
             if (it == aggregation_buffers_.end()) {
@@ -1038,6 +1041,37 @@ private:
                 // refilled by a redirection handler, keep its payload
                 recycle_buffer(std::move(buffer));
             }
+        };
+        // A message that does not fit even an empty buffer: flushing first would not help (the fresh buffer is
+        // just as small, and flushing an empty one is a no-op), so it is merged into the current buffer, which is
+        // then sent at once, as a large message if it exceeds the receive buffers.
+        bool large = false;
+        // loop: while we poll, a redirection handler may refill this destination's buffer, so re-check
+        while (true) {
+            size_t estimated_new_buffer_size = 0;
+            if constexpr (aggregation::EstimatingMerger<Merger, MessageType, BufferContainer>) {
+                estimated_new_buffer_size =
+                    merge.estimate_new_buffer_size(it->second, receiver, queue_.rank(), envelope);
+            } else {
+                estimated_new_buffer_size = it->second.size() + envelope.message.size();
+            }
+            auto const delta = estimated_new_buffer_size - it->second.size();
+            if (!check_for_buffer_overflow(it->second, delta)) {
+                break;
+            }
+            if (check_for_local_buffer_overflow(BufferContainer{}, delta)) {
+                if (!queue_.large_messages_allowed()) {
+                    throw std::runtime_error("Message of " + std::to_string(delta) +
+                                             " buffer elements does not fit an aggregation buffer and large "
+                                             "messages are disabled (Config::allow_large_messages).");
+                }
+                large = true;
+                break;
+            }
+            overflow = true;
+            num_overflows_++;
+            handle_overflow(it);  // may poll, `it` is invalid afterwards
+            replace_flushed_buffer();
         }
         auto& buffer = it->second;
         auto old_buffer_size = buffer.size();
@@ -1048,6 +1082,14 @@ private:
         if (redirecting_depth_ > 0 && merged > 0) {
             redirected_in_buffer_[receiver] += merged;
             flow_.hold_redirected(merged);
+        }
+        if (large) {
+            num_large_messages_++;
+            num_large_message_elements_ += merged;
+            overflow = true;
+            num_overflows_++;
+            handle_overflow(it);  // may poll, `it` is invalid afterwards
+            replace_flushed_buffer();
         }
         return overflow;
     }
@@ -1322,6 +1364,14 @@ private:
     void recycle_buffer(BufferContainer&& buffer) {
         num_buffer_recycles_++;
         buffer.resize(0);  // this does not reduce the capacity
+        if constexpr (requires { buffer.capacity(); }) {
+            // a large message grew it: do not keep that memory in the pool
+            auto const reserved = queue_.reserved_receive_buffer_size();
+            if (buffer.capacity() > 2 * reserved) {
+                buffer = BufferContainer{};
+                buffer.reserve(reserved);
+            }
+        }
         free_aggregation_buffers_.emplace_back(std::move(buffer));
     }
 
@@ -1428,6 +1478,8 @@ private:
 
     std::size_t num_aggregation_buffers_ = 0;
     std::size_t num_overflows_ = 0;
+    std::size_t num_large_messages_ = 0;
+    std::size_t num_large_message_elements_ = 0;
     std::size_t num_elements_flushed_ = 0;
     std::size_t num_buffer_stalls_ = 0;
     std::size_t num_drain_capacity_waits_ = 0;
