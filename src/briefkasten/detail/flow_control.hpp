@@ -155,8 +155,11 @@ public:
         return limits_.max_num_redirect_elements + limits_.num_window_elements;
     }
 
-    /// May a buffer of \p elements elements be sent to \p peer now? A buffer larger than the whole window
-    /// is let through as soon as any credit is left, since it could otherwise never be sent.
+    /// May a buffer of \p elements elements be sent to \p peer now? A buffer larger than half the window is let
+    /// through as soon as any credit is left: the receiver grants only once half the window has freed up, so with
+    /// nothing in flight the credit can stay anywhere above half the window, and a larger buffer would wait for a
+    /// grant that never comes. Buffers up to the local threshold are at most half the window with two or more credit
+    /// buffers; larger ones are large messages (Config::allow_large_messages).
     [[nodiscard]] bool has_credit(PEID peer, std::size_t elements) {
         if (!enabled_) {
             return true;
@@ -166,7 +169,7 @@ public:
         if (elements <= credit) {
             return true;
         }
-        if (credit > 0 && elements > limits_.num_window_elements) {  // does not happen in normal operation
+        if (credit > 0 && elements > limits_.num_window_elements / 2) {
             num_oversize_passes_++;
             return true;
         }
