@@ -176,16 +176,16 @@ struct EnvelopeSerializationMerger {
                       "EnvelopeSerializationMerger: a message element (or the receiver PEID) would be narrowed by the "
                       "buffer element type. Widen the scalar buffer, e.g. with_buffer_type<int64_t>() (or an unsigned "
                       "buffer for unsigned messages).");
-        std::vector<buffer_type> combined(envelope.message.size() + 2);  // extra space for receiver and size
-        combined[0] = static_cast<buffer_type>(envelope.receiver);
-        combined[1] = static_cast<buffer_type>(envelope.message.size());
-        // Copy the message into the combined vector, starting from index 2
-        // and transform the message values to the buffer type.
-        auto converted_message = envelope.message | std::views::transform([](env_type const& value) -> buffer_type {
-                                     return static_cast<buffer_type>(value);
-                                 });
-        std::ranges::copy(converted_message, combined.begin() + 2);
-        buffer.insert(buffer.end(), combined.begin(), combined.end());
+        // [receiver, size, message...], appended in place
+        buffer.push_back(static_cast<buffer_type>(envelope.receiver));
+        buffer.push_back(static_cast<buffer_type>(std::ranges::size(envelope.message)));
+        if constexpr (std::same_as<env_type, buffer_type>) {
+            buffer.insert(buffer.end(), std::ranges::begin(envelope.message), std::ranges::end(envelope.message));
+        } else {
+            for (env_type const& value : envelope.message) {
+                buffer.push_back(static_cast<buffer_type>(value));
+            }
+        }
     }
     template <MPIBuffer BufferContainer, SerializableEnvelope<BufferContainer> EnvType>
     size_t estimate_new_buffer_size(BufferContainer const& buffer,
@@ -207,9 +207,17 @@ struct EnvelopeSerializationSplitter {
                       "buffer for unsigned messages).");
         return buffer | chunk_by_embedded_size(1) | std::views::transform([](auto chunk) {
                    PEID receiver = static_cast<PEID>(chunk[0]);
-                   auto message = chunk | std::views::drop(2) |
-                                  std::views::transform([](auto& elem) { return static_cast<MessageType>(elem); });
-                   return MessageEnvelope{std::move(message), 0, receiver, 0};
+                   if constexpr (std::same_as<MessageType, buffer_type>) {
+                       // no conversion: the message is a contiguous view into the buffer
+                       std::span<buffer_type const> const message{std::ranges::data(chunk) + 2,
+                                                                  std::ranges::size(chunk) - 2};
+                       return MessageEnvelope{message, 0, receiver, 0};
+                   } else {
+                       auto message = chunk | std::views::drop(2) | std::views::transform([](auto& elem) {
+                                          return static_cast<MessageType>(elem);
+                                      });
+                       return MessageEnvelope{std::move(message), 0, receiver, 0};
+                   }
                });
     }
 };
