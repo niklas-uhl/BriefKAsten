@@ -126,3 +126,29 @@ TEST(BufferPoolTest, grid_global_flush_small_credit_window) {
                                           briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
     run_and_check(comm, queue);
 }
+
+// The experiment switch Config::bounded_pool = false restores the pool handling from before #29: everything is
+// still delivered, and the free list outgrows the pool again (the leak this suite guards against otherwise).
+TEST(BufferPoolTest, legacy_pool_switch) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.bounded_pool = false;
+    auto queue = direct_queue(comm, conf);
+    std::size_t received = 0;
+    auto on_message = [&](auto envelope) {
+        received++;
+        EXPECT_EQ(envelope.message.size(), MESSAGE_SIZE);
+    };
+    comm.barrier();
+    std::vector<int> const message(MESSAGE_SIZE, comm.rank_signed());
+    for (std::size_t i = 0; i < MESSAGES_PER_RECEIVER; ++i) {
+        for (int receiver = 0; receiver < comm.size_signed(); ++receiver) {
+            queue.post_message_blocking(std::vector<int>(message), receiver, on_message);
+        }
+        queue.poll(on_message);
+    }
+    while (!queue.terminate(on_message)) {
+    }
+    EXPECT_GT(queue.num_free_buffers(), queue.num_allocated_buffers());
+    EXPECT_EQ(global_sum(comm, received), MESSAGES_PER_RECEIVER * comm.size() * comm.size());
+}

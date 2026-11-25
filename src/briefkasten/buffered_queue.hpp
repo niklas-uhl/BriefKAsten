@@ -96,6 +96,12 @@ struct Config {
     /// buffer, which is then sent at once as a large message (its own tag, received by probing into a buffer of the
     /// probed size). Costs every poll one extra MPI_Improbe for that tag. false: such a message throws.
     bool allow_large_messages = true;
+    /// EXPERIMENT SWITCH (branch exp/pool-fix-switch, not for main): false restores the aggregation buffer pool
+    /// handling from before #29 / #30, i.e. the overflow flush keeps the destination's entry and recycles its
+    /// moved-from shell (the pool leaks about a buffer per overflow flush, the cap does not take effect), own
+    /// messages may take the proxy's reserve, and own posts never wait for the reserve. For A/B measurements of the
+    /// fix with one binary.
+    bool bounded_pool = true;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -157,6 +163,7 @@ public:
         idle_flush_ = effective_config_.idle_flush;
         idle_flush_round_robin_ = effective_config_.idle_flush_round_robin;
         queue_.allow_large_messages(effective_config_.allow_large_messages);
+        bounded_pool_ = effective_config_.bounded_pool;
         reserve_aggregation_buffers(effective_config_.num_request_slots);
 #ifdef BRIEFKASTEN_STALL_TRACE
         if (char const* trace = std::getenv("BRIEFKASTEN_STALL_TRACE_SECONDS")) {
@@ -219,7 +226,7 @@ public:
         // bounded by the redirect limit (see redirect_pool_ceiling). Waiting here is safe: only forwarding
         // posts from inside a handler (split_handler asserts it), and forwarding never waits, so every rank
         // keeps consuming and granting while it polls.
-        if (redirecting_depth_ == 0 && reserve_buffers() > reserve_pause_threshold()) {
+        if (bounded_pool_ && redirecting_depth_ == 0 && reserve_buffers() > reserve_pause_threshold()) {
             num_reserve_waits_++;
             do {
                 poll(on_message);
@@ -332,11 +339,11 @@ public:
     }
 
     void flush_all_buffers() {
-        flush_all_aggregation_buffers_impl([] {}, [] { return false; });
+        flush_all_aggregation_buffers_impl(aggregation_buffers_.end(), [] {}, [] { return false; });
     }
 
     void flush_largest_buffer() {
-        std::ignore = flush_largest_buffer_impl();
+        std::ignore = flush_largest_buffer_impl(aggregation_buffers_.end());
     }
 
     /// Note: Message handlers take a MessageEnvelope as single argument. The
@@ -1032,13 +1039,13 @@ private:
     auto acquire_buffer() -> std::optional<BufferContainer> {
         bool const for_redirect = redirecting_depth_ > 0;
         auto const in_use = num_aggregation_buffers_ - free_aggregation_buffers_.size();
-        bool const own_at_cap = !for_redirect && in_use >= max_num_aggregation_buffers_;
+        bool const own_at_cap = bounded_pool_ && !for_redirect && in_use >= max_num_aggregation_buffers_;
         if (free_aggregation_buffers_.empty() || own_at_cap) {
             if (for_redirect && num_aggregation_buffers_ >= max_num_aggregation_buffers_) {
-                KASSERT(redirect_overdraft_ < redirect_pool_ceiling(),
-                        "proxy overdrew the buffer pool by " << redirect_overdraft_
-                            << " buffers, past the " << redirect_pool_ceiling()
-                            << " that credits should have bounded it to");
+                KASSERT(!bounded_pool_ || redirect_overdraft_ < redirect_pool_ceiling(),
+                        "proxy overdrew the buffer pool by " << redirect_overdraft_ << " buffers, past the "
+                                                             << redirect_pool_ceiling()
+                                                             << " that credits should have bounded it to");
                 redirect_overdraft_++;
             }
             if (!own_at_cap && num_aggregation_buffers_ < buffer_limit()) {
@@ -1060,7 +1067,7 @@ private:
         auto buffer = std::move(free_aggregation_buffers_.back());
         free_aggregation_buffers_.pop_back();
         peak_reserve_buffers_ = std::max(peak_reserve_buffers_, reserve_buffers());
-        KASSERT(!flow_.enabled() || reserve_buffers() <= redirect_pool_ceiling(),
+        KASSERT(!bounded_pool_ || !flow_.enabled() || reserve_buffers() <= redirect_pool_ceiling(),
                 "the reserve holds " << reserve_buffers() << " buffers, more than the " << redirect_pool_ceiling()
                                      << " the redirect limit bounds it to");
         return buffer;
@@ -1360,8 +1367,9 @@ private:
     template <typename PreFlushHook, typename PostFlushHook>
         requires std::invocable<PreFlushHook> && (std::predicate<PostFlushHook> || std::predicate<PostFlushHook, bool>)
     bool flush_all_aggregation_buffers_impl(
-        PreFlushHook&& pre_flush_hook,    // NOLINT(cppcoreguidelines-missing-std-forward)
-        PostFlushHook&& post_flush_hook,  // NOLINT(cppcoreguidelines-missing-std-forward)
+        BufferMap::iterator current_buffer,  // kept (not erased) only without bounded_pool_
+        PreFlushHook&& pre_flush_hook,       // NOLINT(cppcoreguidelines-missing-std-forward)
+        PostFlushHook&& post_flush_hook,     // NOLINT(cppcoreguidelines-missing-std-forward)
         bool break_when_flush_fails = true) {
         auto it = aggregation_buffers_.begin();
         bool flushed_something = false;
@@ -1369,7 +1377,7 @@ private:
             pre_flush_hook();
             bool current_flush_successful = false;
             std::tie(it, current_flush_successful) =
-                flush_buffer_impl(it);  // iterator `it` is updated by std::tie; do not use its previous value
+                flush_buffer_impl(it, bounded_pool_ || it != current_buffer);  // `it` is updated by std::tie
             if (current_flush_successful) {
                 flushed_something = true;
             } else {
@@ -1391,12 +1399,12 @@ private:
         return flushed_something;
     }
 
-    [[nodiscard]] bool flush_largest_buffer_impl() {
+    [[nodiscard]] bool flush_largest_buffer_impl(BufferMap::iterator current_buffer) {
         auto largest_buffer =
             std::max_element(aggregation_buffers_.begin(), aggregation_buffers_.end(),
                              [](auto& lhs, auto& rhs) { return lhs.second.size() < rhs.second.size(); });
         if (largest_buffer != aggregation_buffers_.end()) {
-            auto it = flush_buffer_impl(largest_buffer);
+            auto it = flush_buffer_impl(largest_buffer, bounded_pool_ || largest_buffer != current_buffer);
             return it.second;
         }
         return true;
@@ -1440,7 +1448,7 @@ private:
             }
         }
         free_aggregation_buffers_.emplace_back(std::move(buffer));
-        KASSERT(free_aggregation_buffers_.size() <= num_aggregation_buffers_,
+        KASSERT(!bounded_pool_ || free_aggregation_buffers_.size() <= num_aggregation_buffers_,
                 "the free list holds " << free_aggregation_buffers_.size() << " buffers, more than the pool's "
                                        << num_aggregation_buffers_ << ": a buffer was recycled twice or never counted");
     }
@@ -1471,18 +1479,18 @@ private:
                 // Erase the entry: a sent or parked buffer leaves a moved-from shell, which must not reach the
                 // pool (it is not a pool buffer, and filling it allocates one the pool never counted).
                 // replace_flushed_buffer looks the destination up again and gives it a pool buffer.
-                auto ret = flush_buffer_impl(current_buffer);
+                auto ret = flush_buffer_impl(current_buffer, /*erase=*/bounded_pool_);
                 return ret.second;
             }
             case FlushStrategy::global: {
-                return flush_all_aggregation_buffers_impl([] {}, [] { return false; });
+                return flush_all_aggregation_buffers_impl(current_buffer, [] {}, [] { return false; });
             }
             case FlushStrategy::random: {
                 throw std::runtime_error("Random flush strategy not implemented");
                 return false;
             }
             case FlushStrategy::largest: {
-                return flush_largest_buffer_impl();
+                return flush_largest_buffer_impl(current_buffer);
             }
         }
         // unreachable
@@ -1593,6 +1601,7 @@ private:
     std::size_t num_reserve_waits_ = 0;     ///< own posts that waited for the reserve to drain
     std::size_t peak_reserve_buffers_ = 0;  ///< most buffers in use beyond the pool cap at once
     std::size_t num_peers_ = 0;
+    bool bounded_pool_ = true;  ///< Config::bounded_pool (experiment switch)
     std::size_t poll_throttle_count_ = 0;
     // only read by the stall tracer
     std::size_t num_buffer_acquires_ = 0;
