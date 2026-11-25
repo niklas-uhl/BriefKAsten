@@ -44,6 +44,12 @@ target_link_libraries(large_message_test PRIVATE KaTestrophe::main)
 katestrophe_add_mpi_test(large_message_test CORES 1 2 3 4 9)
 set_target_properties(large_message_test PROPERTIES KASSERT_ASSERTION_LEVEL 30)
 
+add_executable(buffer_pool_test buffer_pool_test.cpp)
+target_link_libraries(buffer_pool_test PRIVATE BriefKAsten::BriefKAsten)
+target_link_libraries(buffer_pool_test PRIVATE KaTestrophe::main)
+katestrophe_add_mpi_test(buffer_pool_test CORES 1 2 3 4 9)
+set_target_properties(buffer_pool_test PROPERTIES KASSERT_ASSERTION_LEVEL 30)
+
 add_executable(aggregators_test aggregators_test.cpp)
 target_link_libraries(aggregators_test PRIVATE BriefKAsten::BriefKAsten)
 target_link_libraries(aggregators_test PRIVATE GTest::gtest_main)
