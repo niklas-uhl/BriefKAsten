@@ -214,6 +214,18 @@ public:
                                int tag,
                                MessageHandler<MessageType> auto&& on_message,
                                std::invocable<> auto&& progress_hook) {
+        // An own message waits while the proxy's reserve is in use beyond one buffer per peer, so the reserve
+        // holds forwarded payload (apart from at most one partially filled buffer per destination) and stays
+        // bounded by the redirect limit (see redirect_pool_ceiling). Waiting here is safe: only forwarding
+        // posts from inside a handler (split_handler asserts it), and forwarding never waits, so every rank
+        // keeps consuming and granting while it polls.
+        if (redirecting_depth_ == 0 && reserve_buffers() > reserve_pause_threshold()) {
+            num_reserve_waits_++;
+            do {
+                poll(on_message);
+                progress_hook();
+            } while (reserve_buffers() > reserve_pause_threshold());
+        }
         auto ret = post_message_impl(
             std::forward<decltype(message)>(message), receiver, envelope_sender, envelope_receiver, tag,
 
@@ -816,15 +828,40 @@ public:
         return num_redirect_buffer_stalls_;
     }
 
-    /// Upper bound on \ref redirect_overdraft, in buffers. This rank's own messages acquire buffers only below
-    /// the pool cap (acquire_buffer), so every buffer in use beyond the cap was acquired by the proxy and holds at
-    /// least one redirected element until its send completes; held redirected elements are at most
-    /// redirect_high_water. The bound is per element, not per buffer_size elements: the proxy's buffer for a
-    /// destination also takes this rank's own messages to it (merging needs no acquisition), so it can be full of
-    /// own payload around a single redirected element. Until own payload is kept out of the overdraft, this weak
-    /// bound is the one that holds.
+    /// Buffers in use beyond the pool cap right now: the reserve, which only the proxy draws from.
+    [[nodiscard]] std::size_t reserve_buffers() const {
+        auto const in_use = num_aggregation_buffers_ - free_aggregation_buffers_.size();
+        return in_use > max_num_aggregation_buffers_ ? in_use - max_num_aggregation_buffers_ : 0;
+    }
+
+    /// The most buffers in use beyond the pool cap at once; at most \ref redirect_pool_ceiling.
+    [[nodiscard]] std::size_t peak_reserve_buffers() const {
+        return peak_reserve_buffers_;
+    }
+
+    /// Own posts (post_message_blocking outside a redirection handler) wait while the reserve holds more than
+    /// this many buffers: one per peer.
+    [[nodiscard]] std::size_t reserve_pause_threshold() const {
+        return num_peers_;
+    }
+
+    /// Own posts that waited for the reserve to drain (see \ref reserve_pause_threshold).
+    [[nodiscard]] std::size_t num_reserve_waits() const {
+        return num_reserve_waits_;
+    }
+
+    /// Upper bound on \ref redirect_overdraft and \ref peak_reserve_buffers, in buffers. Own messages acquire
+    /// only below the pool cap and are not merged while the reserve holds more than \ref reserve_pause_threshold
+    /// buffers, so buffers acquired beyond that hold forwarded payload only. Per destination, two consecutive
+    /// such buffers hold more than one buffer of it (the message that overflowed the first went into the
+    /// second), and the proxy holds at most redirect_high_water forwarded elements. Partially filled buffers
+    /// besides: one per destination being filled, one per destination left over from before the pause, and
+    /// idle flushes, which only send what can go out at once (at most one per send slot).
     [[nodiscard]] std::size_t redirect_pool_ceiling() const {
-        return flow_.redirect_high_water() + 1;
+        auto const buffer_size = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
+        auto const forwarded_buffers = (flow_.redirect_high_water() + buffer_size - 1) / buffer_size;
+        return (2 * forwarded_buffers) + reserve_pause_threshold() + (2 * num_peers_) +
+               effective_config_.num_request_slots + 2;
     }
 
     /// Buffers the proxy allocated beyond the pool cap (the proxy never waits for a buffer).
@@ -928,6 +965,8 @@ public:
         num_parked_for_credit_ = 0;
         num_parked_for_capacity_ = 0;
         num_redirect_buffer_stalls_ = 0;
+        num_reserve_waits_ = 0;
+        peak_reserve_buffers_ = 0;
         flow_.reset_counters();
         queue_.reset_counters();
     }
@@ -1020,6 +1059,10 @@ private:
         num_buffer_acquires_++;
         auto buffer = std::move(free_aggregation_buffers_.back());
         free_aggregation_buffers_.pop_back();
+        peak_reserve_buffers_ = std::max(peak_reserve_buffers_, reserve_buffers());
+        KASSERT(!flow_.enabled() || reserve_buffers() <= redirect_pool_ceiling(),
+                "the reserve holds " << reserve_buffers() << " buffers, more than the " << redirect_pool_ceiling()
+                                     << " the redirect limit bounds it to");
         return buffer;
     };
 
@@ -1547,6 +1590,8 @@ private:
     std::size_t num_parked_for_capacity_ = 0;
     std::size_t num_redirect_buffer_stalls_ = 0;
     std::size_t redirect_overdraft_ = 0;
+    std::size_t num_reserve_waits_ = 0;     ///< own posts that waited for the reserve to drain
+    std::size_t peak_reserve_buffers_ = 0;  ///< most buffers in use beyond the pool cap at once
     std::size_t num_peers_ = 0;
     std::size_t poll_throttle_count_ = 0;
     // only read by the stall tracer
