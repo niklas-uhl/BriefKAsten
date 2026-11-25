@@ -75,6 +75,13 @@ struct Config {
     /// Aggregation buffer pool cap = buffers_per_peer * #peers + num_request_slots (only with flow control).
     /// nullopt: DEFAULT_BUFFERS_PER_PEER.
     std::optional<std::size_t> buffers_per_peer = std::nullopt;
+    /// EXPERIMENT SWITCH (branch exp/kacc-pool-fix-switch: the fixes of #29 / #30 backported onto 5664f7f for
+    /// KaCCv2; not for main). true (default): the aggregation buffer pool stays bounded, i.e. an overflow flush
+    /// erases the destination's entry (its moved-from shell never reaches the free list), own messages acquire only
+    /// below the pool cap, and own posts wait while the proxy's reserve holds more than one buffer per peer.
+    /// false: the pool handling of 5664f7f (the pool leaks about a buffer per overflow flush), for A/B measurements
+    /// with one binary.
+    bool bounded_pool = true;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -140,6 +147,7 @@ public:
             stall_trace_last_ = std::chrono::steady_clock::now();
         }
 #endif
+        bounded_pool_ = effective_config_.bounded_pool;
         // flow control is on by default; IndirectionAdapter re-configures it for its smaller peer count
         if (effective_config_.num_credit_buffers.value_or(DEFAULT_NUM_CREDIT_BUFFERS) > 0) {
             int comm_size = 0;
@@ -190,6 +198,15 @@ public:
                                int tag,
                                MessageHandler<MessageType> auto&& on_message,
                                std::invocable<> auto&& progress_hook) {
+        // bounded_pool: an own message waits while the proxy's reserve holds more than one buffer per peer, so the
+        // reserve holds forwarded payload. Safe: only forwarding posts from inside a handler, and it never waits.
+        if (bounded_pool_ && redirecting_depth_ == 0 && reserve_buffers() > reserve_pause_threshold()) {
+            num_reserve_waits_++;
+            do {
+                poll(on_message);
+                progress_hook();
+            } while (reserve_buffers() > reserve_pause_threshold());
+        }
         auto ret = post_message_impl(
             std::forward<decltype(message)>(message), receiver, envelope_sender, envelope_receiver, tag,
 
@@ -655,7 +672,7 @@ public:
         queue_.synchronous_mode(use_it);
     }
 
-    auto num_allocated_buffers() {
+    [[nodiscard]] std::size_t num_allocated_buffers() const {
         return num_aggregation_buffers_;
     }
 
@@ -733,10 +750,43 @@ public:
         return num_redirect_buffer_stalls_;
     }
 
-    /// Upper bound on \ref redirect_overdraft, in buffers.
+    /// Upper bound on \ref redirect_overdraft and \ref peak_reserve_buffers, in buffers. With bounded_pool: two
+    /// consecutive forwarded-only buffers per destination hold more than one buffer of payload, plus partially
+    /// filled buffers (one per destination, one left from before the pause, one per send slot); see #30.
     [[nodiscard]] std::size_t redirect_pool_ceiling() const {
         auto const buffer_size = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
-        return (flow_.redirect_high_water() / buffer_size) + num_peers_ + 1;
+        if (!bounded_pool_) {
+            return (flow_.redirect_high_water() / buffer_size) + num_peers_ + 1;
+        }
+        auto const forwarded_buffers = (flow_.redirect_high_water() + buffer_size - 1) / buffer_size;
+        return (2 * forwarded_buffers) + reserve_pause_threshold() + (2 * num_peers_) +
+               effective_config_.num_request_slots + 2;
+    }
+
+    /// Buffers in use beyond the pool cap right now: the reserve, which only the proxy draws from.
+    [[nodiscard]] std::size_t reserve_buffers() const {
+        auto const in_use = num_aggregation_buffers_ - free_aggregation_buffers_.size();
+        return in_use > max_num_aggregation_buffers_ ? in_use - max_num_aggregation_buffers_ : 0;
+    }
+
+    /// The most buffers in use beyond the pool cap at once.
+    [[nodiscard]] std::size_t peak_reserve_buffers() const {
+        return peak_reserve_buffers_;
+    }
+
+    /// Own posts wait while the reserve holds more than this many buffers (with bounded_pool): one per peer.
+    [[nodiscard]] std::size_t reserve_pause_threshold() const {
+        return num_peers_;
+    }
+
+    /// Own posts that waited for the reserve to drain.
+    [[nodiscard]] std::size_t num_reserve_waits() const {
+        return num_reserve_waits_;
+    }
+
+    /// Pool buffers not in use right now; with bounded_pool never more than the pool.
+    [[nodiscard]] std::size_t num_free_buffers() const {
+        return free_aggregation_buffers_.size();
     }
 
     /// Buffers the proxy allocated beyond the pool cap (the proxy never waits for a buffer).
@@ -832,6 +882,8 @@ public:
         num_parked_for_credit_ = 0;
         num_parked_for_capacity_ = 0;
         num_redirect_buffer_stalls_ = 0;
+        num_reserve_waits_ = 0;
+        peak_reserve_buffers_ = 0;
         flow_.reset_counters();
         queue_.reset_counters();
     }
@@ -891,7 +943,10 @@ private:
     /// the pool beyond the cap instead, since redirected payload is already bounded by the flow control.
     auto acquire_buffer() -> std::optional<BufferContainer> {
         bool const for_redirect = redirecting_depth_ > 0;
-        if (free_aggregation_buffers_.empty()) {
+        // bounded_pool: own messages use at most the pool cap; buffers beyond it are the proxy's reserve
+        auto const in_use = num_aggregation_buffers_ - free_aggregation_buffers_.size();
+        bool const own_at_cap = bounded_pool_ && !for_redirect && in_use >= max_num_aggregation_buffers_;
+        if (free_aggregation_buffers_.empty() || own_at_cap) {
             if (for_redirect && num_aggregation_buffers_ >= max_num_aggregation_buffers_) {
                 KASSERT(redirect_overdraft_ < redirect_pool_ceiling(),
                         "proxy overdrew the buffer pool by " << redirect_overdraft_
@@ -899,7 +954,7 @@ private:
                             << " that credits should have bounded it to");
                 redirect_overdraft_++;
             }
-            if (num_aggregation_buffers_ < buffer_limit()) {
+            if (!own_at_cap && num_aggregation_buffers_ < buffer_limit()) {
                 reserve_aggregation_buffers(1);
             } else {
                 // Heuristic: at the cap with no free buffer -> flush one.
@@ -917,6 +972,10 @@ private:
         num_buffer_acquires_++;
         auto buffer = std::move(free_aggregation_buffers_.back());
         free_aggregation_buffers_.pop_back();
+        peak_reserve_buffers_ = std::max(peak_reserve_buffers_, reserve_buffers());
+        KASSERT(!bounded_pool_ || !flow_.enabled() || reserve_buffers() <= redirect_pool_ceiling(),
+                "the reserve holds " << reserve_buffers() << " buffers, more than the " << redirect_pool_ceiling()
+                                     << " the redirect limit bounds it to");
         return buffer;
     };
 
@@ -1131,9 +1190,9 @@ private:
         while (it != aggregation_buffers_.end()) {
             pre_flush_hook();
             bool current_flush_successful = false;
-            std::tie(it, current_flush_successful) =
-                flush_buffer_impl(it, it != current_buffer);  // iterator `it` is updated by std::tie; do not use its
-                                                              // previous value after this call
+            std::tie(it, current_flush_successful) = flush_buffer_impl(
+                it, bounded_pool_ || it != current_buffer);  // iterator `it` is updated by std::tie; do not use its
+                                                             // previous value after this call
             if (current_flush_successful) {
                 flushed_something = true;
             } else {
@@ -1160,7 +1219,7 @@ private:
             std::max_element(aggregation_buffers_.begin(), aggregation_buffers_.end(),
                              [](auto& lhs, auto& rhs) { return lhs.second.size() < rhs.second.size(); });
         if (largest_buffer != aggregation_buffers_.end()) {
-            auto it = flush_buffer_impl(largest_buffer, largest_buffer != current_buffer);
+            auto it = flush_buffer_impl(largest_buffer, bounded_pool_ || largest_buffer != current_buffer);
             return it.second;
         }
         return true;
@@ -1195,6 +1254,9 @@ private:
         num_buffer_recycles_++;
         buffer.resize(0);  // this does not reduce the capacity
         free_aggregation_buffers_.emplace_back(std::move(buffer));
+        KASSERT(!bounded_pool_ || free_aggregation_buffers_.size() <= num_aggregation_buffers_,
+                "the free list holds " << free_aggregation_buffers_.size() << " buffers, more than the pool's "
+                                       << num_aggregation_buffers_ << ": a buffer was recycled twice or never counted");
     }
 
     /// Called when a send completed; releases its redirected elements.
@@ -1220,7 +1282,9 @@ private:
                     // already flushed by a redirection handler while we polled
                     return true;
                 }
-                auto ret = flush_buffer_impl(current_buffer, /*erase=*/false);
+                // bounded_pool: erase the entry, so the moved-from shell of a sent or parked buffer never reaches the
+                // pool; the overflow path looks the destination up again and gives it a pool buffer
+                auto ret = flush_buffer_impl(current_buffer, /*erase=*/bounded_pool_);
                 return ret.second;
             }
             case FlushStrategy::global: {
@@ -1329,6 +1393,9 @@ private:
     std::size_t num_redirect_buffer_stalls_ = 0;
     std::size_t redirect_overdraft_ = 0;
     std::size_t num_peers_ = 0;
+    bool bounded_pool_ = true;              ///< Config::bounded_pool (experiment switch)
+    std::size_t num_reserve_waits_ = 0;     ///< own posts that waited for the reserve to drain
+    std::size_t peak_reserve_buffers_ = 0;  ///< most buffers in use beyond the pool cap at once
     std::size_t poll_throttle_count_ = 0;
     // only read by the stall tracer
     std::size_t num_buffer_acquires_ = 0;
