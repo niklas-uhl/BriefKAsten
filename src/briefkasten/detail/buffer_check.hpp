@@ -23,7 +23,13 @@
 /// the same name): a send buffer keeps its address, size and contents from MPI_Isend to completion, no send slot is
 /// reused or destroyed while its send is in flight, and an armed persistent receive buffer keeps its address and size.
 /// A violation is a use-after-free under MPI, which a transport may report far away from the cause (Intel MPI's
-/// single-copy CMA path: `cma_read_nbytes == size`) or not at all. Costs a checksum of every send buffer, twice.
+/// single-copy CMA path: `cma_read_nbytes == size`) or not at all.
+///
+/// The environment variable BRIEFKASTEN_CHECK_BUFFERS selects what a build with the checks does, read once:
+///   full (default): everything, including a checksum of every send buffer at MPI_Isend and at completion (slow:
+///                   it reads every buffer twice, which changes the timing of a timing-dependent bug)
+///   light:          addresses, sizes and request states only, nearly the timing of a build without checks
+///   off:            nothing
 
 #include <cstddef>
 #include <cstdint>
@@ -32,10 +38,25 @@
 #include <print>
 #include <ranges>
 #include <span>
+#include <string_view>
 
 #include <mpi.h>
 
 namespace briefkasten::internal {
+
+enum class BufferCheckMode : std::uint8_t { off, light, full };
+
+/// The mode from the environment variable BRIEFKASTEN_CHECK_BUFFERS (off / light / full, default full); an unknown
+/// value aborts, so a typo does not silently run the wrong mode.
+[[nodiscard]] inline BufferCheckMode buffer_check_mode();
+
+/// Whether any check runs, and whether send buffers are checksummed.
+[[nodiscard]] inline bool buffer_checks_enabled() {
+    return buffer_check_mode() != BufferCheckMode::off;
+}
+[[nodiscard]] inline bool buffer_checksums_enabled() {
+    return buffer_check_mode() == BufferCheckMode::full;
+}
 
 inline constexpr std::uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
 inline constexpr std::uint64_t FNV_PRIME = 1099511628211ULL;
@@ -65,6 +86,24 @@ template <std::ranges::contiguous_range Buffer>
         MPI_Abort(MPI_COMM_WORLD, 3);
     }
     std::abort();
+}
+
+inline BufferCheckMode buffer_check_mode() {
+    static BufferCheckMode const mode = [] {
+        char const* value = std::getenv("BRIEFKASTEN_CHECK_BUFFERS");
+        std::string_view const name = value == nullptr ? "full" : value;
+        if (name == "full") {
+            return BufferCheckMode::full;
+        }
+        if (name == "light") {
+            return BufferCheckMode::light;
+        }
+        if (name == "off") {
+            return BufferCheckMode::off;
+        }
+        buffer_check_failed("unknown BRIEFKASTEN_CHECK_BUFFERS (expected off, light or full)");
+    }();
+    return mode;
 }
 
 /// What a send slot or an armed receive was given to MPI.

@@ -15,7 +15,7 @@ option(
   OFF)
 option(
   BRIEFKASTEN_CHECK_BUFFERS
-  "Check that memory handed to MPI stays put until MPI is done with it (send buffers unchanged until completion, no send slot reused or destroyed in flight, armed persistent receive buffers not moved). Off by default: checksums every send buffer twice. Turn it ON to diagnose transport errors such as Intel MPI's cma_read_nbytes == size."
+  "Check that memory handed to MPI stays put until MPI is done with it (send buffers unchanged until completion, no send slot reused or destroyed in flight, armed persistent receive buffers not moved). Off by default. At run time, the environment variable BRIEFKASTEN_CHECK_BUFFERS selects full (default; checksums every send buffer twice), light (addresses, sizes, requests) or off. Turn it ON to diagnose transport errors such as Intel MPI's cma_read_nbytes == size."
   OFF)
 option(
   BRIEFKASTEN_USE_CXX23

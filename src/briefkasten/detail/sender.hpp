@@ -197,7 +197,7 @@ private:
                     std::size_t request_index) {
         auto& active_send = active_sends_[request_index];
 #ifdef BRIEFKASTEN_CHECK_BUFFERS
-        if (active_send.has_value() || request != MPI_REQUEST_NULL) {
+        if (internal::buffer_checks_enabled() && (active_send.has_value() || request != MPI_REQUEST_NULL)) {
             internal::buffer_check_failed("send slot reused while its send is in flight: its buffer is freed under MPI");
         }
 #endif
@@ -210,9 +210,12 @@ private:
                   kamping::mpi_datatype<value_type>(), msg.destination, msg.tag, comm_, &request);
 #endif
 #ifdef BRIEFKASTEN_CHECK_BUFFERS
-        send_records_[request_index] = internal::BufferRecord{.data = active_send->message.data(),
-                                                              .size = active_send->message.size(),
-                                                              .checksum = internal::buffer_checksum(active_send->message)};
+        if (internal::buffer_checks_enabled()) {
+            send_records_[request_index] = internal::BufferRecord{
+                .data = active_send->message.data(),
+                .size = active_send->message.size(),
+                .checksum = internal::buffer_checksums_enabled() ? internal::buffer_checksum(active_send->message) : 0};
+        }
 #endif
     }
 
@@ -220,6 +223,9 @@ private:
     /// The send of slot \p index completed: MPI must have released the request, and the buffer must be the one given to
     /// MPI_Isend, unchanged.
     void check_completed_send(int index) {
+        if (!internal::buffer_checks_enabled()) {
+            return;
+        }
         auto const slot = static_cast<std::size_t>(index);
         if (request_pool_.is_active(index)) {
             internal::buffer_check_failed("send reported complete while MPI still holds its request");
@@ -229,13 +235,16 @@ private:
         if (static_cast<void const*>(message.data()) != record.data || message.size() != record.size) {
             internal::buffer_check_failed("send buffer moved or resized while in flight");
         }
-        if (internal::buffer_checksum(message) != record.checksum) {
+        if (internal::buffer_checksums_enabled() && internal::buffer_checksum(message) != record.checksum) {
             internal::buffer_check_failed("send buffer modified while in flight");
         }
         send_records_[slot] = {};
     }
 
     void check_no_sends_in_flight(char const* what) const {
+        if (!internal::buffer_checks_enabled()) {
+            return;
+        }
         for (std::size_t slot = 0; slot < active_sends_.size(); ++slot) {
             if (active_sends_[slot].has_value() && request_pool_.is_active(static_cast<int>(slot))) {
                 internal::buffer_check_failed(what);

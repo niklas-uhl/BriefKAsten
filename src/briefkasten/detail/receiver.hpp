@@ -377,6 +377,9 @@ private:
         armed_buffers_[slot_of(buffer)] = internal::BufferRecord{.data = buffer.data(), .size = buffer.size()};
     }
     void check_armed(ReceiveBufferContainer const& buffer, char const* what) const {
+        if (!internal::buffer_checks_enabled()) {
+            return;
+        }
         auto const& record = armed_buffers_[slot_of(buffer)];
         if (static_cast<void const*>(buffer.data()) != record.data || buffer.size() != record.size) {
             internal::buffer_check_failed(what);
