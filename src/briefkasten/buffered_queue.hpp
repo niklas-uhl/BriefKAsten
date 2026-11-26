@@ -942,6 +942,9 @@ public:
 
 private:
     using BufferMap = std::unordered_map<PEID, BufferContainer>;
+    /// Whether an overflow flush keeps the destination's entry (see resolve_overflow): needs capacity() to tell a
+    /// moved-from shell from an empty pool buffer.
+    static constexpr bool KEEP_ENTRY_ON_OVERFLOW = requires(BufferContainer const& buffer) { buffer.capacity(); };
     using BufferList = std::vector<BufferContainer>;
 
     /// \c redirected: how many of its elements are redirected, no longer counted as buffered once sent.
@@ -1075,8 +1078,8 @@ private:
             if (it == aggregation_buffers_.end()) {
                 std::tie(it, std::ignore) = aggregation_buffers_.emplace(receiver, std::move(buffer));
             } else if (it->second.empty()) {
-                // created meanwhile and still empty: it owns a pool buffer (a flush that moves a buffer out
-                // erases the entry, so this is never a moved-from shell), recycle it instead of overwriting it
+                // still empty: a pool buffer, or the moved-from shell the overflow flush left in the entry;
+                // recycle it (recycle_buffer drops a shell) instead of overwriting it
                 recycle_buffer(std::move(it->second));
                 it->second = std::move(buffer);
             } else {
@@ -1084,6 +1087,15 @@ private:
                 recycle_buffer(std::move(buffer));
             }
         };
+        // An overflow flush keeps the destination's entry with the moved-from shell of the sent buffer (see
+        // resolve_overflow). A post that finds such a shell, e.g. a proxy's redirection handler while the overflowing
+        // post polls, must not merge into it: that would grow it into a buffer the pool never counted. It takes a
+        // pool buffer instead, and the shell is dropped.
+        if constexpr (KEEP_ENTRY_ON_OVERFLOW) {
+            if (it->second.empty() && it->second.capacity() == 0) {
+                replace_flushed_buffer();
+            }
+        }
         // A message that does not fit even an empty buffer: flushing first would not help (the fresh buffer is
         // just as small, and flushing an empty one is a no-op), so it is merged into the current buffer, which is
         // then sent at once, as a large message if it exceeds the receive buffers.
@@ -1400,9 +1412,14 @@ private:
         };
     }
 
-    /// Return a buffer that was never sent to the pool. Only pool buffers may come here: a flush that sends or
-    /// parks a buffer erases its destination's entry, so no moved-from shell is left to be recycled.
+    /// Return a buffer that was never sent to the pool. A moved-from shell (capacity 0, left in an entry by an
+    /// overflow flush) is not a pool buffer and is dropped: a pool buffer keeps its capacity.
     void recycle_buffer(BufferContainer&& buffer) {
+        if constexpr (KEEP_ENTRY_ON_OVERFLOW) {
+            if (buffer.capacity() == 0) {
+                return;
+            }
+        }
         num_buffer_recycles_++;
         buffer.resize(0);  // this does not reduce the capacity
         if constexpr (requires { buffer.capacity(); }) {
@@ -1444,10 +1461,14 @@ private:
                     // already flushed by a redirection handler while we polled
                     return true;
                 }
-                // Erase the entry: a sent or parked buffer leaves a moved-from shell, which must not reach the
-                // pool (it is not a pool buffer, and filling it allocates one the pool never counted).
-                // replace_flushed_buffer looks the destination up again and gives it a pool buffer.
-                auto ret = flush_buffer_impl(current_buffer);
+                // Keep the entry: erasing and re-inserting it on every overflow moves the destination in the buffer
+                // map's iteration order (std::unordered_map: to the front), which is the order the termination drain
+                // and the idle flush walk; with the drain stopping early, busy destinations went first and the rest
+                // waited (KaCCv2 flat label propagation, lake-lanier: +13-25 % before the idle flush). The entry
+                // keeps the moved-from shell of the sent or parked buffer; replace_flushed_buffer swaps it for a pool
+                // buffer and recycle_buffer drops it. Containers without capacity() cannot tell a shell from an
+                // empty pool buffer, so for them the entry is erased.
+                auto ret = flush_buffer_impl(current_buffer, /*erase=*/!KEEP_ENTRY_ON_OVERFLOW);
                 return ret.second;
             }
             case FlushStrategy::global: {
