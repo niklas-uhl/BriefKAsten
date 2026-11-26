@@ -111,6 +111,29 @@ TEST(LargeMessageTest, direct) {
     kamping::Communicator<> comm;
     auto queue = direct_queue(comm, small_buffers());
     check(comm, run(comm, queue));
+    // the buffers the large messages grew are released when they return to the pool
+    EXPECT_GT(global_sum(comm, queue.num_grown_buffers_released()), 0U);
+}
+
+/// Buffers filled up to the threshold never grow, so none is released (pool buffers are reserved for exactly that).
+TEST(LargeMessageTest, full_buffers_are_kept) {
+    kamping::Communicator<> comm;
+    auto queue = direct_queue(comm, small_buffers());
+    auto on_message = [](auto /*envelope*/) {};
+    comm.barrier();
+    for (std::size_t round = 0; round < 50; ++round) {
+        for (std::size_t size : {std::size_t{1}, std::size_t{100}, FITS_EXACTLY}) {
+            for (int receiver = 0; receiver < comm.size_signed(); ++receiver) {
+                queue.post_message_blocking(make_message(comm.rank_signed(), size), receiver, on_message);
+                queue.poll(on_message);
+            }
+        }
+    }
+    while (!queue.terminate(on_message)) {
+    }
+    EXPECT_EQ(queue.num_large_messages(), 0U);
+    EXPECT_GT(queue.num_overflows(), 0U);
+    EXPECT_EQ(queue.num_grown_buffers_released(), 0U);
 }
 
 TEST(LargeMessageTest, direct_with_flow_control) {

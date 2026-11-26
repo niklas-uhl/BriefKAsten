@@ -737,6 +737,11 @@ public:
         return num_large_message_elements_;
     }
 
+    /// Pool buffers grown by a large message whose memory was released when they returned to the pool.
+    [[nodiscard]] std::size_t num_grown_buffers_released() const {
+        return num_grown_buffers_released_;
+    }
+
     [[nodiscard]] std::size_t num_elements_flushed() const {
         return num_elements_flushed_;
     }
@@ -898,6 +903,7 @@ public:
         num_overflows_ = 0;
         num_large_messages_ = 0;
         num_large_message_elements_ = 0;
+        num_grown_buffers_released_ = 0;
         num_elements_flushed_ = 0;
         num_buffer_stalls_ = 0;
         num_drain_capacity_waits_ = 0;
@@ -964,7 +970,16 @@ private:
         for (auto& buf :
              std::ranges::subrange(free_aggregation_buffers_.begin() + old_size, free_aggregation_buffers_.end())) {
             num_aggregation_buffers_++;
-            buf.reserve(buffer_size);
+            reserve_pool_buffer(buf, buffer_size);
+        }
+    }
+
+    /// Reserve \p buffer_size elements for a pool buffer and remember the capacity that gives (reserve may round up),
+    /// so recycle_buffer can tell a buffer a large message grew from an untouched one.
+    void reserve_pool_buffer(BufferContainer& buffer, std::size_t buffer_size) {
+        buffer.reserve(buffer_size);
+        if constexpr (requires { buffer.capacity(); }) {
+            pool_buffer_capacity_ = std::max(pool_buffer_capacity_, buffer.capacity());
         }
     }
 
@@ -1367,11 +1382,13 @@ private:
         num_buffer_recycles_++;
         buffer.resize(0);  // this does not reduce the capacity
         if constexpr (requires { buffer.capacity(); }) {
-            // a large message grew it: do not keep that memory in the pool
-            auto const reserved = queue_.reserved_receive_buffer_size();
-            if (buffer.capacity() > 2 * reserved) {
+            // A large message grew it beyond a pool buffer: do not keep that memory in the pool. A buffer filled up to
+            // the local threshold never grows, since pool buffers are reserved for it. (Without a local threshold, a
+            // buffer may grow up to the global one and is then reallocated on every reuse after growing.)
+            if (buffer.capacity() > pool_buffer_capacity_) {
                 buffer = BufferContainer{};
-                buffer.reserve(reserved);
+                reserve_pool_buffer(buffer, queue_.reserved_receive_buffer_size());
+                num_grown_buffers_released_++;
             }
         }
         free_aggregation_buffers_.emplace_back(std::move(buffer));
@@ -1482,6 +1499,8 @@ private:
     std::size_t num_overflows_ = 0;
     std::size_t num_large_messages_ = 0;
     std::size_t num_large_message_elements_ = 0;
+    std::size_t num_grown_buffers_released_ = 0;
+    std::size_t pool_buffer_capacity_ = 0;  ///< the largest capacity a freshly reserved pool buffer got
     std::size_t num_elements_flushed_ = 0;
     std::size_t num_buffer_stalls_ = 0;
     std::size_t num_drain_capacity_waits_ = 0;
