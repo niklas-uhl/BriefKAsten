@@ -341,9 +341,9 @@ private:
         }
         state.in_granted = new_in_granted;
         send_grant(peer, state);
-        // Only a grant on a proxied link adds to what this rank may have to forward. A grant to any other peer is
-        // unrelated to the redirect limit; the limit can be exceeded while an oversize buffer (has_credit) is being
-        // forwarded, and that must not hold back grants to peers that send nothing to forward.
+        // Only a grant on a proxied link adds to what this rank may have to forward, so only those are checked
+        // against the redirect high water. While an overdrawn buffer from a proxied peer (has_credit) is being
+        // forwarded, the sum may exceed it, and a grant to another peer meanwhile is still correct.
         KASSERT(!state.proxied ||
                     num_redirect_elements_buffered_ + sum_proxied_in_credit_ <= redirect_high_water(),
                 "redirect elements overshot their high-water mark: buffered=" << num_redirect_elements_buffered_
