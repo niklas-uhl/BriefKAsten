@@ -207,3 +207,34 @@ TEST(BufferPoolTest, old_base_switches_with_drop_shells) {
     auto queue = direct_queue(comm, conf);
     run_and_check(comm, queue);
 }
+
+// The candidate: bounded_pool (with #30's reserve rules) and drop_shells instead of #29's erase.
+TEST(BufferPoolTest, drop_shells) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.drop_shells = true;
+    auto queue = direct_queue(comm, conf);
+    run_and_check(comm, queue);
+    EXPECT_GE(queue.num_dropped_shells(), MESSAGES_PER_RECEIVER / 6);
+}
+
+// drop_shells under indirection: a proxy's handler may post into a destination whose entry still holds the shell
+// of a buffer just flushed by the overflowing post; that post must take a pool buffer, not grow the shell.
+TEST(BufferPoolTest, drop_shells_grid) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.drop_shells = true;
+    briefkasten::IndirectionAdapter queue{direct_queue(comm, conf),
+                                          briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
+    run_and_check(comm, queue);
+}
+
+TEST(BufferPoolTest, drop_shells_grid_small_credit_window) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.drop_shells = true;
+    conf.num_credit_buffers = 2;
+    briefkasten::IndirectionAdapter queue{direct_queue(comm, conf),
+                                          briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
+    run_and_check(comm, queue);
+}

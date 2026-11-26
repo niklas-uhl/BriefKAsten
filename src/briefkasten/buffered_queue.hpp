@@ -108,10 +108,12 @@ struct Config {
     /// messages may take the proxy's reserve, and own posts never wait for the reserve. For A/B measurements of the
     /// fix with one binary.
     bool bounded_pool = true;
-    /// EXPERIMENT SWITCH (with bounded_pool = false): drop moved-from shells (capacity-0 containers) instead of
-    /// putting them on the free list. This removes the leak of the legacy pool handling and nothing else: an overflow
-    /// flush keeps the destination's map entry (so the termination drain's map order stays as before #29). KaCCv2
-    /// measured the erase of #29 changing that order (exp/kacc-pool-fix-switch, Config::drop_shells there).
+    /// EXPERIMENT SWITCH: a flush of the destination being posted to keeps its map entry, and the moved-from shell
+    /// left in it is dropped (never recycled, never merged into: the next post takes a pool buffer). This is the leak
+    /// fix without #29's erase, which changes the termination drain's map order (KaCCv2: flat ms-async on lake-lanier
+    /// +13-25 %). With bounded_pool = true: the pool fix with #30's reserve rules, minus the erase (the candidate).
+    /// With bounded_pool = false: the legacy pool handling minus the leak; under indirection own messages may then
+    /// still overdraw the proxy's reserve, so the pool is bounded there only by the old redirect ceiling.
     bool drop_shells = false;
     /// EXPERIMENT SWITCH: see DrainOrder.
     DrainOrder drain_order = DrainOrder::map;
@@ -1176,8 +1178,8 @@ private:
             if (it == aggregation_buffers_.end()) {
                 std::tie(it, std::ignore) = aggregation_buffers_.emplace(receiver, std::move(buffer));
             } else if (it->second.empty()) {
-                // created meanwhile and still empty: it owns a pool buffer (a flush that moves a buffer out
-                // erases the entry, so this is never a moved-from shell), recycle it instead of overwriting it
+                // still empty: it owns a pool buffer, or with drop_shells the moved-from shell of the flushed buffer;
+                // recycle it (recycle_buffer drops a shell) instead of overwriting it
                 recycle_buffer(std::move(it->second));
                 it->second = std::move(buffer);
             } else {
@@ -1185,6 +1187,15 @@ private:
                 recycle_buffer(std::move(buffer));
             }
         };
+        // drop_shells: an overflow flush keeps the destination's entry with the moved-from shell of the sent buffer.
+        // A post that finds it (e.g. a proxy's redirection handler while the overflowing post polls) must not merge
+        // into the shell, which would grow into a buffer the pool never counted; it takes a pool buffer instead and
+        // the shell is dropped.
+        if constexpr (requires { it->second.capacity(); }) {
+            if (drop_shells_ && it->second.empty() && it->second.capacity() == 0) {
+                replace_flushed_buffer();
+            }
+        }
         // A message that does not fit even an empty buffer: flushing first would not help (the fresh buffer is
         // just as small, and flushing an empty one is a no-op), so it is merged into the current buffer, which is
         // then sent at once, as a large message if it exceeds the receive buffers.
@@ -1445,7 +1456,7 @@ private:
             pre_flush_hook();
             bool current_flush_successful = false;
             std::tie(it, current_flush_successful) =
-                flush_buffer_impl(it, bounded_pool_ || it != current_buffer);  // `it` is updated by std::tie
+                flush_buffer_impl(it, erase_on_flush() || it != current_buffer);  // `it` is updated by std::tie
             if (current_flush_successful) {
                 flushed_something = true;
             } else {
@@ -1472,7 +1483,7 @@ private:
             std::max_element(aggregation_buffers_.begin(), aggregation_buffers_.end(),
                              [](auto& lhs, auto& rhs) { return lhs.second.size() < rhs.second.size(); });
         if (largest_buffer != aggregation_buffers_.end()) {
-            auto it = flush_buffer_impl(largest_buffer, bounded_pool_ || largest_buffer != current_buffer);
+            auto it = flush_buffer_impl(largest_buffer, erase_on_flush() || largest_buffer != current_buffer);
             return it.second;
         }
         return true;
@@ -1504,6 +1515,12 @@ private:
 
     /// Return a buffer that was never sent to the pool. Only pool buffers may come here: a flush that sends or
     /// parks a buffer erases its destination's entry, so no moved-from shell is left to be recycled.
+    /// Whether a flush of the destination being posted to (overflow, flush-all, flush-largest) erases its entry:
+    /// bounded_pool does (#29), so no moved-from shell is left; drop_shells keeps the entry and drops the shell.
+    [[nodiscard]] bool erase_on_flush() const {
+        return bounded_pool_ && !drop_shells_;
+    }
+
     void recycle_buffer(BufferContainer&& buffer) {
         if constexpr (requires { buffer.capacity(); }) {
             // a pool buffer keeps its capacity, so capacity 0 means a moved-from shell
@@ -1554,7 +1571,7 @@ private:
                 // Erase the entry: a sent or parked buffer leaves a moved-from shell, which must not reach the
                 // pool (it is not a pool buffer, and filling it allocates one the pool never counted).
                 // replace_flushed_buffer looks the destination up again and gives it a pool buffer.
-                auto ret = flush_buffer_impl(current_buffer, /*erase=*/bounded_pool_);
+                auto ret = flush_buffer_impl(current_buffer, /*erase=*/erase_on_flush());
                 return ret.second;
             }
             case FlushStrategy::global: {
