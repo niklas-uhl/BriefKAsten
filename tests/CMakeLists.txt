@@ -18,6 +18,15 @@ target_link_libraries(workloop_test PRIVATE KaTestrophe::main)
 katestrophe_add_mpi_test(workloop_test CORES 1 2 3 4)
 set_target_properties(workloop_test PROPERTIES KASSERT_ASSERTION_LEVEL 30)
 
+add_executable(idle_flush_test idle_flush_test.cpp)
+target_link_libraries(idle_flush_test PRIVATE BriefKAsten::BriefKAsten)
+target_link_libraries(idle_flush_test PRIVATE KaTestrophe::main)
+# 8 and 9 ranks (the credit-pressure grid case) are registered by the pool-bound PR on top: under load they hit two
+# flow-control bugs of the base, the redirect credit accounting (fixed with the large messages) and the proxy's pool
+# overdraft (fixed by the pool and reserve bounds).
+katestrophe_add_mpi_test(idle_flush_test CORES 1 2 3 4)
+set_target_properties(idle_flush_test PROPERTIES KASSERT_ASSERTION_LEVEL 30)
+
 add_executable(view_adaptor_test view_adaptor_test.cpp)
 target_link_libraries(view_adaptor_test PRIVATE BriefKAsten::BriefKAsten)
 target_link_libraries(view_adaptor_test PRIVATE GTest::gtest_main GTest::gmock)

@@ -63,6 +63,15 @@ public:
         queue_.enable_flow_control(num_credit_buffers, buffers, fan_out(indirection_));
     }
 
+    /// \copydoc BufferedMessageQueue::idle_flush(IdleFlush)
+    void idle_flush(IdleFlush mode) {
+        queue_.idle_flush(mode);
+    }
+
+    [[nodiscard]] IdleFlush idle_flush() const {
+        return queue_.idle_flush();
+    }
+
     /// Enable the selective termination drain; see BufferedMessageQueue::flush_all_buffers_blocking.
     void selective_drain(bool enable) {
         queue_.selective_drain(enable);
