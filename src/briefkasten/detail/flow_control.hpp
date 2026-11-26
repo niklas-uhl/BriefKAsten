@@ -167,7 +167,7 @@ public:
             return true;
         }
         Peer& state = peer_state(peer);
-        auto const credit = state.out_allowed - std::min(state.out_allowed, state.out_sent);
+        auto const credit = out_credit(state);
         if (elements <= credit) {
             return true;
         }
@@ -191,12 +191,12 @@ public:
             return;
         }
         Peer& state = peer_state(peer);
-        auto const outstanding_before = outstanding_credit(state);
+        auto const outstanding_before = in_credit(state);
         state.in_received += elements;
         if (state.proxied) {  // message from the peer may contain data that we have to forward
             // the granted credit is used up: what we forward of it is now counted as buffered (hold_redirected).
             // Only the credit this peer had outstanding: an oversize pass (has_credit) receives more than that.
-            sum_proxied_in_credit_ -= outstanding_before - outstanding_credit(state);
+            sum_proxied_in_credit_ -= outstanding_before - in_credit(state);
         }
         grant_if_due(peer, state);
     }
@@ -248,7 +248,7 @@ public:
         state.proxied = proxied;
         if (proxied) {
             // the implicit initial window was granted before proxied was known
-            sum_proxied_in_credit_ += state.in_granted - std::min(state.in_granted, state.in_received);
+            sum_proxied_in_credit_ += in_credit(state);
         }
     }
 
@@ -282,7 +282,7 @@ public:
             Peer const& st = entry.second;
             out << "\n    peer " << entry.first << (st.proxied ? " PROXIED" : " DEST ") << " out_sent=" << st.out_sent
                 << " out_allowed=" << st.out_allowed
-                << " credit=" << (st.out_allowed - std::min(st.out_allowed, st.out_sent))
+                << " credit=" << out_credit(st)
                 << " in_granted=" << st.in_granted << " in_received=" << st.in_received
                 << (st.proxied_known ? "" : " PROXIED_UNKNOWN") << (st.grant_withheld ? " GRANT_WITHHELD" : "")
                 << (st.grant_pending ? " GRANT_PENDING" : "")
@@ -309,8 +309,14 @@ private:
         return peers_.emplace(peer, fresh).first->second;
     }
 
-    /// The credit granted to \p state's peer and not yet used: in_granted - in_received, 0 after an oversize pass.
-    [[nodiscard]] static std::size_t outstanding_credit(Peer const& state) {
+    /// Outbound credit: what this rank may still send to \p state's peer; 0 after an oversize pass.
+    [[nodiscard]] static std::size_t out_credit(Peer const& state) {
+        return state.out_allowed - std::min(state.out_allowed, state.out_sent);
+    }
+
+    /// Inbound credit: what \p state's peer may still send this rank (granted, not yet received); 0 after an
+    /// oversize pass.
+    [[nodiscard]] static std::size_t in_credit(Peer const& state) {
         return state.in_granted - std::min(state.in_granted, state.in_received);
     }
 
