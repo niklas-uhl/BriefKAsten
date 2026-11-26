@@ -10,6 +10,10 @@ project(
 option(BRIEFKASTEN_BUILD_EXAMPLES "Build examples" ${PROJECT_IS_TOP_LEVEL})
 option(BRIEFKASTEN_BUILD_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
 option(
+  BRIEFKASTEN_STALL_TRACE
+  "Compile in the stall tracer (runtime-gated by BRIEFKASTEN_STALL_TRACE_SECONDS). Off by default: no diagnostic scaffolding in a production hot path. Turn it ON to diagnose a hang -- phase-end counters cannot see a stall, because the phase never ends."
+  OFF)
+option(
   BRIEFKASTEN_USE_CXX23
   "Use C++23. Default is ON, when OFF, this library uses C++20 and depends on range-v3."
   ON)
@@ -74,6 +78,11 @@ else()
   message(
     STATUS "Compiler supports std::views::split and std::views::lazy_split")
 endif()
+if(BRIEFKASTEN_STALL_TRACE)
+  target_compile_definitions(BriefKAsten_BriefKAsten INTERFACE BRIEFKASTEN_STALL_TRACE)
+  message(STATUS "BriefKAsten: stall tracer compiled in; set BRIEFKASTEN_STALL_TRACE_SECONDS to enable")
+endif()
+
 add_library(BriefKAsten::BriefKAsten ALIAS BriefKAsten_BriefKAsten)
 
 if(BRIEFKASTEN_BUILD_EXAMPLES)

@@ -50,6 +50,11 @@ public:
         return 1;
     }
 
+    // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
+    [[nodiscard]] bool may_redirect(PEID /*peer*/) const {
+        return false;
+    }
+
 private:
     [[nodiscard]] int rank() const {
         return my_rank_;

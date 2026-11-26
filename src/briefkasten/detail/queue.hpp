@@ -83,7 +83,9 @@ public:
           allow_large_messages_(other.allow_large_messages_),
           termination_state_(other.termination_state_),
           synchronous_mode_(other.synchronous_mode_),
-          poll_count_(other.poll_count_) {
+          poll_count_(other.poll_count_),
+          num_polls_(other.num_polls_),
+          num_unproductive_polls_(other.num_unproductive_polls_) {
         receiver_.rebind_termination_counter(termination_);
         large_message_receiver_.rebind_termination_counter(termination_);
     }
@@ -105,6 +107,8 @@ public:
         termination_state_ = other.termination_state_;
         synchronous_mode_ = other.synchronous_mode_;
         poll_count_ = other.poll_count_;
+        num_polls_ = other.num_polls_;
+        num_unproductive_polls_ = other.num_unproductive_polls_;
         receiver_.rebind_termination_counter(termination_);
         large_message_receiver_.rebind_termination_counter(termination_);
     }
@@ -140,6 +144,7 @@ public:
     auto poll(MessageHandler<T, MessageContainer> auto&& on_message,
               SendFinishedCallback<MessageContainer> auto&& on_finished_sending)
         -> std::optional<std::pair<bool, bool>> {
+        num_polls_++;
         bool received_large_message = false;
         if (allow_large_messages_) {
             received_large_message =
@@ -155,6 +160,7 @@ public:
         if (send_finished_something || received_something) {
             return std::pair{send_finished_something, received_something};
         }
+        num_unproductive_polls_++;
         return std::nullopt;
     }
 
@@ -186,8 +192,14 @@ public:
                                  std::invocable<> auto&& before_next_message_counting_round_hook,
                                  std::invocable<> auto&& progress_hook,
                                  std::invocable<> auto&& additional_counts) {
+        num_terminate_calls_++;
         termination_state_ = TerminationState::trying_termination;
         while (true) {
+            // Counted here rather than at start_message_counting: this loop can abort (below) before
+            // ever launching an allreduce, and the hook has ALREADY run by then. Under IndirectionAdapter
+            // the hook is what drains the sibling hop's buffers, so this -- not num_termination_rounds --
+            // is the number that multiplies the proxy's forced flushes.
+            num_termination_drains_++;
             before_next_message_counting_round_hook();
             if (termination_state_ == TerminationState::active) {
                 return false;
@@ -198,8 +210,9 @@ public:
             if (termination_state_ == TerminationState::active) {
                 return false;
             }
-            // additional_counts() folds in a sibling queue's send/receive counts so that termination of a multi-hop
-            // setup is decided by a single allreduce over the whole system (see IndirectionAdapter).
+            // additional_counts() contributes the caller's own not-yet-handed-to-MPI payload (BufferedMessageQueue's
+            // aggregation buffers) to the counting round. It used to also fold a sibling queue's buffer counts in, back
+            // when IndirectionAdapter ran one queue per hop; that is gone with the two-hop collapse.
             termination_.start_message_counting(additional_counts());
             // poll at least once, so we don't miss any messages
             // if the the message box is empty upon calling this function
@@ -279,8 +292,87 @@ public:
         return termination_.local_counts();
     }
 
+    /// Calls to \ref poll, and the subset of them that neither received a message nor completed a send.
+    /// A slow phase whose work counters are unchanged but whose unproductive-poll count has risen was spent
+    /// waiting on the transport, not doing more work.
+    [[nodiscard]] std::size_t num_polls() const {
+        return num_polls_;
+    }
+
+    [[nodiscard]] std::size_t num_unproductive_polls() const {
+        return num_unproductive_polls_;
+    }
+
+    /// Receive (re-)arms issued by the small-message receiver over its lifetime; see \ref
+    /// internal::ReceiveArmCounter. Not reset by \ref reset_counters.
+    [[nodiscard]] std::size_t num_receive_arms() const {
+        return receiver_.num_receive_arms();
+    }
+
+    /// Receive nesting on the small-message receiver; see \ref internal::ReceiveNestingCounter. Per-phase.
+    [[nodiscard]] std::size_t max_probe_depth() const {
+        return receiver_.max_probe_depth();
+    }
+
+    [[nodiscard]] std::size_t num_nested_probes() const {
+        return receiver_.num_nested_probes();
+    }
+
+    [[nodiscard]] std::size_t max_disarmed_slots() const {
+        return receiver_.max_disarmed_slots();
+    }
+
+    [[nodiscard]] std::size_t num_half_deaf_probes() const {
+        return receiver_.num_half_deaf_probes();
+    }
+
+    [[nodiscard]] std::size_t num_deaf_probes() const {
+        return receiver_.num_deaf_probes();
+    }
+
+    [[nodiscard]] std::size_t num_immediate_sends() const {
+        return sender_.num_immediate_sends();
+    }
+
+    [[nodiscard]] std::size_t num_backlogged_sends() const {
+        return sender_.num_backlogged_sends();
+    }
+
+    [[nodiscard]] std::size_t num_send_capacity_misses() const {
+        return sender_.num_send_capacity_misses();
+    }
+
+    [[nodiscard]] std::size_t peak_send_backlog() const {
+        return sender_.peak_send_backlog();
+    }
+
+    /// Resets the per-phase counters. \ref num_receive_arms is deliberately excluded: it tracks a
+    /// transport-side resource that is itself never reset.
+    void reset_counters() {
+        num_polls_ = 0;
+        num_unproductive_polls_ = 0;
+        num_terminate_calls_ = 0;
+        num_termination_drains_ = 0;
+        sender_.reset_counters();
+        receiver_.reset_nesting_counters();
+    }
+
     [[nodiscard]] std::size_t num_termination_rounds() const {
         return termination_.num_termination_rounds();
+    }
+
+    /// Times the *application* called \ref terminate. Each call that returns false is a termination
+    /// attempt aborted by an arriving message, and the caller then does more work and tries again.
+    [[nodiscard]] std::size_t num_terminate_calls() const {
+        return num_terminate_calls_;
+    }
+
+    /// Iterations of terminate's counting loop, i.e. how often \p before_next_message_counting_round_hook
+    /// ran. Strictly >= \ref num_termination_rounds, which only counts rounds that got as far as
+    /// launching an allreduce -- an attempt aborted by an arriving message runs the hook and returns
+    /// without ever counting a round.
+    [[nodiscard]] std::size_t num_termination_drains() const {
+        return num_termination_drains_;
     }
 
 private:
@@ -311,6 +403,10 @@ private:
     TerminationState termination_state_ = TerminationState::active;
     bool synchronous_mode_ = false;
     std::size_t poll_count_ = 0;
+    std::size_t num_terminate_calls_ = 0;
+    std::size_t num_termination_drains_ = 0;
+    std::size_t num_polls_ = 0;
+    std::size_t num_unproductive_polls_ = 0;
 };
 
 }  // namespace briefkasten

@@ -29,6 +29,10 @@ namespace briefkasten::internal {
 struct MessageCounter {
     size_t send;
     size_t receive;
+    /// Elements accepted into an aggregation buffer but not yet handed to MPI. send/receive count
+    /// buffers, so without this a redirected message waiting in a proxy's buffer would let
+    /// termination fire.
+    size_t pending = 0;
     auto operator<=>(const MessageCounter&) const = default;
 };
 
@@ -52,8 +56,10 @@ public:
 
     void start_message_counting(MessageCounter additional = {.send = 0, .receive = 0}) {
         if (reduce_req_ == MPI_REQUEST_NULL) {
-            global_ = {.send = local_.send + additional.send, .receive = local_.receive + additional.receive};
-            MPI_Iallreduce(MPI_IN_PLACE, &global_, 2, kamping::mpi_datatype<std::size_t>(), MPI_SUM, comm_,
+            global_ = {.send = local_.send + additional.send,
+                       .receive = local_.receive + additional.receive,
+                       .pending = additional.pending};
+            MPI_Iallreduce(MPI_IN_PLACE, &global_, 3, kamping::mpi_datatype<std::size_t>(), MPI_SUM, comm_,
                            &reduce_req_);
             num_termination_rounds_++;
         }
@@ -73,11 +79,14 @@ public:
     }
 
     [[nodiscard]] bool terminated() {
-        bool terminated = global_ == previous_global_ && global_.send == global_.receive;
+        // `pending == 0` is required in addition to the balance: a payload still sitting in some
+        // rank's aggregation buffer is neither sent nor received, so the balance alone cannot see it.
+        bool terminated =
+            global_ == previous_global_ && global_.send == global_.receive && global_.pending == 0;
         if (!terminated) {
             // store for double counting
             previous_global_ = global_;
-            global_ = {.send = 0, .receive = 0};
+            global_ = {.send = 0, .receive = 0, .pending = 0};
         }
         return terminated;
     }

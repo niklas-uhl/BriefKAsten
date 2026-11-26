@@ -51,6 +51,15 @@ public:
         return grid_size_;
     }
 
+    /// Whether buffers from \p peer may contain messages this rank has to forward: true unless \p peer is in
+    /// our own column, since a destination in the sender's column is always reached directly.
+    [[nodiscard]] bool may_redirect(PEID peer) const {
+        if (peer == rank()) {
+            return false;
+        }
+        return rank_to_grid_position(peer).column != rank_to_grid_position(rank()).column;
+    }
+
     /// Size of a column-group (number of rows), i.e. the second-hop fan-out: a proxy forwards within a column to every
     /// final receiver in it. For a non-square grid this exceeds num_groups by up to one, and it is >= both hops'
     /// fan-out, so callers can use it as a single conservative bound for sizing both hop queues.
