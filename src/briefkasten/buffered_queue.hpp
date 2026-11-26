@@ -102,6 +102,11 @@ struct Config {
     /// messages may take the proxy's reserve, and own posts never wait for the reserve. For A/B measurements of the
     /// fix with one binary.
     bool bounded_pool = true;
+    /// EXPERIMENT SWITCH (with bounded_pool = false): drop moved-from shells (capacity-0 containers) instead of
+    /// putting them on the free list. This removes the leak of the legacy pool handling and nothing else: an overflow
+    /// flush keeps the destination's map entry (so the termination drain's map order stays as before #29). KaCCv2
+    /// measured the erase of #29 changing that order (exp/kacc-pool-fix-switch, Config::drop_shells there).
+    bool drop_shells = false;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -164,6 +169,7 @@ public:
         idle_flush_round_robin_ = effective_config_.idle_flush_round_robin;
         queue_.allow_large_messages(effective_config_.allow_large_messages);
         bounded_pool_ = effective_config_.bounded_pool;
+        drop_shells_ = effective_config_.drop_shells;
         reserve_aggregation_buffers(effective_config_.num_request_slots);
 #ifdef BRIEFKASTEN_STALL_TRACE
         if (char const* trace = std::getenv("BRIEFKASTEN_STALL_TRACE_SECONDS")) {
@@ -853,6 +859,11 @@ public:
     }
 
     /// Own posts that waited for the reserve to drain (see \ref reserve_pause_threshold).
+    /// Moved-from shells dropped instead of recycled (Config::drop_shells).
+    [[nodiscard]] std::size_t num_dropped_shells() const {
+        return num_dropped_shells_;
+    }
+
     [[nodiscard]] std::size_t num_reserve_waits() const {
         return num_reserve_waits_;
     }
@@ -974,6 +985,7 @@ public:
         num_redirect_buffer_stalls_ = 0;
         num_reserve_waits_ = 0;
         peak_reserve_buffers_ = 0;
+        num_dropped_shells_ = 0;
         flow_.reset_counters();
         queue_.reset_counters();
     }
@@ -1437,6 +1449,13 @@ private:
     /// Return a buffer that was never sent to the pool. Only pool buffers may come here: a flush that sends or
     /// parks a buffer erases its destination's entry, so no moved-from shell is left to be recycled.
     void recycle_buffer(BufferContainer&& buffer) {
+        if constexpr (requires { buffer.capacity(); }) {
+            // a pool buffer keeps its capacity, so capacity 0 means a moved-from shell
+            if (drop_shells_ && buffer.capacity() == 0) {
+                num_dropped_shells_++;
+                return;
+            }
+        }
         num_buffer_recycles_++;
         buffer.resize(0);  // this does not reduce the capacity
         if constexpr (requires { buffer.capacity(); }) {
@@ -1448,7 +1467,7 @@ private:
             }
         }
         free_aggregation_buffers_.emplace_back(std::move(buffer));
-        KASSERT(!bounded_pool_ || free_aggregation_buffers_.size() <= num_aggregation_buffers_,
+        KASSERT((!bounded_pool_ && !drop_shells_) || free_aggregation_buffers_.size() <= num_aggregation_buffers_,
                 "the free list holds " << free_aggregation_buffers_.size() << " buffers, more than the pool's "
                                        << num_aggregation_buffers_ << ": a buffer was recycled twice or never counted");
     }
@@ -1602,6 +1621,8 @@ private:
     std::size_t peak_reserve_buffers_ = 0;  ///< most buffers in use beyond the pool cap at once
     std::size_t num_peers_ = 0;
     bool bounded_pool_ = true;  ///< Config::bounded_pool (experiment switch)
+    bool drop_shells_ = false;  ///< Config::drop_shells (experiment switch)
+    std::size_t num_dropped_shells_ = 0;
     std::size_t poll_throttle_count_ = 0;
     // only read by the stall tracer
     std::size_t num_buffer_acquires_ = 0;
