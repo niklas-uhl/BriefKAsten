@@ -164,3 +164,31 @@ TEST(BufferPoolTest, legacy_pool_drop_shells) {
     run_and_check(comm, queue);
     EXPECT_GE(queue.num_dropped_shells(), MESSAGES_PER_RECEIVER / 6);
 }
+
+// Config::drain_order: every order delivers everything and keeps the pool bounded.
+TEST(BufferPoolTest, drain_order_rank) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.drain_order = briefkasten::DrainOrder::rank;
+    auto queue = direct_queue(comm, conf);
+    run_and_check(comm, queue);
+    EXPECT_GE(queue.num_drains(), 1);
+}
+
+TEST(BufferPoolTest, drain_order_rotating) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.drain_order = briefkasten::DrainOrder::rotating;
+    auto queue = direct_queue(comm, conf);
+    run_and_check(comm, queue);
+    EXPECT_GE(queue.num_drains(), 1);
+}
+
+TEST(BufferPoolTest, drain_order_rotating_grid) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.drain_order = briefkasten::DrainOrder::rotating;
+    briefkasten::IndirectionAdapter queue{direct_queue(comm, conf),
+                                          briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
+    run_and_check(comm, queue);
+}
