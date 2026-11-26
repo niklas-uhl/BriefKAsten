@@ -94,8 +94,10 @@ struct Config {
     bool idle_flush_round_robin = true;
     /// A message that does not fit an empty aggregation buffer (local threshold) is merged into its destination's
     /// buffer, which is then sent at once as a large message (its own tag, received by probing into a buffer of the
-    /// probed size). Costs every poll one extra MPI_Improbe for that tag. false: such a message throws.
-    bool allow_large_messages = true;
+    /// probed size). Costs every poll one extra MPI_Improbe for that tag, so it is off unless the application can
+    /// produce such messages (KaCCv2, flat label propagation on lake-lanier at 768 cores: +16-18 % without the idle
+    /// flush, 1-2 % with it). false: such a message throws.
+    bool allow_large_messages = false;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct

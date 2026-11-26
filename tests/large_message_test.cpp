@@ -94,6 +94,7 @@ void check(kamping::Communicator<> const& comm, Outcome const& outcome) {
 briefkasten::Config small_buffers() {
     briefkasten::Config conf;
     conf.local_threshold_bytes = THRESHOLD_BYTES;
+    conf.allow_large_messages = true;
     return conf;
 }
 
@@ -135,4 +136,20 @@ TEST(LargeMessageTest, grid_without_flow_control) {
     briefkasten::IndirectionAdapter queue{direct_queue(comm, conf),
                                           briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
     check(comm, run(comm, queue));
+}
+
+/// Large messages are opt-in (each poll then probes their tag): by default a message that does not fit an empty
+/// buffer throws instead of being sent.
+TEST(LargeMessageTest, off_by_default) {
+    kamping::Communicator<> comm;
+    briefkasten::Config conf;
+    conf.local_threshold_bytes = THRESHOLD_BYTES;
+    EXPECT_FALSE(conf.allow_large_messages);
+    auto queue = direct_queue(comm, conf);
+    auto on_message = [](auto /*envelope*/) {};
+    std::vector<int> const large(4 * THRESHOLD_BYTES / sizeof(int), comm.rank_signed());
+    EXPECT_THROW(queue.post_message_blocking(std::vector<int>(large), comm.rank_signed(), on_message),
+                 std::runtime_error);
+    while (!queue.terminate(on_message)) {
+    }
 }
