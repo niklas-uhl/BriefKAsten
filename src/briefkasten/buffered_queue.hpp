@@ -63,6 +63,12 @@ static constexpr std::size_t DEFAULT_BUFFERS_PER_PEER = 2;
 
 enum class FlushStrategy : std::uint8_t { local, global, random, largest };
 
+/// EXPERIMENT SWITCH: the order in which the termination drain flushes the aggregation buffers (it stops as soon as
+/// new work arrives, so the order decides which buffers wait). map: the buffer map's iteration order, i.e. for
+/// libstdc++'s std::unordered_map the most recently inserted destination first. rank: ascending destination rank.
+/// rotating: ascending rank, starting at the destination where the previous drain stopped.
+enum class DrainOrder : std::uint8_t { map, rank, rotating };
+
 struct Config {
     size_t num_request_slots = DEFAULT_NUM_REQUEST_SLOTS;
     std::optional<std::size_t> max_num_aggregation_buffers = std::nullopt;
@@ -87,6 +93,8 @@ struct Config {
     /// flush still keeps the destination's map entry, and own messages are not held below the cap. Isolates whether
     /// the cost of bounded_pool on drain-heavy workloads comes from erasing entries or from the bounded pool itself.
     bool drop_shells = false;
+    /// EXPERIMENT SWITCH: see DrainOrder.
+    DrainOrder drain_order = DrainOrder::map;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -154,6 +162,7 @@ public:
 #endif
         bounded_pool_ = effective_config_.bounded_pool;
         drop_shells_ = effective_config_.drop_shells;
+        drain_order_ = effective_config_.drain_order;
         // flow control is on by default; IndirectionAdapter re-configures it for its smaller peer count
         if (effective_config_.num_credit_buffers.value_or(DEFAULT_NUM_CREDIT_BUFFERS) > 0) {
             int comm_size = 0;
@@ -461,12 +470,28 @@ public:
         for (auto const& entry : aggregation_buffers_) {
             drain_targets_.push_back(entry.first);
         }
+        if (drain_order_ != DrainOrder::map) {
+            std::ranges::sort(drain_targets_);
+            if (drain_order_ == DrainOrder::rotating) {
+                std::ranges::rotate(drain_targets_, std::ranges::lower_bound(drain_targets_, drain_cursor_));
+            }
+        }
+        num_drains_++;
+        num_drain_targets_ += drain_targets_.size();
         auto finish = [&] { draining_ = false; };
-        for (PEID target : drain_targets_) {
+        // new work arrived before target i was flushed: the rest waits for the next drain
+        auto stop_early = [&](std::size_t i) {
+            num_drain_early_stops_++;
+            num_drain_targets_left_ += drain_targets_.size() - i;
+            drain_cursor_ = drain_targets_[i];
+            finish();
+        };
+        for (std::size_t i = 0; i < drain_targets_.size(); ++i) {
+            PEID const target = drain_targets_[i];
             poll(on_message);  // observe arrivals (may flip should_stop) and progress sends
             progress_hook();
             if (should_stop()) {
-                finish();
+                stop_early(i);
                 return;
             }
             // with flow control a flush never fails (it parks), so there is nothing to wait for
@@ -475,10 +500,11 @@ public:
                 poll(on_message);  // only block when slots are exhausted; polling frees them as peers receive
                 progress_hook();
                 if (should_stop()) {
-                    finish();
+                    stop_early(i);
                     return;
                 }
             }
+            drain_cursor_ = target + 1;
             auto it = aggregation_buffers_.find(target);
             if (it == aggregation_buffers_.end()) {
                 continue;  // a nested redirect flushed it while we were polling
@@ -785,6 +811,21 @@ public:
         return num_peers_;
     }
 
+    /// Termination drains, drains that stopped early because new work arrived, destinations snapshotted by all
+    /// drains, and destinations an early stop left unflushed (Config::drain_order experiment).
+    [[nodiscard]] std::size_t num_drains() const {
+        return num_drains_;
+    }
+    [[nodiscard]] std::size_t num_drain_early_stops() const {
+        return num_drain_early_stops_;
+    }
+    [[nodiscard]] std::size_t num_drain_targets() const {
+        return num_drain_targets_;
+    }
+    [[nodiscard]] std::size_t num_drain_targets_left() const {
+        return num_drain_targets_left_;
+    }
+
     /// Moved-from shells dropped instead of recycled (Config::drop_shells).
     [[nodiscard]] std::size_t num_dropped_shells() const {
         return num_dropped_shells_;
@@ -895,6 +936,10 @@ public:
         num_redirect_buffer_stalls_ = 0;
         num_reserve_waits_ = 0;
         num_dropped_shells_ = 0;
+        num_drains_ = 0;
+        num_drain_early_stops_ = 0;
+        num_drain_targets_ = 0;
+        num_drain_targets_left_ = 0;
         peak_reserve_buffers_ = 0;
         flow_.reset_counters();
         queue_.reset_counters();
@@ -1415,6 +1460,12 @@ private:
     bool bounded_pool_ = true;              ///< Config::bounded_pool (experiment switch)
     bool drop_shells_ = false;              ///< Config::drop_shells (experiment switch)
     std::size_t num_dropped_shells_ = 0;    ///< shells dropped instead of recycled
+    DrainOrder drain_order_ = DrainOrder::map;  ///< Config::drain_order (experiment switch)
+    PEID drain_cursor_ = 0;                     ///< DrainOrder::rotating: where the next drain starts
+    std::size_t num_drains_ = 0;
+    std::size_t num_drain_early_stops_ = 0;
+    std::size_t num_drain_targets_ = 0;
+    std::size_t num_drain_targets_left_ = 0;
     std::size_t num_reserve_waits_ = 0;     ///< own posts that waited for the reserve to drain
     std::size_t peak_reserve_buffers_ = 0;  ///< most buffers in use beyond the pool cap at once
     std::size_t poll_throttle_count_ = 0;
