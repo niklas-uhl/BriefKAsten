@@ -97,6 +97,7 @@ public:
           peers_(std::move(other.peers_)),
           pending_grants_(std::move(other.pending_grants_)),
           limits_(other.limits_),
+          half_window_pass_(other.half_window_pass_),
           sum_proxied_in_credit_(other.sum_proxied_in_credit_),
           num_redirect_elements_buffered_(other.num_redirect_elements_buffered_),
           withheld_grants_(std::move(other.withheld_grants_)),
@@ -128,6 +129,12 @@ public:
 
     /// Give every peer a window of \p num_window_elements and arm the grant receives. May be called again to
     /// change the peer count (IndirectionAdapter does), but only before the first message.
+    /// EXPERIMENT SWITCH (Config::half_window_oversize_pass): false restores the pass threshold from before
+    /// b75b61f, the whole window instead of half of it.
+    void half_window_oversize_pass(bool enable) {
+        half_window_pass_ = enable;
+    }
+
     void configure(std::size_t num_window_elements, std::size_t num_peers) {
         if (num_window_elements == 0) {
             return;
@@ -170,7 +177,8 @@ public:
             return true;
         }
         // counted in track_send: a buffer may be checked again and again while it waits for a send slot
-        return credit > 0 && elements > limits_.num_window_elements / 2;
+        auto const pass_above = half_window_pass_ ? limits_.num_window_elements / 2 : limits_.num_window_elements;
+        return credit > 0 && elements > pass_above;
     }
 
     void track_send(PEID peer, std::size_t elements) {
@@ -468,6 +476,7 @@ private:
     std::unordered_map<PEID, Peer> peers_;
     std::vector<PEID> pending_grants_;
     Limits limits_;
+    bool half_window_pass_ = true;  ///< see half_window_oversize_pass
     /// sum of in_granted - in_received over proxied peers: what they may still send us, in elements
     std::size_t sum_proxied_in_credit_ = 0;
     /// received from proxied peers, merged for forwarding, not yet sent

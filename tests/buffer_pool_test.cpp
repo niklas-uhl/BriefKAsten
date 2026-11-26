@@ -192,3 +192,18 @@ TEST(BufferPoolTest, drain_order_rotating_grid) {
                                           briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
     run_and_check(comm, queue);
 }
+
+// Every switch at the behaviour of 5664f7f (KaCCv2's base) except the leak, which drop_shells removes: still
+// delivers everything and keeps the pool bounded.
+TEST(BufferPoolTest, old_base_switches_with_drop_shells) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.bounded_pool = false;
+    conf.drop_shells = true;
+    conf.idle_flush = briefkasten::IdleFlush::off;
+    conf.allow_large_messages = false;
+    conf.poll_while_waiting = false;
+    conf.half_window_oversize_pass = false;
+    auto queue = direct_queue(comm, conf);
+    run_and_check(comm, queue);
+}

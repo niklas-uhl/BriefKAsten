@@ -115,6 +115,15 @@ struct Config {
     bool drop_shells = false;
     /// EXPERIMENT SWITCH: see DrainOrder.
     DrainOrder drain_order = DrainOrder::map;
+    /// EXPERIMENT SWITCHES (branch exp/drain-policy): the behaviour changes since KaCCv2's base 5664f7f that are not
+    /// already configurable, for a clean A/B in one binary. Together with idle_flush = off,
+    /// allow_large_messages = false and bounded_pool = false they restore 5664f7f's behaviour for small messages.
+    /// poll_while_waiting = false: poll_throttled skips polls even while buffers are parked or every send slot is
+    /// taken (before 9c4bbf0, #26).
+    bool poll_while_waiting = true;
+    /// half_window_oversize_pass = false: a buffer larger than its credit passes only if it exceeds the whole credit
+    /// window, not half of it (before b75b61f).
+    bool half_window_oversize_pass = true;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -186,6 +195,8 @@ public:
         }
 #endif
         drain_order_ = effective_config_.drain_order;
+        poll_while_waiting_ = effective_config_.poll_while_waiting;
+        flow_.half_window_oversize_pass(effective_config_.half_window_oversize_pass);
         // flow control is on by default; IndirectionAdapter re-configures it for its smaller peer count
         if (effective_config_.num_credit_buffers.value_or(DEFAULT_NUM_CREDIT_BUFFERS) > 0) {
             int comm_size = 0;
@@ -381,7 +392,7 @@ public:
     auto poll_throttled(MessageHandler<MessageType> auto&& on_message,
                         std::size_t poll_skip_threshold = DEFAULT_POLL_SKIP_THRESHOLD)
         -> std::optional<std::pair<bool, bool>> {
-        bool const waiting = parked_elements_ > 0 || !queue_.has_send_capacity();
+        bool const waiting = poll_while_waiting_ && (parked_elements_ > 0 || !queue_.has_send_capacity());
         if (poll_skip_threshold > 1 && !waiting && (poll_throttle_count_++ % poll_skip_threshold) != 0) {
             return std::nullopt;
         }
@@ -1663,6 +1674,7 @@ private:
     std::size_t num_redirect_buffer_stalls_ = 0;
     std::size_t redirect_overdraft_ = 0;
     DrainOrder drain_order_ = DrainOrder::map;  ///< Config::drain_order (experiment switch)
+    bool poll_while_waiting_ = true;            ///< Config::poll_while_waiting (experiment switch)
     PEID drain_cursor_ = 0;                     ///< DrainOrder::rotating: where the next drain starts
     std::size_t num_drains_ = 0;
     std::size_t num_drain_early_stops_ = 0;
