@@ -180,7 +180,7 @@ public:
             return;
         }
         Peer& state = peer_state(peer);
-        auto const credit = state.out_allowed - std::min(state.out_allowed, state.out_sent);
+        auto const credit = out_credit(state);
         if (elements > credit) {  // let through by has_credit as an oversize buffer
             num_oversize_passes_++;
         }
