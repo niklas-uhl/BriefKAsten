@@ -153,3 +153,15 @@ TEST(BufferPoolTest, legacy_pool_switch) {
     EXPECT_GT(queue.num_free_buffers(), queue.num_allocated_buffers());
     EXPECT_EQ(global_sum(comm, received), MESSAGES_PER_RECEIVER * comm.size() * comm.size());
 }
+
+// Config::drop_shells on top of the legacy pool handling: dropping the moved-from shells alone keeps the pool
+// bounded, although overflow flushes keep the destination's map entry.
+TEST(BufferPoolTest, legacy_pool_drop_shells) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.bounded_pool = false;
+    conf.drop_shells = true;
+    auto queue = direct_queue(comm, conf);
+    run_and_check(comm, queue);
+    EXPECT_GE(queue.num_dropped_shells(), MESSAGES_PER_RECEIVER / 6);
+}
