@@ -123,7 +123,8 @@ TEST_P(IdleFlushTest, flat_chains_complete_with_one_send_slot) {
     // the resume point is exercised on every attempt, with and without round robin
     for (bool round_robin : {true, false}) {
         kamping::Communicator<> comm;
-        // the previous pass's queue is destroyed on every rank before any rank posts into this one (see SetUp)
+        // the previous pass's queue is destroyed on every rank before any rank posts into this one
+        // (KaTestrophe separates tests, not the passes within one)
         comm.barrier();
         briefkasten::Config conf;
         conf.idle_flush = GetParam();
@@ -141,7 +142,8 @@ TEST_P(IdleFlushTest, flat_chains_complete_with_one_send_slot) {
 TEST_P(IdleFlushTest, grid_chains_complete_with_one_send_slot) {
     for (bool round_robin : {true, false}) {
         kamping::Communicator<> comm;
-        // the previous pass's queue is destroyed on every rank before any rank posts into this one (see SetUp)
+        // the previous pass's queue is destroyed on every rank before any rank posts into this one
+        // (KaTestrophe separates tests, not the passes within one)
         comm.barrier();
         briefkasten::Config conf;
         conf.idle_flush = GetParam();
