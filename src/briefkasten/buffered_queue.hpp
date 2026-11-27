@@ -342,11 +342,15 @@ public:
         return result;
     }
 
-    /// Only every \p poll_skip_threshold-th call polls; this throttles grants and parked buffers too.
+    /// Only every \p poll_skip_threshold-th call polls, unless buffers are parked or every send slot is taken:
+    /// then every call polls, as only a poll notices completed sends and arriving grants, and a skipped poll
+    /// leaves the parked buffers (and the sends behind them) waiting. Grants this rank owes others are still
+    /// throttled.
     auto poll_throttled(MessageHandler<MessageType> auto&& on_message,
                         std::size_t poll_skip_threshold = DEFAULT_POLL_SKIP_THRESHOLD)
         -> std::optional<std::pair<bool, bool>> {
-        if (poll_skip_threshold > 1 && (poll_throttle_count_++ % poll_skip_threshold) != 0) {
+        bool const waiting = parked_elements_ > 0 || !queue_.has_send_capacity();
+        if (poll_skip_threshold > 1 && !waiting && (poll_throttle_count_++ % poll_skip_threshold) != 0) {
             return std::nullopt;
         }
         return poll(std::forward<decltype(on_message)>(on_message));
@@ -835,7 +839,8 @@ public:
         return flow_.num_grants_received();
     }
 
-    /// Buffers larger than a whole window, sent anyway (see FlowController::has_credit).
+    /// Buffers sent with less credit than their size, let through as larger than half the window (see
+    /// FlowController::has_credit); counted once per send.
     [[nodiscard]] std::size_t num_oversize_passes() const {
         return flow_.num_oversize_passes();
     }
