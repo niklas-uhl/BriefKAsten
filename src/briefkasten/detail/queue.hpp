@@ -263,6 +263,10 @@ public:
         allow_large_messages_ = allow;
     }
 
+    [[nodiscard]] bool large_messages_allowed() const {
+        return allow_large_messages_;
+    }
+
     [[nodiscard]] PEID rank() const {
         return rank_;
     }

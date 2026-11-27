@@ -155,18 +155,23 @@ public:
         return limits_.max_num_redirect_elements + limits_.num_window_elements;
     }
 
-    /// May a buffer of \p elements elements be sent to \p peer now? A buffer larger than the whole window
-    /// is let through as soon as any credit is left, since it could otherwise never be sent.
+    /// May a buffer of \p elements elements be sent to \p peer now? Normally only within the peer's credit. A buffer
+    /// larger than half the window may overdraw it, as soon as any credit is left: the receiver tops the credit up
+    /// only once at most half the window is outstanding, so with nothing in flight the credit can stay anywhere above
+    /// half the window, and such a buffer would wait for a grant that never comes. The overdraft is bounded: the
+    /// credit is then exhausted, so at most one buffer per peer exceeds the window, and the receiver grants as soon
+    /// as it has received it. Buffers up to the local threshold are at most half the window (with two or more credit
+    /// buffers), so only large messages (Config::allow_large_messages) take this path.
     [[nodiscard]] bool has_credit(PEID peer, std::size_t elements) {
         if (!enabled_) {
             return true;
         }
         Peer& state = peer_state(peer);
-        auto const credit = state.out_allowed - std::min(state.out_allowed, state.out_sent);
+        auto const credit = out_credit(state);
         if (elements <= credit) {
             return true;
         }
-        if (credit > 0 && elements > limits_.num_window_elements) {  // does not happen in normal operation
+        if (credit > 0 && elements > limits_.num_window_elements / 2) {
             num_oversize_passes_++;
             return true;
         }
@@ -186,10 +191,12 @@ public:
             return;
         }
         Peer& state = peer_state(peer);
+        auto const outstanding_before = in_credit(state);
         state.in_received += elements;
         if (state.proxied) {  // message from the peer may contain data that we have to forward
-            // the granted credit is used up: what we forward of it is now counted as buffered (hold_redirected)
-            sum_proxied_in_credit_ -= std::min(sum_proxied_in_credit_, elements);
+            // the granted credit is used up: what we forward of it is now counted as buffered (hold_redirected).
+            // Only the credit this peer had outstanding: an oversize pass (has_credit) receives more than that.
+            sum_proxied_in_credit_ -= outstanding_before - in_credit(state);
         }
         grant_if_due(peer, state);
     }
@@ -241,7 +248,7 @@ public:
         state.proxied = proxied;
         if (proxied) {
             // the implicit initial window was granted before proxied was known
-            sum_proxied_in_credit_ += state.in_granted - std::min(state.in_granted, state.in_received);
+            sum_proxied_in_credit_ += in_credit(state);
         }
     }
 
@@ -275,7 +282,7 @@ public:
             Peer const& st = entry.second;
             out << "\n    peer " << entry.first << (st.proxied ? " PROXIED" : " DEST ") << " out_sent=" << st.out_sent
                 << " out_allowed=" << st.out_allowed
-                << " credit=" << (st.out_allowed - std::min(st.out_allowed, st.out_sent))
+                << " credit=" << out_credit(st)
                 << " in_granted=" << st.in_granted << " in_received=" << st.in_received
                 << (st.proxied_known ? "" : " PROXIED_UNKNOWN") << (st.grant_withheld ? " GRANT_WITHHELD" : "")
                 << (st.grant_pending ? " GRANT_PENDING" : "")
@@ -302,6 +309,17 @@ private:
         return peers_.emplace(peer, fresh).first->second;
     }
 
+    /// Outbound credit: what this rank may still send to \p state's peer; 0 after an oversize pass.
+    [[nodiscard]] static std::size_t out_credit(Peer const& state) {
+        return state.out_allowed - std::min(state.out_allowed, state.out_sent);
+    }
+
+    /// Inbound credit: what \p state's peer may still send this rank (granted, not yet received); 0 after an
+    /// oversize pass.
+    [[nodiscard]] static std::size_t in_credit(Peer const& state) {
+        return state.in_granted - std::min(state.in_granted, state.in_received);
+    }
+
     /// Grant once at least half the window has freed up. On a proxied link, withhold the grant while the
     /// redirect limit is reached; release_redirected() retries it.
     void grant_if_due(PEID peer, Peer& state) {
@@ -323,11 +341,17 @@ private:
             return;
         }
         if (state.proxied) {
-            sum_proxied_in_credit_ += new_in_granted - state.in_granted;
+            // the new outstanding credit is the whole window: after an oversize pass in_received exceeds the
+            // old grant, and that excess was never credit
+            sum_proxied_in_credit_ += new_in_granted - std::max(state.in_granted, state.in_received);
         }
         state.in_granted = new_in_granted;
         send_grant(peer, state);
-        KASSERT(num_redirect_elements_buffered_ + sum_proxied_in_credit_ <= redirect_high_water(),
+        // Only a grant on a proxied link adds to what this rank may have to forward, so only those are checked
+        // against the redirect high water. While an overdrawn buffer from a proxied peer (has_credit) is being
+        // forwarded, the sum may exceed it, and a grant to another peer meanwhile is still correct.
+        KASSERT(!state.proxied ||
+                    num_redirect_elements_buffered_ + sum_proxied_in_credit_ <= redirect_high_water(),
                 "redirect elements overshot their high-water mark: buffered=" << num_redirect_elements_buffered_
                                                                               << " credit=" << sum_proxied_in_credit_
                                                                               << " bound=" << redirect_high_water());
