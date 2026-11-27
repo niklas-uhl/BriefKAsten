@@ -128,12 +128,16 @@ namespace {
 // Config::separate_forwarding and Config::exact_redirect_limit, each combination with the default credit window and
 // with one buffer per peer: everything arrives, and the reserve stays within the ceiling for the combination (also
 // checked at every acquisition by a KASSERT). Own posts wait for the reserve only with shared buffers.
-void run_grid(bool separate_forwarding, bool exact_redirect_limit, std::size_t num_credit_buffers) {
+void run_grid(bool separate_forwarding,
+              bool exact_redirect_limit,
+              std::size_t num_credit_buffers,
+              briefkasten::DrainOrder drain_order = briefkasten::DrainOrder::map) {
     kamping::Communicator<> comm;
     auto conf = small_buffers(/*flow_control=*/true);
     conf.num_credit_buffers = num_credit_buffers;
     conf.separate_forwarding = separate_forwarding;
     conf.exact_redirect_limit = exact_redirect_limit;
+    conf.drain_order = drain_order;
     briefkasten::IndirectionAdapter queue{direct_queue(comm, conf),
                                           briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
     run_and_check(comm, queue);
@@ -165,4 +169,12 @@ TEST(BufferPoolTest, grid_shared_buffers_inexact_redirect_limit) {
 
 TEST(BufferPoolTest, grid_shared_buffers_inexact_redirect_limit_small_credit_window) {
     run_grid(false, false, 1);
+}
+
+TEST(BufferPoolTest, grid_drain_order_rank) {
+    run_grid(true, true, 1, briefkasten::DrainOrder::rank);
+}
+
+TEST(BufferPoolTest, grid_drain_order_rotating) {
+    run_grid(true, true, 1, briefkasten::DrainOrder::rotating);
 }
