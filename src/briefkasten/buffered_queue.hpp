@@ -322,11 +322,11 @@ public:
     }
 
     void flush_all_buffers() {
-        flush_all_aggregation_buffers_impl(aggregation_buffers_.end(), [] {}, [] { return false; });
+        flush_all_aggregation_buffers_impl([] {}, [] { return false; });
     }
 
     void flush_largest_buffer() {
-        std::ignore = flush_largest_buffer_impl(aggregation_buffers_.end());
+        std::ignore = flush_largest_buffer_impl();
     }
 
     /// Note: Message handlers take a MessageEnvelope as single argument. The
@@ -724,8 +724,15 @@ public:
         queue_.synchronous_mode(use_it);
     }
 
-    auto num_allocated_buffers() {
+    /// Aggregation buffers in the pool: free, filling, parked or in flight. At most the pool cap plus the proxy's
+    /// overdraft (\ref max_num_aggregation_buffers, \ref redirect_overdraft).
+    [[nodiscard]] std::size_t num_allocated_buffers() const {
         return num_aggregation_buffers_;
+    }
+
+    /// Pool buffers not in use right now; never more than \ref num_allocated_buffers.
+    [[nodiscard]] std::size_t num_free_buffers() const {
+        return free_aggregation_buffers_.size();
     }
 
     [[nodiscard]] std::size_t num_overflows() const {
@@ -816,10 +823,15 @@ public:
         return num_redirect_buffer_stalls_;
     }
 
-    /// Upper bound on \ref redirect_overdraft, in buffers.
+    /// Upper bound on \ref redirect_overdraft, in buffers. This rank's own messages acquire buffers only below
+    /// the pool cap (acquire_buffer), so every buffer in use beyond the cap was acquired by the proxy and holds at
+    /// least one redirected element until its send completes; held redirected elements are at most
+    /// redirect_high_water. The bound is per element, not per buffer_size elements: the proxy's buffer for a
+    /// destination also takes this rank's own messages to it (merging needs no acquisition), so it can be full of
+    /// own payload around a single redirected element. Until own payload is kept out of the overdraft, this weak
+    /// bound is the one that holds.
     [[nodiscard]] std::size_t redirect_pool_ceiling() const {
-        auto const buffer_size = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
-        return (flow_.redirect_high_water() / buffer_size) + num_peers_ + 1;
+        return flow_.redirect_high_water() + 1;
     }
 
     /// Buffers the proxy allocated beyond the pool cap (the proxy never waits for a buffer).
@@ -930,6 +942,9 @@ public:
 
 private:
     using BufferMap = std::unordered_map<PEID, BufferContainer>;
+    /// Whether an overflow flush keeps the destination's entry (see resolve_overflow): needs capacity() to tell a
+    /// moved-from shell from an empty pool buffer.
+    static constexpr bool KEEP_ENTRY_ON_OVERFLOW = requires(BufferContainer const& buffer) { buffer.capacity(); };
     using BufferList = std::vector<BufferContainer>;
 
     /// \c redirected: how many of its elements are redirected, no longer counted as buffered once sent.
@@ -990,9 +1005,16 @@ private:
 
     /// \return a free buffer, or nullopt if the caller must wait for one. The proxy never waits: it grows
     /// the pool beyond the cap instead, since redirected payload is already bounded by the flow control.
+    ///
+    /// This rank's own messages use at most the pool cap: buffers beyond it are the proxy's overdraft, kept for
+    /// redirected payload. Taking them for own messages would leave the proxy without a free buffer, so it would
+    /// overdraw again, and the overdraft would grow with everything this rank parks instead of with what the
+    /// credits bound.
     auto acquire_buffer() -> std::optional<BufferContainer> {
         bool const for_redirect = redirecting_depth_ > 0;
-        if (free_aggregation_buffers_.empty()) {
+        auto const in_use = num_aggregation_buffers_ - free_aggregation_buffers_.size();
+        bool const own_at_cap = !for_redirect && in_use >= max_num_aggregation_buffers_;
+        if (free_aggregation_buffers_.empty() || own_at_cap) {
             if (for_redirect && num_aggregation_buffers_ >= max_num_aggregation_buffers_) {
                 KASSERT(redirect_overdraft_ < redirect_pool_ceiling(),
                         "proxy overdrew the buffer pool by " << redirect_overdraft_
@@ -1000,7 +1022,7 @@ private:
                             << " that credits should have bounded it to");
                 redirect_overdraft_++;
             }
-            if (num_aggregation_buffers_ < buffer_limit()) {
+            if (!own_at_cap && num_aggregation_buffers_ < buffer_limit()) {
                 reserve_aggregation_buffers(1);
             } else {
                 // Heuristic: at the cap with no free buffer -> flush one.
@@ -1056,7 +1078,8 @@ private:
             if (it == aggregation_buffers_.end()) {
                 std::tie(it, std::ignore) = aggregation_buffers_.emplace(receiver, std::move(buffer));
             } else if (it->second.empty()) {
-                // may still own a pool buffer, so recycle it instead of overwriting it
+                // still empty: a pool buffer, or the moved-from shell the overflow flush left in the entry;
+                // recycle it (recycle_buffer drops a shell) instead of overwriting it
                 recycle_buffer(std::move(it->second));
                 it->second = std::move(buffer);
             } else {
@@ -1064,6 +1087,15 @@ private:
                 recycle_buffer(std::move(buffer));
             }
         };
+        // An overflow flush keeps the destination's entry with the moved-from shell of the sent buffer (see
+        // resolve_overflow). A post that finds such a shell, e.g. a proxy's redirection handler while the overflowing
+        // post polls, must not merge into it: that would grow it into a buffer the pool never counted. It takes a
+        // pool buffer instead, and the shell is dropped.
+        if constexpr (KEEP_ENTRY_ON_OVERFLOW) {
+            if (it->second.empty() && it->second.capacity() == 0) {
+                replace_flushed_buffer();
+            }
+        }
         // A message that does not fit even an empty buffer: flushing first would not help (the fresh buffer is
         // just as small, and flushing an empty one is a no-op), so it is merged into the current buffer, which is
         // then sent at once, as a large message if it exceeds the receive buffers.
@@ -1314,7 +1346,6 @@ private:
     template <typename PreFlushHook, typename PostFlushHook>
         requires std::invocable<PreFlushHook> && (std::predicate<PostFlushHook> || std::predicate<PostFlushHook, bool>)
     bool flush_all_aggregation_buffers_impl(
-        BufferMap::iterator current_buffer,
         PreFlushHook&& pre_flush_hook,    // NOLINT(cppcoreguidelines-missing-std-forward)
         PostFlushHook&& post_flush_hook,  // NOLINT(cppcoreguidelines-missing-std-forward)
         bool break_when_flush_fails = true) {
@@ -1324,8 +1355,7 @@ private:
             pre_flush_hook();
             bool current_flush_successful = false;
             std::tie(it, current_flush_successful) =
-                flush_buffer_impl(it, it != current_buffer);  // iterator `it` is updated by std::tie; do not use its
-                                                              // previous value after this call
+                flush_buffer_impl(it);  // iterator `it` is updated by std::tie; do not use its previous value
             if (current_flush_successful) {
                 flushed_something = true;
             } else {
@@ -1347,12 +1377,12 @@ private:
         return flushed_something;
     }
 
-    [[nodiscard]] bool flush_largest_buffer_impl(BufferMap::iterator current_buffer) {
+    [[nodiscard]] bool flush_largest_buffer_impl() {
         auto largest_buffer =
             std::max_element(aggregation_buffers_.begin(), aggregation_buffers_.end(),
                              [](auto& lhs, auto& rhs) { return lhs.second.size() < rhs.second.size(); });
         if (largest_buffer != aggregation_buffers_.end()) {
-            auto it = flush_buffer_impl(largest_buffer, largest_buffer != current_buffer);
+            auto it = flush_buffer_impl(largest_buffer);
             return it.second;
         }
         return true;
@@ -1382,8 +1412,14 @@ private:
         };
     }
 
-    /// Return a buffer that was never sent to the pool.
+    /// Return a buffer that was never sent to the pool. A moved-from shell (capacity 0, left in an entry by an
+    /// overflow flush) is not a pool buffer and is dropped: a pool buffer keeps its capacity.
     void recycle_buffer(BufferContainer&& buffer) {
+        if constexpr (KEEP_ENTRY_ON_OVERFLOW) {
+            if (buffer.capacity() == 0) {
+                return;
+            }
+        }
         num_buffer_recycles_++;
         buffer.resize(0);  // this does not reduce the capacity
         if constexpr (requires { buffer.capacity(); }) {
@@ -1397,6 +1433,9 @@ private:
             }
         }
         free_aggregation_buffers_.emplace_back(std::move(buffer));
+        KASSERT(free_aggregation_buffers_.size() <= num_aggregation_buffers_,
+                "the free list holds " << free_aggregation_buffers_.size() << " buffers, more than the pool's "
+                                       << num_aggregation_buffers_ << ": a buffer was recycled twice or never counted");
     }
 
     /// Called when a send completed; releases its redirected elements.
@@ -1422,18 +1461,25 @@ private:
                     // already flushed by a redirection handler while we polled
                     return true;
                 }
-                auto ret = flush_buffer_impl(current_buffer, /*erase=*/false);
+                // Keep the entry: erasing and re-inserting it on every overflow moves the destination in the buffer
+                // map's iteration order (std::unordered_map: to the front), which is the order the termination drain
+                // and the idle flush walk; with the drain stopping early, busy destinations went first and the rest
+                // waited (KaCCv2 flat label propagation, lake-lanier: +13-25 % before the idle flush). The entry
+                // keeps the moved-from shell of the sent or parked buffer; replace_flushed_buffer swaps it for a pool
+                // buffer and recycle_buffer drops it. Containers without capacity() cannot tell a shell from an
+                // empty pool buffer, so for them the entry is erased.
+                auto ret = flush_buffer_impl(current_buffer, /*erase=*/!KEEP_ENTRY_ON_OVERFLOW);
                 return ret.second;
             }
             case FlushStrategy::global: {
-                return flush_all_aggregation_buffers_impl(current_buffer, [] {}, [] { return false; });
+                return flush_all_aggregation_buffers_impl([] {}, [] { return false; });
             }
             case FlushStrategy::random: {
                 throw std::runtime_error("Random flush strategy not implemented");
                 return false;
             }
             case FlushStrategy::largest: {
-                return flush_largest_buffer_impl(current_buffer);
+                return flush_largest_buffer_impl();
             }
         }
         // unreachable
