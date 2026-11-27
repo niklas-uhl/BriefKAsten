@@ -150,6 +150,9 @@ struct Config {
     std::optional<std::size_t> num_delivery_credit_buffers = std::nullopt;
     /// See FlowController::feeder_first (needs exact_redirect_limit). Costs a lookup per forwarded message.
     bool feeder_first = false;
+    /// EXPERIMENT: a grant falls due once 1 / grant_divisor of the window has freed up (2: half, the default; at
+    /// least 2). Larger values send more grants at the same window, to measure what grants cost.
+    std::size_t grant_divisor = 2;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -249,6 +252,7 @@ public:
                                buffer_size);
         flow_.delivery_window(effective_config_.num_delivery_credit_buffers.value_or(0) * buffer_size);
         flow_.feeder_first(effective_config_.feeder_first);
+        flow_.grant_divisor(effective_config_.grant_divisor);
         // buffers wait in per-destination parking queues instead of the sender's single FIFO backlog
         if (!user_config_.send_backlog_capacity) {
             queue_.set_send_backlog_capacity(0);

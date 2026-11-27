@@ -136,6 +136,7 @@ public:
           num_window_grows_(other.num_window_grows_),
           num_window_shrinks_(other.num_window_shrinks_),
           feeder_first_(other.feeder_first_),
+          grant_divisor_(other.grant_divisor_),
           num_feeder_withholds_(other.num_feeder_withholds_) {
         other.enabled_ = false;
         other.receive_requests_.clear();
@@ -231,6 +232,12 @@ public:
             state.forwarded /= 2;
             state.forwarded_congested /= 2;
         }
+    }
+
+    /// A grant falls due once 1 / \p divisor of the link's window has freed up (default 2: half the window). Larger
+    /// divisors grant earlier and more often (same window, same bound); only for measuring what grants cost.
+    void grant_divisor(std::size_t divisor) {
+        grant_divisor_ = std::max<std::size_t>(divisor, 2);
     }
 
     [[nodiscard]] std::size_t num_feeder_withholds() const {
@@ -527,7 +534,7 @@ private:
             !state.proxied) {
             next_window = limits_.delivery_window_elements;
         }
-        if (limits_.budget_elements > 0 && freed * 2 >= window) {
+        if (limits_.budget_elements > 0 && freed * grant_divisor_ >= window) {
             // every window is reserved in full (a link is refilled to it without asking the budget), so growth must
             // fit the budget next to all windows and the forwarded payload held; if they already exceed it, halve
             auto const committed = inbound_windows() + num_redirect_elements_buffered_;
@@ -547,7 +554,7 @@ private:
         auto const held = num_redirect_elements_buffered_ + sum_proxied_in_credit_;
         if (exact_redirect_limit_) {
             // only a grant that is due can be withheld, and it is withheld unless all of it fits the limit
-            if (freed * 2 < window) {
+            if (freed * grant_divisor_ < window) {
                 return;
             }
             if (state.proxied && held + added > limits_.max_num_redirect_elements) {
@@ -565,7 +572,7 @@ private:
                 withhold();
                 return;
             }
-            if (freed * 2 < window) {
+            if (freed * grant_divisor_ < window) {
                 return;
             }
         }
@@ -739,6 +746,7 @@ private:
     std::size_t num_window_grows_ = 0;
     std::size_t num_window_shrinks_ = 0;
     bool feeder_first_ = false;
+    std::size_t grant_divisor_ = 2;  ///< see grant_divisor
     std::size_t num_feeder_withholds_ = 0;  ///< withholds below the limit, of feeders (feeder_first)
 };
 
