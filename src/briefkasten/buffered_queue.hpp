@@ -98,6 +98,12 @@ struct Config {
     /// produce such messages (KaCCv2, flat label propagation on lake-lanier at 768 cores: +16-18 % without the idle
     /// flush, 1-2 % with it). false: such a message throws.
     bool allow_large_messages = false;
+    /// With indirection: a proxy aggregates forwarded messages in buffers of their own, separate from this rank's
+    /// own messages to the same destination. Own payload then never enters the reserve, so own posts never wait for
+    /// it, and the reserve is bounded by the forwarded payload alone (redirect_pool_ceiling). false: own and forwarded
+    /// messages share each destination's buffer (fewer partially filled sends), and an own post waits while the
+    /// reserve holds more than one buffer per peer, which bounds the reserve with three more terms.
+    bool separate_forwarding = true;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -158,6 +164,7 @@ public:
           flush_strategy_(effective_config_.flush_strategy) {
         idle_flush_ = effective_config_.idle_flush;
         idle_flush_round_robin_ = effective_config_.idle_flush_round_robin;
+        separate_forwarding_ = effective_config_.separate_forwarding;
         queue_.allow_large_messages(effective_config_.allow_large_messages);
         reserve_aggregation_buffers(effective_config_.num_request_slots);
 #ifdef BRIEFKASTEN_STALL_TRACE
@@ -216,12 +223,12 @@ public:
                                int tag,
                                MessageHandler<MessageType> auto&& on_message,
                                std::invocable<> auto&& progress_hook) {
-        // An own message waits while the proxy's reserve is in use beyond one buffer per peer, so the reserve
-        // holds forwarded payload (apart from at most one partially filled buffer per destination) and stays
-        // bounded by the redirect limit (see redirect_pool_ceiling). Waiting here is safe: only forwarding
-        // posts from inside a handler (split_handler asserts it), and forwarding never waits, so every rank
-        // keeps consuming and granting while it polls.
-        if (redirecting_depth_ == 0 && reserve_buffers() > reserve_pause_threshold()) {
+        // Shared buffers (Config::separate_forwarding off): an own message waits while the proxy's reserve is in use
+        // beyond one buffer per peer, so the reserve holds forwarded payload (apart from at most one partially filled
+        // buffer per destination) and stays bounded (redirect_pool_ceiling). Waiting here is safe: only forwarding
+        // posts from inside a handler (split_handler asserts it), and forwarding never waits, so every rank keeps
+        // consuming and granting while it polls. With separate buffers own payload never enters the reserve.
+        if (!separate_forwarding_ && redirecting_depth_ == 0 && reserve_buffers() > reserve_pause_threshold()) {
             num_reserve_waits_++;
             do {
                 poll(on_message);
@@ -232,8 +239,8 @@ public:
             std::forward<decltype(message)>(message), receiver, envelope_sender, envelope_receiver, tag,
 
             [&](auto /*it*/) {  // handle_overflow
-                // by receiver, not iterator: polling may modify aggregation_buffers_
-                resolve_overflow_blocking(receiver, on_message, progress_hook);
+                // by key, not iterator: polling may modify aggregation_buffers_
+                resolve_overflow_blocking(buffer_key(receiver), on_message, progress_hook);
             },
             [&] {  // get_new_buffer
                 while (true) {
@@ -289,7 +296,7 @@ public:
         return post_message_impl(
             std::forward<decltype(message)>(message), receiver, envelope_sender, envelope_receiver, tag,
             [&](auto /*it*/) {
-                bool success = resolve_overflow(receiver);
+                bool success = resolve_overflow(buffer_key(receiver));
                 if (!success) {
                     throw std::runtime_error(
                         "Failed to resolve overflow, because sending to the underlying queue failed.");
@@ -320,17 +327,15 @@ public:
     /// \param receiver The rank of the receiver
     /// \return true if the buffer had some data to flush and succeeded, false otherwise
     bool flush_buffer(PEID receiver) {
-        auto it = aggregation_buffers_.find(receiver);
-        if (it != aggregation_buffers_.end()) {
-            // bool buffer_was_empty = it->second.empty();
-            auto new_it = flush_buffer_impl(it);
-            return new_it.second;
-            // if (new_it == it) {
-            //   return false;
-            // }
-            // return buffer_was_empty;
+        bool flushed = false;
+        // a proxy also holds a buffer of forwarded messages to the destination (see buffer_key)
+        for (PEID key : {receiver, forwarding_key(receiver)}) {
+            auto it = aggregation_buffers_.find(key);
+            if (it != aggregation_buffers_.end()) {
+                flushed = flush_buffer_impl(it).second || flushed;
+            }
         }
-        return false;
+        return flushed;
     }
 
     void flush_all_buffers() {
@@ -855,10 +860,10 @@ public:
         return peak_reserve_buffers_;
     }
 
-    /// Own posts (post_message_blocking outside a redirection handler) wait while the reserve holds more than
-    /// this many buffers: one per peer.
+    /// Own posts (post_message_blocking outside a redirection handler) wait while the reserve holds more than this
+    /// many buffers, one per peer; only with shared buffers (Config::separate_forwarding off).
     [[nodiscard]] std::size_t reserve_pause_threshold() const {
-        return num_peers_;
+        return separate_forwarding_ ? std::numeric_limits<std::size_t>::max() : num_peers_;
     }
 
     /// Own posts that waited for the reserve to drain (see \ref reserve_pause_threshold).
@@ -872,17 +877,26 @@ public:
         return num_drain_forward_deferred_;
     }
 
-    /// Upper bound on \ref redirect_overdraft and \ref peak_reserve_buffers, in buffers. Own messages acquire
-    /// only below the pool cap and are not merged while the reserve holds more than \ref reserve_pause_threshold
-    /// buffers, so buffers acquired beyond that hold forwarded payload only. Per destination, two consecutive
-    /// such buffers hold more than one buffer of it (the message that overflowed the first went into the
-    /// second), and the proxy holds at most redirect_high_water forwarded elements. Partially filled buffers
-    /// besides: one per destination being filled, one per destination left over from before the pause, and those
-    /// that left before they overflowed (idle flush, termination drain), which are only sent if they can go out at
-    /// once (at most one per send slot).
+    /// Upper bound on \ref redirect_overdraft and \ref peak_reserve_buffers, in buffers, for messages that fit a
+    /// buffer. The proxy holds at most redirect_high_water forwarded elements. A buffer holding forwarded messages
+    /// that leaves before it overflowed (idle flush, termination drain) is sent at once and holds a send slot until
+    /// it completes; every other one was flushed by the message that went into the next, so per destination any two
+    /// consecutive ones hold more than a buffer of forwarded payload.
+    ///
+    /// Separate buffers (Config::separate_forwarding): own messages only use the pool (acquire_buffer) and never
+    /// merge into forwarded buffers (buffer_key), so the reserve holds only forwarded buffers: per destination at
+    /// most 2 * payload / buffer + 1, plus those in send slots.
+    ///
+    /// Shared buffers: own messages acquire only below the pool cap and are not merged while the reserve holds more
+    /// than \ref reserve_pause_threshold buffers, so buffers acquired beyond that hold forwarded payload only.
+    /// Besides: one partially filled buffer per destination being filled, one per destination left over from before
+    /// the pause, and the threshold's own payload.
     [[nodiscard]] std::size_t redirect_pool_ceiling() const {
         auto const buffer_size = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
         auto const forwarded_buffers = (flow_.redirect_high_water() + buffer_size - 1) / buffer_size;
+        if (separate_forwarding_) {
+            return (2 * forwarded_buffers) + num_peers_ + effective_config_.num_request_slots;
+        }
         return (2 * forwarded_buffers) + reserve_pause_threshold() + (2 * num_peers_) +
                effective_config_.num_request_slots + 2;
     }
@@ -1027,14 +1041,29 @@ private:
         return (bytes_per_buffer + sizeof(BufferType) - 1) / sizeof(BufferType);
     }
 
-    /// The destination of the buffer with key \p key in aggregation_buffers_.
-    [[nodiscard]] PEID destination(PEID key) const {
-        return key;
+    /// Keys of aggregation_buffers_ (and of redirected_in_buffer_): the destination rank for this rank's own
+    /// messages, with Config::separate_forwarding the destination plus the communicator size for forwarded ones.
+    [[nodiscard]] PEID forwarding_key(PEID receiver) const {
+        return receiver + queue_.size();
     }
 
-    /// Whether the current buffer of \p key holds forwarded messages (a redirection handler merged into it).
+    [[nodiscard]] bool is_forwarding_key(PEID key) const {
+        return key >= queue_.size();
+    }
+
+    [[nodiscard]] PEID destination(PEID key) const {
+        return is_forwarding_key(key) ? key - queue_.size() : key;
+    }
+
+    /// The buffer a post to \p receiver goes into: posts from inside a redirection handler are forwards.
+    [[nodiscard]] PEID buffer_key(PEID receiver) const {
+        return separate_forwarding_ && redirecting_depth_ > 0 ? forwarding_key(receiver) : receiver;
+    }
+
+    /// Whether the current buffer of \p key holds forwarded messages: a forwarded buffer, or with shared buffers one
+    /// a redirection handler merged into.
     [[nodiscard]] bool holds_forwarded(PEID key) const {
-        return redirected_in_buffer_.contains(key);
+        return is_forwarding_key(key) || redirected_in_buffer_.contains(key);
     }
 
     [[nodiscard]] std::size_t buffer_limit() const {
@@ -1126,13 +1155,15 @@ private:
                            OverflowHandler<BufferMap> auto&& handle_overflow,
                            BufferProvider<BufferContainer> auto&& get_new_buffer) {
         num_posts_++;  // checked in split_handler
-        auto it = aggregation_buffers_.find(receiver);
+        // redirecting_depth_ is the same after every poll below (nested handlers restore it), and so is the key
+        PEID const key = buffer_key(receiver);
+        auto it = aggregation_buffers_.find(key);
         if (it == aggregation_buffers_.end()) {
             auto buffer = get_new_buffer();
             // a redirection handler may have created the entry meanwhile
-            it = aggregation_buffers_.find(receiver);
+            it = aggregation_buffers_.find(key);
             if (it == aggregation_buffers_.end()) {
-                std::tie(it, std::ignore) = aggregation_buffers_.emplace(receiver, std::move(buffer));
+                std::tie(it, std::ignore) = aggregation_buffers_.emplace(key, std::move(buffer));
             } else {
                 recycle_buffer(std::move(buffer));
             }
@@ -1144,9 +1175,9 @@ private:
         // The destination's buffer after a flush: a fresh one from the pool. May poll; `it` is valid afterwards.
         auto replace_flushed_buffer = [&] {
             auto buffer = get_new_buffer();  // may poll
-            it = aggregation_buffers_.find(receiver);
+            it = aggregation_buffers_.find(key);
             if (it == aggregation_buffers_.end()) {
-                std::tie(it, std::ignore) = aggregation_buffers_.emplace(receiver, std::move(buffer));
+                std::tie(it, std::ignore) = aggregation_buffers_.emplace(key, std::move(buffer));
             } else if (it->second.empty()) {
                 // still empty: a pool buffer, or the moved-from shell the overflow flush left in the entry;
                 // recycle it (recycle_buffer drops a shell) instead of overwriting it
@@ -1204,7 +1235,7 @@ private:
         auto const merged = new_buffer_size - old_buffer_size;
         global_buffer_size_ += merged;
         if (redirecting_depth_ > 0 && merged > 0) {
-            redirected_in_buffer_[receiver] += merged;
+            redirected_in_buffer_[key] += merged;
             flow_.hold_redirected(merged);
         }
         if (large) {
@@ -1222,10 +1253,11 @@ private:
     auto flush_buffer_impl(BufferMap::iterator buffer_it, bool erase = true)
         -> std::pair<typename BufferMap::iterator, bool> {
         KASSERT(buffer_it != aggregation_buffers_.end(), "Trying to flush non-existing buffer.");
-        auto& [receiver, buffer] = *buffer_it;
+        auto& [key, buffer] = *buffer_it;
+        PEID const receiver = destination(key);
         if (idle_flush_ == IdleFlush::stale) {
             // whatever fills this destination next starts a new buffer, which IdleFlush::stale must see grow
-            idle_last_size_.erase(receiver);
+            idle_last_size_.erase(key);
         }
         if (buffer.empty()) {
             if (erase) {
@@ -1242,7 +1274,7 @@ private:
         // we don't send if the cleanup has emptied the buffer
         if (buffer.empty()) {
             global_buffer_size_ -= pre_cleanup_buffer_size;
-            flow_.release_redirected(take_redirected(receiver));
+            flow_.release_redirected(take_redirected(key));
             if (erase) {
                 BufferContainer container = std::move(buffer_it->second);
                 auto next = aggregation_buffers_.erase(buffer_it);
@@ -1266,7 +1298,7 @@ private:
                 } else {
                     num_parked_for_capacity_++;
                 }
-                park_buffer(receiver, std::move(buffer_it->second));
+                park_buffer(receiver, std::move(buffer_it->second), take_redirected(key));
                 global_buffer_size_ -= pre_cleanup_buffer_size;
                 if (erase) {
                     return {aggregation_buffers_.erase(buffer_it), true};
@@ -1277,7 +1309,7 @@ private:
             return {buffer_it, false};
         }
         num_elements_flushed_ += elements;
-        auto const redirected = take_redirected(receiver);
+        auto const redirected = take_redirected(key);
         auto receipt = queue_.post_message(std::move(buffer_it->second), receiver);
         KASSERT(receipt.has_value(),
                 "We checked before that there is capacity, so posting the message should not fail.");
@@ -1337,7 +1369,7 @@ private:
                     continue;
                 }
             }
-            if (flow_.enabled() && !flow_.has_credit(it->first, size)) {
+            if (flow_.enabled() && !flow_.has_credit(destination(it->first), size)) {
                 num_idle_flush_deferred_++;
                 it = advance(std::next(it));
                 continue;
@@ -1353,13 +1385,14 @@ private:
         }
     }
 
-    void park_buffer(PEID receiver, BufferContainer&& buffer) {
+    /// \p redirected: the redirected elements in \p buffer (take_redirected).
+    void park_buffer(PEID receiver, BufferContainer&& buffer, std::size_t redirected) {
         auto const elements = buffer.size();
         auto& queue_for_peer = parked_[receiver];
         if (queue_for_peer.empty()) {
             parked_peers_.push_back(receiver);
         }
-        queue_for_peer.push_back(ParkedBuffer{.buffer = std::move(buffer), .redirected = take_redirected(receiver)});
+        queue_for_peer.push_back(ParkedBuffer{.buffer = std::move(buffer), .redirected = redirected});
         parked_elements_ += elements;
     }
 
@@ -1401,9 +1434,10 @@ private:
         parked_peers_.resize(kept);
     }
 
-    /// Redirected elements in \p receiver's current buffer; resets the count, since the buffer is being sent or parked.
-    std::size_t take_redirected(PEID receiver) {
-        auto it = redirected_in_buffer_.find(receiver);
+    /// Redirected elements in the current buffer of \p key (see buffer_key); resets the count, since the buffer is
+    /// being sent or parked.
+    std::size_t take_redirected(PEID key) {
+        auto it = redirected_in_buffer_.find(key);
         if (it == redirected_in_buffer_.end()) {
             return 0;
         }
@@ -1661,6 +1695,7 @@ private:
     std::size_t redirect_overdraft_ = 0;
     std::size_t num_reserve_waits_ = 0;     ///< own posts that waited for the reserve to drain
     std::size_t num_drain_forward_deferred_ = 0;  ///< see num_drain_forward_deferred
+    bool separate_forwarding_ = true;             ///< Config::separate_forwarding
     std::size_t peak_reserve_buffers_ = 0;  ///< most buffers in use beyond the pool cap at once
     std::size_t num_peers_ = 0;
     std::size_t poll_throttle_count_ = 0;
