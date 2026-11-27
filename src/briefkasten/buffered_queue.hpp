@@ -116,6 +116,11 @@ struct Config {
     bool exact_redirect_limit = true;
     /// See DrainOrder.
     DrainOrder drain_order = DrainOrder::map;
+    /// Credit budget per rank, in buffers per peer on average (see FlowController). nullopt or 0: a fixed window
+    /// of num_credit_buffers per link. Otherwise links start at two buffers and grow up to num_credit_buffers while
+    /// the credit outstanding on all inbound links plus the forwarded payload held stays within
+    /// credit_budget_buffers * #peers buffers; with indirection that is also the redirect limit. At least 2.
+    std::optional<std::size_t> credit_budget_buffers = std::nullopt;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -206,7 +211,9 @@ public:
         }
         num_peers_ = num_peers;
         auto const buffer_size = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
-        flow_.configure(num_credit_buffers * buffer_size, num_peers);
+        auto const budget_buffers = effective_config_.credit_budget_buffers.value_or(0);
+        flow_.configure_budget(num_credit_buffers * buffer_size, num_peers, budget_buffers * buffer_size * num_peers,
+                               buffer_size);
         // buffers wait in per-destination parking queues instead of the sender's single FIFO backlog
         if (!user_config_.send_backlog_capacity) {
             queue_.set_send_backlog_capacity(0);
@@ -961,6 +968,26 @@ public:
 
     [[nodiscard]] std::size_t num_grants_sent() const {
         return flow_.num_grants_sent();
+    }
+
+    /// The most credit outstanding on all inbound links at once, in elements: what peers could have sent this rank
+    /// without waiting (a bound on its unexpected messages).
+    [[nodiscard]] std::size_t peak_inbound_credit() const {
+        return flow_.peak_inbound_credit();
+    }
+
+    /// Config::credit_budget_buffers: the budget in elements (0: fixed windows), and how often due grants grew a
+    /// link's window or halved it because the budget was full.
+    [[nodiscard]] std::size_t credit_budget_elements() const {
+        return flow_.budget_elements();
+    }
+
+    [[nodiscard]] std::size_t num_window_grows() const {
+        return flow_.num_window_grows();
+    }
+
+    [[nodiscard]] std::size_t num_window_shrinks() const {
+        return flow_.num_window_shrinks();
     }
 
     [[nodiscard]] std::size_t num_grants_received() const {

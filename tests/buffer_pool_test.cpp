@@ -178,3 +178,51 @@ TEST(BufferPoolTest, grid_drain_order_rank) {
 TEST(BufferPoolTest, grid_drain_order_rotating) {
     run_grid(true, true, 1, briefkasten::DrainOrder::rotating);
 }
+
+namespace {
+// Config::credit_budget_buffers: windows start at two buffers and grow within the budget. Everything arrives, the
+// pool stays within its ceiling, and the credit outstanding on all inbound links never exceeds the budget.
+template <typename MakeQueue>
+void run_budget(std::size_t num_credit_buffers, std::size_t credit_budget_buffers, MakeQueue make_queue) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.num_credit_buffers = num_credit_buffers;
+    conf.credit_budget_buffers = credit_budget_buffers;
+    auto queue = make_queue(comm, conf);
+    run_and_check(comm, queue);
+    auto const& base = [&]() -> auto const& {
+        if constexpr (requires { queue.queue(); }) {
+            return queue.queue();
+        } else {
+            return queue;
+        }
+    }();
+    EXPECT_GT(base.credit_budget_elements(), 0U);
+    EXPECT_LE(base.peak_inbound_credit(), base.credit_budget_elements());
+    // a budget of two buffers per peer is all initial windows: nothing can grow
+    if (comm.size() > 1 && credit_budget_buffers > 2) {
+        EXPECT_GT(global_sum(comm, base.num_window_grows()), 0U);
+    }
+    if (credit_budget_buffers == 2) {
+        EXPECT_EQ(base.num_window_grows(), 0U);
+    }
+}
+
+auto grid_queue(kamping::Communicator<> const& comm, briefkasten::Config const& conf) {
+    return briefkasten::IndirectionAdapter{direct_queue(comm, conf),
+                                           briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
+}
+}  // namespace
+
+TEST(BufferPoolTest, direct_credit_budget) {
+    run_budget(briefkasten::DEFAULT_NUM_CREDIT_BUFFERS, 4, direct_queue);
+}
+
+TEST(BufferPoolTest, grid_credit_budget) {
+    run_budget(briefkasten::DEFAULT_NUM_CREDIT_BUFFERS, 4, grid_queue);
+}
+
+// the smallest budget: every link stays at its initial window of two buffers
+TEST(BufferPoolTest, grid_credit_budget_minimal) {
+    run_budget(briefkasten::DEFAULT_NUM_CREDIT_BUFFERS, 2, grid_queue);
+}

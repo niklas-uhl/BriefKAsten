@@ -140,3 +140,20 @@ TEST(FlowControlTest, parking_under_a_tiny_window_still_delivers_everything) {
         EXPECT_GT(global_sum(comm, outcome.parked_for_credit), 0U);
     }
 }
+
+/// Config::credit_budget_buffers with the smallest budget and no polling while posting: links start at two buffers,
+/// grow only within the budget and halve when it is full. Nothing may be lost or block in a handler.
+TEST(FlowControlTest, credit_budget_under_pressure_still_delivers_everything) {
+    kamping::Communicator<> comm;
+    briefkasten::Config conf;
+    conf.local_threshold_bytes = 1024;  // 256 elements per buffer
+    conf.num_credit_buffers = 8;
+    conf.credit_budget_buffers = 2;
+    auto outcome = run_alltoall(comm, conf, /*poll_while_posting=*/false);
+
+    EXPECT_TRUE(outcome.flow_control);
+    EXPECT_EQ(global_sum(comm, outcome.received), NUM_LOCAL_ELEMENTS * comm.size());
+    EXPECT_EQ(outcome.pending_at_end, 0U);
+    EXPECT_EQ(outcome.redirect_buffer_stalls, 0U);
+    EXPECT_EQ(outcome.overflow_capacity_waits, 0U);
+}
