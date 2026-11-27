@@ -98,6 +98,7 @@ public:
           pending_grants_(std::move(other.pending_grants_)),
           limits_(other.limits_),
           half_window_pass_(other.half_window_pass_),
+          exact_redirect_limit_(other.exact_redirect_limit_),
           sum_proxied_in_credit_(other.sum_proxied_in_credit_),
           num_redirect_elements_buffered_(other.num_redirect_elements_buffered_),
           withheld_grants_(std::move(other.withheld_grants_)),
@@ -156,10 +157,16 @@ public:
         return limits_.num_window_elements;
     }
 
-    /// Upper bound on num_redirect_elements_buffered_ + sum_proxied_in_credit_: the limit, plus the one grant
-    /// that reaches it.
+    /// Upper bound on num_redirect_elements_buffered_ + sum_proxied_in_credit_ (apart from oversize passes): the
+    /// limit, plus the one grant that reaches it unless the limit is exact.
     [[nodiscard]] std::size_t redirect_high_water() const {
-        return limits_.max_num_redirect_elements + limits_.num_window_elements;
+        return limits_.max_num_redirect_elements + (exact_redirect_limit_ ? 0 : limits_.num_window_elements);
+    }
+
+    /// EXPERIMENT SWITCH (Config::exact_redirect_limit): a proxy grants on a proxied link only if the whole grant
+    /// fits the redirect limit, instead of whenever it is below the limit, so the limit is never overshot.
+    void exact_redirect_limit(bool enable) {
+        exact_redirect_limit_ = enable;
     }
 
     /// May a buffer of \p elements elements be sent to \p peer now? A buffer larger than half the window is let
@@ -329,23 +336,38 @@ private:
         if (new_in_granted <= state.in_granted) {
             return;
         }
-        if (state.proxied &&
-            num_redirect_elements_buffered_ + sum_proxied_in_credit_ >= limits_.max_num_redirect_elements) {
+        auto const freed = new_in_granted - state.in_granted;
+        // the new outstanding credit is the whole window: after an oversize pass in_received exceeds the old
+        // grant, and that excess was never credit
+        auto const added = new_in_granted - std::max(state.in_granted, state.in_received);
+        auto const withhold = [&] {
             if (!state.grant_withheld) {
                 state.grant_withheld = true;
                 withheld_grants_.push_back(peer);
                 num_grants_withheld_++;
             }
-            return;
-        }
-        auto const freed = new_in_granted - state.in_granted;
-        if (freed * 2 < limits_.num_window_elements) {
-            return;
+        };
+        auto const held = num_redirect_elements_buffered_ + sum_proxied_in_credit_;
+        if (exact_redirect_limit_) {
+            // only a grant that is due can be withheld, and it is withheld unless all of it fits the limit
+            if (freed * 2 < limits_.num_window_elements) {
+                return;
+            }
+            if (state.proxied && held + added > limits_.max_num_redirect_elements) {
+                withhold();
+                return;
+            }
+        } else {
+            if (state.proxied && held >= limits_.max_num_redirect_elements) {
+                withhold();
+                return;
+            }
+            if (freed * 2 < limits_.num_window_elements) {
+                return;
+            }
         }
         if (state.proxied) {
-            // the new outstanding credit is the whole window: after an oversize pass in_received exceeds the
-            // old grant, and that excess was never credit
-            sum_proxied_in_credit_ += new_in_granted - std::max(state.in_granted, state.in_received);
+            sum_proxied_in_credit_ += added;
         }
         state.in_granted = new_in_granted;
         send_grant(peer, state);
@@ -476,7 +498,8 @@ private:
     std::unordered_map<PEID, Peer> peers_;
     std::vector<PEID> pending_grants_;
     Limits limits_;
-    bool half_window_pass_ = true;  ///< see half_window_oversize_pass
+    bool half_window_pass_ = true;        ///< see half_window_oversize_pass
+    bool exact_redirect_limit_ = false;  ///< see exact_redirect_limit
     /// sum of in_granted - in_received over proxied peers: what they may still send us, in elements
     std::size_t sum_proxied_in_credit_ = 0;
     /// received from proxied peers, merged for forwarding, not yet sent

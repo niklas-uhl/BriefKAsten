@@ -127,6 +127,47 @@ TEST(BufferPoolTest, grid_global_flush_small_credit_window) {
     run_and_check(comm, queue);
 }
 
+// Experiment switches Config::separate_forwarding and Config::exact_redirect_limit, alone and together, with the
+// default credit window and with one buffer per peer: everything arrives, and the reserve stays within the ceiling
+// for the switches in use (also checked at every acquisition by a KASSERT).
+void run_grid(bool separate_forwarding, bool exact_redirect_limit, std::size_t num_credit_buffers) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.num_credit_buffers = num_credit_buffers;
+    conf.separate_forwarding = separate_forwarding;
+    conf.exact_redirect_limit = exact_redirect_limit;
+    briefkasten::IndirectionAdapter queue{direct_queue(comm, conf),
+                                          briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
+    run_and_check(comm, queue);
+    if (separate_forwarding) {
+        EXPECT_EQ(queue.queue().num_reserve_waits(), 0);
+    }
+}
+
+TEST(BufferPoolTest, grid_separate_forwarding) {
+    run_grid(true, false, briefkasten::DEFAULT_NUM_CREDIT_BUFFERS);
+}
+
+TEST(BufferPoolTest, grid_separate_forwarding_small_credit_window) {
+    run_grid(true, false, 1);
+}
+
+TEST(BufferPoolTest, grid_exact_redirect_limit) {
+    run_grid(false, true, briefkasten::DEFAULT_NUM_CREDIT_BUFFERS);
+}
+
+TEST(BufferPoolTest, grid_exact_redirect_limit_small_credit_window) {
+    run_grid(false, true, 1);
+}
+
+TEST(BufferPoolTest, grid_separate_forwarding_exact_redirect_limit) {
+    run_grid(true, true, briefkasten::DEFAULT_NUM_CREDIT_BUFFERS);
+}
+
+TEST(BufferPoolTest, grid_separate_forwarding_exact_redirect_limit_small_credit_window) {
+    run_grid(true, true, 1);
+}
+
 // The experiment switch Config::bounded_pool = false restores the pool handling from before #29: everything is
 // still delivered, and the free list outgrows the pool again (the leak this suite guards against otherwise).
 TEST(BufferPoolTest, legacy_pool_switch) {
