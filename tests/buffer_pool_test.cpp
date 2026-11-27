@@ -341,3 +341,14 @@ TEST(BufferPoolTest, grid_credit_budget) {
 TEST(BufferPoolTest, grid_credit_budget_minimal) {
     run_budget(briefkasten::DEFAULT_NUM_CREDIT_BUFFERS, 2, grid_queue);
 }
+
+// Config::num_delivery_credit_buffers: links that are only delivered over get a larger window than the proxied ones.
+// Everything arrives and the pool stays within the ceiling of the (proxied) window.
+TEST(BufferPoolTest, grid_delivery_window) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.num_credit_buffers = 2;
+    conf.num_delivery_credit_buffers = 8;
+    auto queue = grid_queue(comm, conf);
+    run_and_check(comm, queue);
+}

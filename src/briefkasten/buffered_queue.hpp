@@ -143,6 +143,10 @@ struct Config {
     /// DIAGNOSTIC: classify withheld peers as feeders / bystanders of the congestion (num_withheld_bystanders etc.).
     /// Costs a map update per forwarded message (~11 % on lake-lanier), so off unless asked for.
     bool withhold_feeder_diagnostic = false;
+    /// Window of links whose buffers are only delivered here (not forwarded), in buffers; nullopt: num_credit_buffers.
+    /// With indirection these are the hops from the proxies to the final receiver; the proxy's bound depends only on
+    /// num_credit_buffers (the window of the links it forwards from). Ignored with a credit budget.
+    std::optional<std::size_t> num_delivery_credit_buffers = std::nullopt;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -240,6 +244,7 @@ public:
         auto const budget_buffers = effective_config_.credit_budget_buffers.value_or(0);
         flow_.configure_budget(num_credit_buffers * buffer_size, num_peers, budget_buffers * buffer_size * num_peers,
                                buffer_size);
+        flow_.delivery_window(effective_config_.num_delivery_credit_buffers.value_or(0) * buffer_size);
         // buffers wait in per-destination parking queues instead of the sender's single FIFO backlog
         if (!user_config_.send_backlog_capacity) {
             queue_.set_send_backlog_capacity(0);

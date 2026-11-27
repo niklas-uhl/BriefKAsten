@@ -90,6 +90,8 @@ public:
         std::size_t window_step_elements = 0;       ///< growth per due grant (one buffer)
         std::size_t budget_elements = 0;            ///< 0: fixed windows
         std::size_t num_peers = 0;
+        /// window of links that are known not to be proxied (only delivered here), with fixed windows; 0: the window
+        std::size_t delivery_window_elements = 0;
     };
 
     // NOLINTBEGIN(*-easily-swappable-parameters)
@@ -191,6 +193,14 @@ public:
             enabled_ = true;
             arm_receives();
         }
+    }
+
+    /// Fixed windows only: links whose buffers this rank only receives (not proxied) get a window of \p elements
+    /// instead, once the first buffer has shown that they are not proxied. The redirect limit and the initial window
+    /// stay those of the (proxied) window, so the proxy's bound is unchanged: forwarded payload enters only through
+    /// proxied links. Larger delivery windows let a proxy pass forwarded payload on faster.
+    void delivery_window(std::size_t elements) {
+        limits_.delivery_window_elements = elements;
     }
 
     [[nodiscard]] bool enabled() const {
@@ -478,6 +488,10 @@ private:
             }
         };
         auto next_window = window;
+        if (limits_.budget_elements == 0 && limits_.delivery_window_elements > 0 && state.proxied_known &&
+            !state.proxied) {
+            next_window = limits_.delivery_window_elements;
+        }
         if (limits_.budget_elements > 0 && freed * 2 >= window) {
             // every window is reserved in full (a link is refilled to it without asking the budget), so growth must
             // fit the budget next to all windows and the forwarded payload held; if they already exceed it, halve
