@@ -1,7 +1,6 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <kamping/collectives/allreduce.hpp>
-#include <kamping/collectives/barrier.hpp>
 #include <kamping/communicator.hpp>
 
 #include <cstddef>
@@ -60,9 +59,6 @@ Outcome run(kamping::Communicator<> const& comm, Queue& queue) {
         }
         outcome.bad_messages += ok ? 0 : 1;
     };
-    // The tests share the communicator and the tags: wait until every rank has destroyed the previous test's queue,
-    // or its persistent receives may match this test's first messages.
-    comm.barrier();
     for (std::size_t round = 0; round < 3; ++round) {
         for (std::size_t size : MESSAGE_SIZES) {
             for (int receiver = 0; receiver < comm.size_signed(); ++receiver) {
@@ -130,7 +126,6 @@ TEST(LargeMessageTest, full_buffers_are_kept) {
     kamping::Communicator<> comm;
     auto queue = direct_queue(comm, small_buffers());
     auto on_message = [](auto /*envelope*/) {};
-    comm.barrier();
     for (std::size_t round = 0; round < 50; ++round) {
         for (std::size_t size : {std::size_t{1}, std::size_t{100}, FITS_EXACTLY}) {
             for (int receiver = 0; receiver < comm.size_signed(); ++receiver) {
