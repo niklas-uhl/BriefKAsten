@@ -157,3 +157,18 @@ TEST(FlowControlTest, credit_budget_under_pressure_still_delivers_everything) {
     EXPECT_EQ(outcome.redirect_buffer_stalls, 0U);
     EXPECT_EQ(outcome.overflow_capacity_waits, 0U);
 }
+
+/// Config::feeder_first under pressure (tiny window, no polling while posting).
+TEST(FlowControlTest, feeder_first_under_pressure_still_delivers_everything) {
+    kamping::Communicator<> comm;
+    briefkasten::Config conf;
+    conf.local_threshold_bytes = 1024;
+    conf.num_credit_buffers = 2;
+    conf.feeder_first = true;
+    auto outcome = run_alltoall(comm, conf, /*poll_while_posting=*/false);
+
+    EXPECT_EQ(global_sum(comm, outcome.received), NUM_LOCAL_ELEMENTS * comm.size());
+    EXPECT_EQ(outcome.pending_at_end, 0U);
+    EXPECT_EQ(outcome.redirect_buffer_stalls, 0U);
+    EXPECT_EQ(outcome.overflow_capacity_waits, 0U);
+}

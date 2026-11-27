@@ -352,3 +352,14 @@ TEST(BufferPoolTest, grid_delivery_window) {
     auto queue = grid_queue(comm, conf);
     run_and_check(comm, queue);
 }
+
+// Config::feeder_first: withholding from the feeders of the congestion first must not lose anything or break the
+// ceiling, also with the smallest window (most withholds).
+TEST(BufferPoolTest, grid_feeder_first) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.num_credit_buffers = 2;
+    conf.feeder_first = true;
+    auto queue = grid_queue(comm, conf);
+    run_and_check(comm, queue);
+}

@@ -80,6 +80,11 @@ public:
         bool proxied_known = false;
         double withheld_since = -1.0;  ///< DIAGNOSTIC: MPI_Wtime() when the current withhold episode began
         std::size_t window = 0;  ///< inbound window of this link (the fixed window without a credit budget)
+        // feeder-first: what this proxied peer's buffers carried to forward, and the part of it to destinations
+        // with payload parked at that moment (both halved once the total exceeds eight windows, so recent traffic
+        // counts most)
+        std::size_t forwarded = 0;
+        std::size_t forwarded_congested = 0;
     };
 
     /// Set by configure(), fixed afterwards.
@@ -129,7 +134,9 @@ public:
           sum_touched_windows_(other.sum_touched_windows_),
           peak_inbound_credit_(other.peak_inbound_credit_),
           num_window_grows_(other.num_window_grows_),
-          num_window_shrinks_(other.num_window_shrinks_) {
+          num_window_shrinks_(other.num_window_shrinks_),
+          feeder_first_(other.feeder_first_),
+          num_feeder_withholds_(other.num_feeder_withholds_) {
         other.enabled_ = false;
         other.receive_requests_.clear();
         other.receive_buffers_.clear();
@@ -201,6 +208,33 @@ public:
     /// proxied links. Larger delivery windows let a proxy pass forwarded payload on faster.
     void delivery_window(std::size_t elements) {
         limits_.delivery_window_elements = elements;
+    }
+
+    /// Feeder-first withholding (exact redirect limit only): above three quarters of the redirect limit, a proxy
+    /// already withholds due grants from proxied peers whose recent forwarded payload went to at least a quarter to
+    /// destinations with payload parked (the feeders of the congestion), and keeps granting the others up to the
+    /// limit itself. The limit, and with it the bound, is unchanged; only who waits first changes.
+    void feeder_first(bool enable) {
+        feeder_first_ = enable;
+    }
+
+    /// Feeder-first: \p peer's buffer carried \p elements to forward, \p congested of them to destinations with
+    /// payload parked.
+    void note_forwarded(PEID peer, std::size_t elements, std::size_t congested) {
+        if (!enabled_ || elements == 0) {
+            return;
+        }
+        Peer& state = peer_state(peer);
+        state.forwarded += elements;
+        state.forwarded_congested += congested;
+        if (state.forwarded > 8 * limits_.num_window_elements) {
+            state.forwarded /= 2;
+            state.forwarded_congested /= 2;
+        }
+    }
+
+    [[nodiscard]] std::size_t num_feeder_withholds() const {
+        return num_feeder_withholds_;
     }
 
     [[nodiscard]] bool enabled() const {
@@ -422,6 +456,7 @@ public:
         peak_inbound_credit_ = inbound_credit();
         num_window_grows_ = 0;
         num_window_shrinks_ = 0;
+        num_feeder_withholds_ = 0;
     }
 
 private:
@@ -516,6 +551,12 @@ private:
                 return;
             }
             if (state.proxied && held + added > limits_.max_num_redirect_elements) {
+                withhold();
+                return;
+            }
+            if (feeder_first_ && state.proxied && 4 * (held + added) > 3 * limits_.max_num_redirect_elements &&
+                4 * state.forwarded_congested >= state.forwarded && state.forwarded > 0) {
+                num_feeder_withholds_++;
                 withhold();
                 return;
             }
@@ -697,6 +738,8 @@ private:
     std::size_t peak_inbound_credit_ = 0;
     std::size_t num_window_grows_ = 0;
     std::size_t num_window_shrinks_ = 0;
+    bool feeder_first_ = false;
+    std::size_t num_feeder_withholds_ = 0;  ///< withholds below the limit, of feeders (feeder_first)
 };
 
 }  // namespace briefkasten::internal

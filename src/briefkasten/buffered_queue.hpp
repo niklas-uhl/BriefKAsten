@@ -37,6 +37,7 @@
 #include <ranges>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "./aggregators.hpp"
@@ -147,6 +148,8 @@ struct Config {
     /// With indirection these are the hops from the proxies to the final receiver; the proxy's bound depends only on
     /// num_credit_buffers (the window of the links it forwards from). Ignored with a credit budget.
     std::optional<std::size_t> num_delivery_credit_buffers = std::nullopt;
+    /// See FlowController::feeder_first (needs exact_redirect_limit). Costs a lookup per forwarded message.
+    bool feeder_first = false;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -245,6 +248,7 @@ public:
         flow_.configure_budget(num_credit_buffers * buffer_size, num_peers, budget_buffers * buffer_size * num_peers,
                                buffer_size);
         flow_.delivery_window(effective_config_.num_delivery_credit_buffers.value_or(0) * buffer_size);
+        flow_.feeder_first(effective_config_.feeder_first);
         // buffers wait in per-destination parking queues instead of the sender's single FIFO backlog
         if (!user_config_.send_backlog_capacity) {
             queue_.set_send_backlog_capacity(0);
@@ -1020,6 +1024,11 @@ public:
         return flow_.num_window_grows();
     }
 
+    /// Config::feeder_first: grants withheld below the redirect limit because the peer feeds the congestion.
+    [[nodiscard]] std::size_t num_feeder_withholds() const {
+        return flow_.num_feeder_withholds();
+    }
+
     [[nodiscard]] std::size_t num_window_shrinks() const {
         return flow_.num_window_shrinks();
     }
@@ -1406,6 +1415,12 @@ private:
         if (redirecting_depth_ > 0 && merged > 0) {
             redirected_in_buffer_[key] += merged;
             flow_.hold_redirected(merged);
+            if (effective_config_.feeder_first) {
+                forwarded_in_handler_ += merged;
+                if (!parked_.empty() && parked_.contains(receiver)) {
+                    forwarded_congested_in_handler_ += merged;
+                }
+            }
             if (effective_config_.withhold_feeder_diagnostic) {
                 auto& by_destination = forwarded_by_source_[redirect_source_];
                 by_destination[receiver] += merged;
@@ -1749,12 +1764,19 @@ private:
             flow_.set_proxied(source, redirects);
             redirecting_depth_ += redirects ? 1 : 0;
             auto const outer_redirect_source = redirect_source_;
+            auto const outer_forwarded = std::exchange(forwarded_in_handler_, 0);
+            auto const outer_forwarded_congested = std::exchange(forwarded_congested_in_handler_, 0);
             if (redirects) {
                 redirect_source_ = source;
             }
             for (Envelope<MessageType> auto env : split(buffer.message, buffer.sender, queue_.rank())) {
                 on_message(std::move(env));
             }
+            if (redirects) {
+                flow_.note_forwarded(source, forwarded_in_handler_, forwarded_congested_in_handler_);
+            }
+            forwarded_in_handler_ = outer_forwarded;
+            forwarded_congested_in_handler_ = outer_forwarded_congested;
             redirect_source_ = outer_redirect_source;
             redirecting_depth_ -= redirects ? 1 : 0;
             auto const episodes_before = flow_.num_withhold_episodes();
@@ -1948,6 +1970,8 @@ private:
     WithholdSnapshot withhold_sum_;      ///< DIAGNOSTIC: summed over the samples
     WithholdSnapshot withhold_max_;      ///< DIAGNOSTIC: componentwise maximum over the samples
     PEID redirect_source_ = -1;          ///< the proxied peer whose buffer is being handled (forwards come from it)
+    std::size_t forwarded_in_handler_ = 0;            ///< feeder_first: forwarded from the buffer being handled
+    std::size_t forwarded_congested_in_handler_ = 0;  ///< ... of it to destinations with payload parked
     /// DIAGNOSTIC: forwarded elements per proxied source and destination, and per source
     std::unordered_map<PEID, std::unordered_map<PEID, std::size_t>> forwarded_by_source_;
     std::unordered_map<PEID, std::size_t> forwarded_from_source_;
