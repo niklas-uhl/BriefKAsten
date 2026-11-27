@@ -516,6 +516,15 @@ public:
                     continue;
                 }
             }
+            // A partially filled buffer holding forwarded messages goes out only if it can be sent now. Parked, a
+            // destination could collect partially filled forwarded buffers drain after drain, bounded only per
+            // forwarded element (see redirect_pool_ceiling). It stays pending, so termination waits for a later
+            // attempt.
+            if (holds_forwarded(target) && !it->second.empty() &&
+                (!flow_.has_credit(destination(target), it->second.size()) || !queue_.has_send_capacity())) {
+                num_drain_forward_deferred_++;
+                continue;
+            }
             bool flushed = false;
             forced_flush_ = true;
             if (selective_drain_) {
@@ -857,13 +866,20 @@ public:
         return num_reserve_waits_;
     }
 
+    /// Buffers holding forwarded messages that the termination drain left in place because they could not be sent
+    /// at once.
+    [[nodiscard]] std::size_t num_drain_forward_deferred() const {
+        return num_drain_forward_deferred_;
+    }
+
     /// Upper bound on \ref redirect_overdraft and \ref peak_reserve_buffers, in buffers. Own messages acquire
     /// only below the pool cap and are not merged while the reserve holds more than \ref reserve_pause_threshold
     /// buffers, so buffers acquired beyond that hold forwarded payload only. Per destination, two consecutive
     /// such buffers hold more than one buffer of it (the message that overflowed the first went into the
     /// second), and the proxy holds at most redirect_high_water forwarded elements. Partially filled buffers
-    /// besides: one per destination being filled, one per destination left over from before the pause, and
-    /// idle flushes, which only send what can go out at once (at most one per send slot).
+    /// besides: one per destination being filled, one per destination left over from before the pause, and those
+    /// that left before they overflowed (idle flush, termination drain), which are only sent if they can go out at
+    /// once (at most one per send slot).
     [[nodiscard]] std::size_t redirect_pool_ceiling() const {
         auto const buffer_size = std::max<std::size_t>(queue_.reserved_receive_buffer_size(), 1);
         auto const forwarded_buffers = (flow_.redirect_high_water() + buffer_size - 1) / buffer_size;
@@ -974,6 +990,7 @@ public:
         num_parked_for_capacity_ = 0;
         num_redirect_buffer_stalls_ = 0;
         num_reserve_waits_ = 0;
+        num_drain_forward_deferred_ = 0;
         peak_reserve_buffers_ = 0;
         flow_.reset_counters();
         queue_.reset_counters();
@@ -1008,6 +1025,16 @@ private:
         }
         auto bytes_per_buffer = 2 * (config.global_threshold_bytes / config.num_request_slots);
         return (bytes_per_buffer + sizeof(BufferType) - 1) / sizeof(BufferType);
+    }
+
+    /// The destination of the buffer with key \p key in aggregation_buffers_.
+    [[nodiscard]] PEID destination(PEID key) const {
+        return key;
+    }
+
+    /// Whether the current buffer of \p key holds forwarded messages (a redirection handler merged into it).
+    [[nodiscard]] bool holds_forwarded(PEID key) const {
+        return redirected_in_buffer_.contains(key);
     }
 
     [[nodiscard]] std::size_t buffer_limit() const {
@@ -1633,6 +1660,7 @@ private:
     std::size_t num_redirect_buffer_stalls_ = 0;
     std::size_t redirect_overdraft_ = 0;
     std::size_t num_reserve_waits_ = 0;     ///< own posts that waited for the reserve to drain
+    std::size_t num_drain_forward_deferred_ = 0;  ///< see num_drain_forward_deferred
     std::size_t peak_reserve_buffers_ = 0;  ///< most buffers in use beyond the pool cap at once
     std::size_t num_peers_ = 0;
     std::size_t poll_throttle_count_ = 0;
