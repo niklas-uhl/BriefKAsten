@@ -54,6 +54,14 @@ namespace briefkasten::internal {
 /// forward. To such peers it only grants while num_redirect_elements_buffered_ + sum_proxied_in_credit_ <
 /// max_num_redirect_elements, i.e. it never allows more than it can forward. This is what keeps the receive handler
 /// from blocking.
+///
+/// Credit budget (configure_budget, Config::credit_budget_buffers): instead of a fixed window per link, every link
+/// starts at a minimum window of two buffers, and a receiver grows a link's window by one buffer per due grant, up to
+/// the maximum window, while the windows of all inbound links (the untouched ones at their initial window included)
+/// plus the forwarded elements held stay within the budget. If they already exceed it, the link's window is halved
+/// instead (down to the minimum). Credit cannot be revoked, so a link only shrinks when its next grant falls due. The
+/// redirect limit becomes the budget, so a proxy holds at most the budget in forwarded elements, and what peers may
+/// send this rank is at most the budget. Links to non-proxied peers are never withheld (at most shrunk).
 class FlowController {
 public:
     struct Peer {
@@ -71,12 +79,17 @@ public:
         bool grant_withheld = false;    ///< a grant is due, but the redirect limit is reached
         bool proxied_known = false;
         double withheld_since = -1.0;  ///< DIAGNOSTIC: MPI_Wtime() when the current withhold episode began
+        std::size_t window = 0;  ///< inbound window of this link (the fixed window without a credit budget)
     };
 
     /// Set by configure(), fixed afterwards.
     struct Limits {
-        std::size_t num_window_elements = 0;        ///< credit per peer
-        std::size_t max_num_redirect_elements = 0;  ///< num_window_elements * num_peers
+        std::size_t num_window_elements = 0;        ///< credit per peer (with a budget: the largest window)
+        std::size_t max_num_redirect_elements = 0;  ///< num_window_elements * num_peers, or the budget
+        std::size_t initial_window_elements = 0;    ///< implicit first window of every link, identical on both ends
+        std::size_t window_step_elements = 0;       ///< growth per due grant (one buffer)
+        std::size_t budget_elements = 0;            ///< 0: fixed windows
+        std::size_t num_peers = 0;
     };
 
     // NOLINTBEGIN(*-easily-swappable-parameters)
@@ -109,7 +122,12 @@ public:
           num_grants_withheld_(other.num_grants_withheld_),
           num_withhold_episodes_(other.num_withhold_episodes_),
           withheld_seconds_(other.withheld_seconds_),
-          max_withheld_seconds_(other.max_withheld_seconds_) {
+          max_withheld_seconds_(other.max_withheld_seconds_),
+          sum_touched_in_credit_(other.sum_touched_in_credit_),
+          sum_touched_windows_(other.sum_touched_windows_),
+          peak_inbound_credit_(other.peak_inbound_credit_),
+          num_window_grows_(other.num_window_grows_),
+          num_window_shrinks_(other.num_window_shrinks_) {
         other.enabled_ = false;
         other.receive_requests_.clear();
         other.receive_buffers_.clear();
@@ -141,12 +159,34 @@ public:
     }
 
     void configure(std::size_t num_window_elements, std::size_t num_peers) {
+        configure_budget(num_window_elements, num_peers, 0, 0);
+    }
+
+    /// With a budget of \p budget_elements (0: fixed windows of \p num_window_elements): links start at two buffers
+    /// of \p buffer_elements each (at most the largest window, \p num_window_elements) and grow by one buffer per
+    /// due grant while all windows plus the forwarded payload held stay within the budget, which is raised to hold
+    /// the initial windows of all \p num_peers peers if necessary.
+    void configure_budget(std::size_t num_window_elements, std::size_t num_peers, std::size_t budget_elements,
+                          std::size_t buffer_elements) {
         if (num_window_elements == 0) {
             return;
         }
         KASSERT(peers_.empty(), "flow control must be rationed before the first message");
+        auto const peers = std::max<std::size_t>(1, num_peers);
         limits_.num_window_elements = num_window_elements;
-        limits_.max_num_redirect_elements = num_window_elements * std::max<std::size_t>(1, num_peers);
+        limits_.num_peers = peers;
+        if (budget_elements == 0) {
+            limits_.initial_window_elements = num_window_elements;
+            limits_.window_step_elements = 0;
+            limits_.budget_elements = 0;
+            limits_.max_num_redirect_elements = num_window_elements * peers;
+        } else {
+            limits_.initial_window_elements = std::min(num_window_elements, 2 * buffer_elements);
+            limits_.window_step_elements = std::max<std::size_t>(buffer_elements, 1);
+            limits_.budget_elements = std::max(budget_elements, limits_.initial_window_elements * peers);
+            limits_.max_num_redirect_elements = limits_.budget_elements;
+        }
+        peak_inbound_credit_ = inbound_credit();
         if (!enabled_) {
             enabled_ = true;
             arm_receives();
@@ -188,7 +228,9 @@ public:
             return true;
         }
         // counted in track_send: a buffer may be checked again and again while it waits for a send slot
-        auto const pass_above = half_window_pass_ ? limits_.num_window_elements / 2 : limits_.num_window_elements;
+        // the receiver's window of this link is at least the initial one, so half of that is the safe threshold
+        auto const pass_above =
+            half_window_pass_ ? limits_.initial_window_elements / 2 : limits_.initial_window_elements;
         return credit > 0 && elements > pass_above;
     }
 
@@ -212,6 +254,7 @@ public:
         Peer& state = peer_state(peer);
         auto const outstanding_before = outstanding_credit(state);
         state.in_received += elements;
+        sum_touched_in_credit_ -= outstanding_before - outstanding_credit(state);
         if (state.proxied) {  // message from the peer may contain data that we have to forward
             // the granted credit is used up: what we forward of it is now counted as buffered (hold_redirected).
             // Only the credit this peer had outstanding: an oversize pass (has_credit) receives more than that.
@@ -318,6 +361,25 @@ public:
         return grants_received_;
     }
 
+    /// The most credit outstanding on all inbound links at once (untouched links at their initial window included):
+    /// what peers could have sent this rank without waiting, i.e. a bound on its unexpected messages.
+    [[nodiscard]] std::size_t peak_inbound_credit() const {
+        return peak_inbound_credit_;
+    }
+
+    /// Credit budget: due grants that grew their link's window, and ones that halved it because the budget was full.
+    [[nodiscard]] std::size_t num_window_grows() const {
+        return num_window_grows_;
+    }
+
+    [[nodiscard]] std::size_t num_window_shrinks() const {
+        return num_window_shrinks_;
+    }
+
+    [[nodiscard]] std::size_t budget_elements() const {
+        return limits_.budget_elements;
+    }
+
     /// Snapshot of all counters, for BufferedMessageQueue's stall tracer.
     [[nodiscard]] std::string describe() const {
         std::ostringstream out;
@@ -347,6 +409,9 @@ public:
         num_withhold_episodes_ = 0;
         withheld_seconds_ = 0.0;
         max_withheld_seconds_ = 0.0;
+        peak_inbound_credit_ = inbound_credit();
+        num_window_grows_ = 0;
+        num_window_shrinks_ = 0;
     }
 
 private:
@@ -357,9 +422,27 @@ private:
         }
         // implicit initial window, identical on both ends
         Peer fresh;
-        fresh.out_allowed = limits_.num_window_elements;
-        fresh.in_granted = limits_.num_window_elements;
+        fresh.out_allowed = limits_.initial_window_elements;
+        fresh.in_granted = limits_.initial_window_elements;
+        fresh.window = limits_.initial_window_elements;
+        sum_touched_in_credit_ += fresh.in_granted;
+        sum_touched_windows_ += fresh.window;
         return peers_.emplace(peer, fresh).first->second;
+    }
+
+    /// Credit outstanding on all inbound links: the touched ones as tracked, every other expected peer at its
+    /// implicit initial window.
+    [[nodiscard]] std::size_t inbound_credit() const {
+        auto const untouched = limits_.num_peers - std::min(limits_.num_peers, peers_.size());
+        return sum_touched_in_credit_ + (untouched * limits_.initial_window_elements);
+    }
+
+    /// The windows of all inbound links (every expected peer not seen yet at its initial window). A link's credit
+    /// never exceeds its window, and a grant at an unchanged window is never refused on a non-proxied link, so this
+    /// is what the budget has to cover.
+    [[nodiscard]] std::size_t inbound_windows() const {
+        auto const untouched = limits_.num_peers - std::min(limits_.num_peers, peers_.size());
+        return sum_touched_windows_ + (untouched * limits_.initial_window_elements);
     }
 
     /// The credit granted to \p state's peer and not yet used: in_granted - in_received, 0 after an oversize pass.
@@ -370,14 +453,18 @@ private:
     /// Grant once at least half the window has freed up. On a proxied link, withhold the grant while the
     /// redirect limit is reached; release_redirected() retries it.
     void grant_if_due(PEID peer, Peer& state) {
-        auto const new_in_granted = state.in_received + limits_.num_window_elements;
-        if (new_in_granted <= state.in_granted) {
+        auto const window = state.window;
+        if (state.in_received + window <= state.in_granted) {
             return;
         }
-        auto const freed = new_in_granted - state.in_granted;
+        auto const freed = state.in_received + window - state.in_granted;
         // the new outstanding credit is the whole window: after an oversize pass in_received exceeds the old
         // grant, and that excess was never credit
-        auto const added = new_in_granted - std::max(state.in_granted, state.in_received);
+        auto const added_for = [&](std::size_t w) {
+            auto const granted = state.in_received + w;
+            auto const base = std::max(state.in_granted, state.in_received);
+            return granted > base ? granted - base : 0;
+        };
         auto const withhold = [&] {
             if (!state.grant_withheld) {
                 state.grant_withheld = true;
@@ -390,10 +477,28 @@ private:
                 new_episode_peers_.push_back(peer);
             }
         };
+        auto next_window = window;
+        if (limits_.budget_elements > 0 && freed * 2 >= window) {
+            // every window is reserved in full (a link is refilled to it without asking the budget), so growth must
+            // fit the budget next to all windows and the forwarded payload held; if they already exceed it, halve
+            auto const committed = inbound_windows() + num_redirect_elements_buffered_;
+            auto const grown = std::min(window + limits_.window_step_elements, limits_.num_window_elements);
+            if (committed + (grown - window) <= limits_.budget_elements) {
+                next_window = grown;
+            } else if (committed > limits_.budget_elements) {
+                next_window = std::max(window / 2, limits_.initial_window_elements);
+            }
+            if (state.in_received + next_window <= state.in_granted) {
+                // more than the smaller window is still outstanding: keep the window (and its reservation) until
+                // enough has arrived for a grant at the smaller one
+                return;
+            }
+        }
+        auto const added = added_for(next_window);
         auto const held = num_redirect_elements_buffered_ + sum_proxied_in_credit_;
         if (exact_redirect_limit_) {
             // only a grant that is due can be withheld, and it is withheld unless all of it fits the limit
-            if (freed * 2 < limits_.num_window_elements) {
+            if (freed * 2 < window) {
                 return;
             }
             if (state.proxied && held + added > limits_.max_num_redirect_elements) {
@@ -405,20 +510,30 @@ private:
                 withhold();
                 return;
             }
-            if (freed * 2 < limits_.num_window_elements) {
+            if (freed * 2 < window) {
                 return;
             }
         }
+        if (next_window > window) {
+            num_window_grows_++;
+        } else if (next_window < window) {
+            num_window_shrinks_++;
+        }
+        sum_touched_windows_ += next_window;
+        sum_touched_windows_ -= window;
+        state.window = next_window;
         if (state.proxied) {
             sum_proxied_in_credit_ += added;
         }
+        sum_touched_in_credit_ += added;
         if (state.withheld_since >= 0.0) {
             auto const waited = MPI_Wtime() - state.withheld_since;
             withheld_seconds_ += waited;
             max_withheld_seconds_ = std::max(max_withheld_seconds_, waited);
             state.withheld_since = -1.0;
         }
-        state.in_granted = new_in_granted;
+        state.in_granted = state.in_received + next_window;
+        peak_inbound_credit_ = std::max(peak_inbound_credit_, inbound_credit());
         send_grant(peer, state);
         // Only a grant on a proxied link adds to what this rank may have to forward. A grant to any other peer is
         // unrelated to the redirect limit; the limit can be exceeded while an oversize buffer (has_credit) is being
@@ -562,6 +677,12 @@ private:
     double withheld_seconds_ = 0.0;
     double max_withheld_seconds_ = 0.0;
     std::vector<PEID> new_episode_peers_;
+    /// sum of in_granted - in_received over the peers in peers_ (untouched peers: see inbound_credit)
+    std::size_t sum_touched_in_credit_ = 0;
+    std::size_t sum_touched_windows_ = 0;  ///< sum of the windows of the peers in peers_
+    std::size_t peak_inbound_credit_ = 0;
+    std::size_t num_window_grows_ = 0;
+    std::size_t num_window_shrinks_ = 0;
 };
 
 }  // namespace briefkasten::internal
