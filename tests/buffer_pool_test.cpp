@@ -130,12 +130,16 @@ TEST(BufferPoolTest, grid_global_flush_small_credit_window) {
 // Experiment switches Config::separate_forwarding and Config::exact_redirect_limit, alone and together, with the
 // default credit window and with one buffer per peer: everything arrives, and the reserve stays within the ceiling
 // for the switches in use (also checked at every acquisition by a KASSERT).
-void run_grid(bool separate_forwarding, bool exact_redirect_limit, std::size_t num_credit_buffers) {
+void run_grid(bool separate_forwarding,
+              bool exact_redirect_limit,
+              std::size_t num_credit_buffers,
+              bool drop_shells = false) {
     kamping::Communicator<> comm;
     auto conf = small_buffers(/*flow_control=*/true);
     conf.num_credit_buffers = num_credit_buffers;
     conf.separate_forwarding = separate_forwarding;
     conf.exact_redirect_limit = exact_redirect_limit;
+    conf.drop_shells = drop_shells;
     briefkasten::IndirectionAdapter queue{direct_queue(comm, conf),
                                           briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
     run_and_check(comm, queue);
@@ -166,6 +170,16 @@ TEST(BufferPoolTest, grid_separate_forwarding_exact_redirect_limit) {
 
 TEST(BufferPoolTest, grid_separate_forwarding_exact_redirect_limit_small_credit_window) {
     run_grid(true, true, 1);
+}
+
+// KaCCv2 runs with Config::drop_shells (the candidate pool fix): the moved-from shells of either kind of buffer are
+// dropped, never recycled
+TEST(BufferPoolTest, grid_separate_forwarding_exact_redirect_limit_drop_shells) {
+    run_grid(true, true, briefkasten::DEFAULT_NUM_CREDIT_BUFFERS, /*drop_shells=*/true);
+}
+
+TEST(BufferPoolTest, grid_separate_forwarding_exact_redirect_limit_drop_shells_small_credit_window) {
+    run_grid(true, true, 1, /*drop_shells=*/true);
 }
 
 // The experiment switch Config::bounded_pool = false restores the pool handling from before #29: everything is
