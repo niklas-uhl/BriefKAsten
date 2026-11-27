@@ -54,6 +54,8 @@ void run_and_check(kamping::Communicator<> const& comm, Queue& queue) {
     EXPECT_GE(base.num_overflows(), MESSAGES_PER_RECEIVER / 6);
     EXPECT_LE(base.num_free_buffers(), base.num_allocated_buffers());
     EXPECT_LE(base.num_allocated_buffers(), base.max_num_aggregation_buffers() + base.redirect_overdraft());
+    // only a proxy draws from the reserve, and forwarded payload bounds it
+    EXPECT_LE(base.peak_reserve_buffers(), base.redirect_pool_ceiling());
     EXPECT_EQ(global_sum(comm, received), MESSAGES_PER_RECEIVER * comm.size() * comm.size());
 }
 
@@ -97,6 +99,27 @@ TEST(BufferPoolTest, direct_global_flush) {
 TEST(BufferPoolTest, grid) {
     kamping::Communicator<> comm;
     briefkasten::IndirectionAdapter queue{direct_queue(comm, small_buffers(/*flow_control=*/true)),
+                                          briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
+    run_and_check(comm, queue);
+}
+
+// One credit buffer per peer: buffers park for credit all the time, so the proxies draw from the reserve while
+// every rank keeps posting its own messages to the same destinations.
+TEST(BufferPoolTest, grid_small_credit_window) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.num_credit_buffers = 1;
+    briefkasten::IndirectionAdapter queue{direct_queue(comm, conf),
+                                          briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
+    run_and_check(comm, queue);
+}
+
+TEST(BufferPoolTest, grid_global_flush_small_credit_window) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.num_credit_buffers = 1;
+    conf.flush_strategy = briefkasten::FlushStrategy::global;
+    briefkasten::IndirectionAdapter queue{direct_queue(comm, conf),
                                           briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
     run_and_check(comm, queue);
 }
