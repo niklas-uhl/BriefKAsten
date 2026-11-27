@@ -77,15 +77,9 @@ void check_counters(auto const& queue, briefkasten::IdleFlush mode) {
     }
 }
 
-/// Every test starts with a barrier: all queues share the world communicator, so a rank that already posts
-/// in the next test could otherwise hit a persistent receive of a slower rank's queue that is still being
-/// destroyed (the barrier at the end of a test runs before the queue's destructor).
-class IdleFlushTest : public ::testing::TestWithParam<briefkasten::IdleFlush> {
-protected:
-    void SetUp() override {
-        kamping::Communicator<>{}.barrier();
-    }
-};
+/// Consecutive tests are isolated by KaTestrophe, which ends every test with a barrier after its queues are
+/// destroyed.
+class IdleFlushTest : public ::testing::TestWithParam<briefkasten::IdleFlush> {};
 }  // namespace
 
 TEST_P(IdleFlushTest, flat_chains_complete) {

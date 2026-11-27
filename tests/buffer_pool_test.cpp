@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 #include <kamping/collectives/allreduce.hpp>
-#include <kamping/collectives/barrier.hpp>
 #include <kamping/communicator.hpp>
 
 #include <cstddef>
@@ -41,8 +40,6 @@ void run_and_check(kamping::Communicator<> const& comm, Queue& queue) {
         received++;
         EXPECT_EQ(envelope.message.size(), MESSAGE_SIZE);
     };
-    // the tests share the communicator and the tags: let every rank destroy the previous test's queue first
-    comm.barrier();
     std::vector<int> const message(MESSAGE_SIZE, comm.rank_signed());
     for (std::size_t i = 0; i < MESSAGES_PER_RECEIVER; ++i) {
         for (int receiver = 0; receiver < comm.size_signed(); ++receiver) {
