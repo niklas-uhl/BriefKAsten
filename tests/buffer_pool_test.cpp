@@ -123,3 +123,29 @@ TEST(BufferPoolTest, grid_global_flush_small_credit_window) {
                                           briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
     run_and_check(comm, queue);
 }
+
+namespace {
+// Config::separate_forwarding, with the default credit window and with one buffer per peer: everything arrives, and
+// the reserve stays within the ceiling for the mode (also checked at every acquisition by a KASSERT). Own posts wait
+// for the reserve only with shared buffers.
+void run_grid(bool separate_forwarding, std::size_t num_credit_buffers) {
+    kamping::Communicator<> comm;
+    auto conf = small_buffers(/*flow_control=*/true);
+    conf.num_credit_buffers = num_credit_buffers;
+    conf.separate_forwarding = separate_forwarding;
+    briefkasten::IndirectionAdapter queue{direct_queue(comm, conf),
+                                          briefkasten::GridIndirectionScheme{comm.mpi_communicator()}};
+    run_and_check(comm, queue);
+    if (separate_forwarding) {
+        EXPECT_EQ(queue.queue().num_reserve_waits(), 0);
+    }
+}
+}  // namespace
+
+TEST(BufferPoolTest, grid_shared_buffers) {
+    run_grid(false, briefkasten::DEFAULT_NUM_CREDIT_BUFFERS);
+}
+
+TEST(BufferPoolTest, grid_shared_buffers_small_credit_window) {
+    run_grid(false, 1);
+}
