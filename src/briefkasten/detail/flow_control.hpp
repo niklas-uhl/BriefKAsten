@@ -294,6 +294,13 @@ public:
         return max_withheld_seconds_;
     }
 
+    /// DIAGNOSTIC: the peers whose withhold episode began since the last call.
+    std::vector<PEID> take_new_episode_peers() {
+        std::vector<PEID> peers;
+        peers.swap(new_episode_peers_);
+        return peers;
+    }
+
     /// DIAGNOSTIC: credit granted to proxied peers and not yet used, in elements.
     [[nodiscard]] std::size_t sum_proxied_in_credit() const {
         return sum_proxied_in_credit_;
@@ -380,6 +387,7 @@ private:
             if (state.withheld_since < 0.0) {
                 state.withheld_since = MPI_Wtime();
                 num_withhold_episodes_++;
+                new_episode_peers_.push_back(peer);
             }
         };
         auto const held = num_redirect_elements_buffered_ + sum_proxied_in_credit_;
@@ -553,6 +561,7 @@ private:
     std::size_t num_withhold_episodes_ = 0;
     double withheld_seconds_ = 0.0;
     double max_withheld_seconds_ = 0.0;
+    std::vector<PEID> new_episode_peers_;
 };
 
 }  // namespace briefkasten::internal

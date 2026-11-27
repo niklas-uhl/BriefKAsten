@@ -1017,6 +1017,24 @@ public:
     [[nodiscard]] std::size_t num_withhold_samples() const {
         return withhold_samples_;
     }
+    /// DIAGNOSTIC: withhold episodes by the withheld peer's share of forwarded payload that went to destinations
+    /// with payload parked for credit at that moment: bystanders (< 10 %), mixed, feeders (>= 50 %), unknown (the
+    /// peer had sent nothing to forward yet). Many bystanders: withholding from feeders first could help.
+    [[nodiscard]] std::size_t num_withheld_bystanders() const {
+        return num_withheld_bystanders_;
+    }
+    [[nodiscard]] std::size_t num_withheld_mixed() const {
+        return num_withheld_mixed_;
+    }
+    [[nodiscard]] std::size_t num_withheld_feeders() const {
+        return num_withheld_feeders_;
+    }
+    [[nodiscard]] std::size_t num_withheld_unknown() const {
+        return num_withheld_unknown_;
+    }
+    [[nodiscard]] double withheld_share_sum() const {
+        return withheld_share_sum_;
+    }
     [[nodiscard]] WithholdSnapshot const& withhold_sum() const {
         return withhold_sum_;
     }
@@ -1135,6 +1153,11 @@ public:
         withhold_samples_ = 0;
         withhold_sum_ = {};
         withhold_max_ = {};
+        num_withheld_bystanders_ = 0;
+        num_withheld_mixed_ = 0;
+        num_withheld_feeders_ = 0;
+        num_withheld_unknown_ = 0;
+        withheld_share_sum_ = 0.0;
         flow_.reset_counters();
         queue_.reset_counters();
     }
@@ -1348,6 +1371,9 @@ private:
         if (redirecting_depth_ > 0 && merged > 0) {
             redirected_in_buffer_[key] += merged;
             flow_.hold_redirected(merged);
+            auto& by_destination = forwarded_by_source_[redirect_source_];
+            by_destination[receiver] += merged;
+            forwarded_from_source_[redirect_source_] += merged;
         }
         if (large) {
             num_large_messages_++;
@@ -1576,6 +1602,40 @@ private:
         withhold_samples_++;
         withhold_sum_.add(snap);
         withhold_max_.max(snap);
+        // Is a withheld peer feeding the congestion, or a bystander? Congested: destinations with a forwarded
+        // buffer parked for credit. A peer's share: of what it sent through this proxy so far, the part that went
+        // to congested destinations.
+        congested_scratch_.clear();
+        for (auto& [receiver, queue_for_peer] : parked_) {
+            for (auto const& parked : queue_for_peer) {
+                if (parked.redirected > 0 && !flow_.has_credit(receiver, parked.buffer.size())) {
+                    congested_scratch_.push_back(receiver);
+                    break;
+                }
+            }
+        }
+        for (PEID peer : flow_.take_new_episode_peers()) {
+            auto const total_it = forwarded_from_source_.find(peer);
+            if (total_it == forwarded_from_source_.end() || total_it->second == 0) {
+                num_withheld_unknown_++;
+                continue;
+            }
+            std::size_t to_congested = 0;
+            auto const& by_destination = forwarded_by_source_[peer];
+            for (PEID destination : congested_scratch_) {
+                auto const it = by_destination.find(destination);
+                to_congested += it == by_destination.end() ? 0 : it->second;
+            }
+            auto const share = static_cast<double>(to_congested) / static_cast<double>(total_it->second);
+            withheld_share_sum_ += share;
+            if (share < 0.1) {
+                num_withheld_bystanders_++;
+            } else if (share < 0.5) {
+                num_withheld_mixed_++;
+            } else {
+                num_withheld_feeders_++;
+            }
+        }
     }
 
     /// Redirected elements in the current buffer of \p key (see buffer_key); resets the count, since the buffer is
@@ -1647,9 +1707,14 @@ private:
             bool const redirects = may_redirect(source);
             flow_.set_proxied(source, redirects);
             redirecting_depth_ += redirects ? 1 : 0;
+            auto const outer_redirect_source = redirect_source_;
+            if (redirects) {
+                redirect_source_ = source;
+            }
             for (Envelope<MessageType> auto env : split(buffer.message, buffer.sender, queue_.rank())) {
                 on_message(std::move(env));
             }
+            redirect_source_ = outer_redirect_source;
             redirecting_depth_ -= redirects ? 1 : 0;
             auto const episodes_before = flow_.num_withhold_episodes();
             flow_.track_receive(source, elements);
@@ -1841,6 +1906,16 @@ private:
     std::size_t withhold_samples_ = 0;   ///< DIAGNOSTIC: calls that began at least one withhold episode
     WithholdSnapshot withhold_sum_;      ///< DIAGNOSTIC: summed over the samples
     WithholdSnapshot withhold_max_;      ///< DIAGNOSTIC: componentwise maximum over the samples
+    PEID redirect_source_ = -1;          ///< the proxied peer whose buffer is being handled (forwards come from it)
+    /// DIAGNOSTIC: forwarded elements per proxied source and destination, and per source
+    std::unordered_map<PEID, std::unordered_map<PEID, std::size_t>> forwarded_by_source_;
+    std::unordered_map<PEID, std::size_t> forwarded_from_source_;
+    std::vector<PEID> congested_scratch_;
+    std::size_t num_withheld_bystanders_ = 0;  ///< DIAGNOSTIC: episodes of peers with < 10 % to congested destinations
+    std::size_t num_withheld_mixed_ = 0;       ///< 10-50 %
+    std::size_t num_withheld_feeders_ = 0;     ///< >= 50 %
+    std::size_t num_withheld_unknown_ = 0;     ///< the peer has not sent anything to forward yet
+    double withheld_share_sum_ = 0.0;          ///< sum of the shares (divide by the three classified counts)
     std::size_t num_parked_for_credit_ = 0;
     std::size_t num_parked_for_capacity_ = 0;
     std::size_t num_redirect_buffer_stalls_ = 0;
