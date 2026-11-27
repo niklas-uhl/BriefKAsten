@@ -37,6 +37,7 @@
 #include <ranges>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1028,6 +1029,27 @@ public:
         return flow_.num_window_grows();
     }
 
+    /// DIAGNOSTIC: combining potential. With a key per message (e.g. the target vertex), every received buffer is
+    /// checked for messages whose key an earlier message in the same buffer already had: what combining them before
+    /// sending would have saved. Separately for buffers from proxied peers (the first hop, combined by the sender)
+    /// and the others (delivered by a proxy, or sent directly). Costs a hash set insert per received message.
+    struct CombineCounts {
+        std::size_t messages = 0;
+        std::size_t duplicates = 0;
+    };
+
+    void combine_key_diagnostic(std::function<std::uint64_t(MessageType const&)> key) {
+        combine_key_ = std::move(key);
+    }
+
+    [[nodiscard]] CombineCounts const& combine_first_hop() const {
+        return combine_first_hop_;
+    }
+
+    [[nodiscard]] CombineCounts const& combine_delivered() const {
+        return combine_delivered_;
+    }
+
     /// Config::feeder_first: grants withheld below the redirect limit because the peer feeds the congestion.
     [[nodiscard]] std::size_t num_feeder_withholds() const {
         return flow_.num_feeder_withholds();
@@ -1206,6 +1228,8 @@ public:
         num_withheld_feeders_ = 0;
         num_withheld_unknown_ = 0;
         withheld_share_sum_ = 0.0;
+        combine_first_hop_ = {};
+        combine_delivered_ = {};
         flow_.reset_counters();
         queue_.reset_counters();
     }
@@ -1773,8 +1797,23 @@ private:
             if (redirects) {
                 redirect_source_ = source;
             }
+            // a nested handler (a forward that polls) checks its own buffer; the outer one's keys are restored after
+            auto outer_combine_seen = combine_key_ ? std::exchange(combine_seen_, {}) : decltype(combine_seen_){};
             for (Envelope<MessageType> auto env : split(buffer.message, buffer.sender, queue_.rank())) {
+                if constexpr (std::ranges::forward_range<decltype(env.message)>) {
+                    if (combine_key_) {
+                        for (auto const& message : env.message) {
+                            bool const duplicate = !combine_seen_.insert(combine_key_(message)).second;
+                            auto& counts = redirects ? combine_first_hop_ : combine_delivered_;
+                            counts.messages++;
+                            counts.duplicates += duplicate ? 1 : 0;
+                        }
+                    }
+                }
                 on_message(std::move(env));
+            }
+            if (combine_key_) {
+                combine_seen_ = std::move(outer_combine_seen);
             }
             if (redirects) {
                 flow_.note_forwarded(source, forwarded_in_handler_, forwarded_congested_in_handler_);
@@ -1974,6 +2013,10 @@ private:
     WithholdSnapshot withhold_sum_;      ///< DIAGNOSTIC: summed over the samples
     WithholdSnapshot withhold_max_;      ///< DIAGNOSTIC: componentwise maximum over the samples
     PEID redirect_source_ = -1;          ///< the proxied peer whose buffer is being handled (forwards come from it)
+    std::function<std::uint64_t(MessageType const&)> combine_key_;  ///< DIAGNOSTIC: see combine_key_diagnostic
+    std::unordered_set<std::uint64_t> combine_seen_;
+    CombineCounts combine_first_hop_;
+    CombineCounts combine_delivered_;
     std::size_t forwarded_in_handler_ = 0;            ///< feeder_first: forwarded from the buffer being handled
     std::size_t forwarded_congested_in_handler_ = 0;  ///< ... of it to destinations with payload parked
     /// DIAGNOSTIC: forwarded elements per proxied source and destination, and per source
