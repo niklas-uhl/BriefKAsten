@@ -989,6 +989,53 @@ public:
         return flow_.num_grants_sent();
     }
 
+    /// DIAGNOSTIC: where a proxy's redirect budget (max_num_redirect_elements) is when it starts withholding a
+    /// grant, in elements: credit granted to proxied peers and not yet used, and forwarded elements filling a
+    /// buffer, parked without credit, parked without a send slot, or in flight (posted, send not completed).
+    struct WithholdSnapshot {
+        std::size_t credit = 0;
+        std::size_t filling = 0;
+        std::size_t parked_credit = 0;
+        std::size_t parked_slot = 0;
+        std::size_t in_flight = 0;
+        void add(WithholdSnapshot const& o) {
+            credit += o.credit;
+            filling += o.filling;
+            parked_credit += o.parked_credit;
+            parked_slot += o.parked_slot;
+            in_flight += o.in_flight;
+        }
+        void max(WithholdSnapshot const& o) {
+            credit = std::max(credit, o.credit);
+            filling = std::max(filling, o.filling);
+            parked_credit = std::max(parked_credit, o.parked_credit);
+            parked_slot = std::max(parked_slot, o.parked_slot);
+            in_flight = std::max(in_flight, o.in_flight);
+        }
+    };
+
+    [[nodiscard]] std::size_t num_withhold_samples() const {
+        return withhold_samples_;
+    }
+    [[nodiscard]] WithholdSnapshot const& withhold_sum() const {
+        return withhold_sum_;
+    }
+    [[nodiscard]] WithholdSnapshot const& withhold_max() const {
+        return withhold_max_;
+    }
+    [[nodiscard]] std::size_t num_withhold_episodes() const {
+        return flow_.num_withhold_episodes();
+    }
+    [[nodiscard]] double withheld_seconds() const {
+        return flow_.withheld_seconds();
+    }
+    [[nodiscard]] double max_withheld_seconds() const {
+        return flow_.max_withheld_seconds();
+    }
+    [[nodiscard]] std::size_t max_num_redirect_elements() const {
+        return flow_.max_num_redirect_elements();
+    }
+
     [[nodiscard]] std::size_t num_grants_received() const {
         return flow_.num_grants_received();
     }
@@ -1085,6 +1132,9 @@ public:
         peak_reserve_buffers_ = 0;
         num_dropped_shells_ = 0;
         num_drain_forward_deferred_ = 0;
+        withhold_samples_ = 0;
+        withhold_sum_ = {};
+        withhold_max_ = {};
         flow_.reset_counters();
         queue_.reset_counters();
     }
@@ -1335,7 +1385,9 @@ private:
         // we don't send if the cleanup has emptied the buffer
         if (buffer.empty()) {
             global_buffer_size_ -= pre_cleanup_buffer_size;
+            auto const episodes_before = flow_.num_withhold_episodes();
             flow_.release_redirected(take_redirected(key));
+            sample_withhold(episodes_before);
             if (erase) {
                 BufferContainer container = std::move(buffer_it->second);
                 auto next = aggregation_buffers_.erase(buffer_it);
@@ -1495,6 +1547,37 @@ private:
         parked_peers_.resize(kept);
     }
 
+    /// DIAGNOSTIC: if a withhold episode began, record where the redirect budget is: outstanding credit to proxied
+    /// peers, and the redirected elements filling, parked (for credit / for a send slot) and in flight.
+    void sample_withhold(std::size_t episodes_before) {
+        if (flow_.num_withhold_episodes() == episodes_before) {
+            return;
+        }
+        WithholdSnapshot snap;
+        snap.credit = flow_.sum_proxied_in_credit();
+        for (auto const& entry : redirected_in_buffer_) {
+            snap.filling += entry.second;
+        }
+        for (auto& [receiver, queue_for_peer] : parked_) {
+            for (auto const& parked : queue_for_peer) {
+                if (parked.redirected == 0) {
+                    continue;
+                }
+                if (flow_.has_credit(receiver, parked.buffer.size())) {
+                    snap.parked_slot += parked.redirected;
+                } else {
+                    snap.parked_credit += parked.redirected;
+                }
+            }
+        }
+        for (auto const& entry : redirected_by_receipt_) {
+            snap.in_flight += entry.second;
+        }
+        withhold_samples_++;
+        withhold_sum_.add(snap);
+        withhold_max_.max(snap);
+    }
+
     /// Redirected elements in the current buffer of \p key (see buffer_key); resets the count, since the buffer is
     /// being sent or parked.
     std::size_t take_redirected(PEID key) {
@@ -1568,7 +1651,9 @@ private:
                 on_message(std::move(env));
             }
             redirecting_depth_ -= redirects ? 1 : 0;
+            auto const episodes_before = flow_.num_withhold_episodes();
             flow_.track_receive(source, elements);
+            sample_withhold(episodes_before);
             // Handlers must not send, except for the forwarding by the proxy. Otherwise flow control can deadlock.
             KASSERT(may_redirect(source) || num_posts_ == posts_before,
                     "posted " << (num_posts_ - posts_before) << " message(s) while handling a buffer from rank "
@@ -1615,7 +1700,9 @@ private:
         num_buffer_reclaims_++;
         auto it = redirected_by_receipt_.find(receipt);
         if (it != redirected_by_receipt_.end()) {
+            auto const episodes_before = flow_.num_withhold_episodes();
             flow_.release_redirected(it->second);
+            sample_withhold(episodes_before);
             redirected_by_receipt_.erase(it);
         }
         recycle_buffer(std::move(buffer));
@@ -1751,6 +1838,9 @@ private:
     std::unordered_map<PEID, std::size_t> redirected_in_buffer_;         ///< redirected elements per filling buffer
     std::unordered_map<std::size_t, std::size_t> redirected_by_receipt_;  ///< redirected elements per in-flight send
     std::size_t redirecting_depth_ = 0;  ///< nesting depth of handlers for buffers from may_redirect peers
+    std::size_t withhold_samples_ = 0;   ///< DIAGNOSTIC: calls that began at least one withhold episode
+    WithholdSnapshot withhold_sum_;      ///< DIAGNOSTIC: summed over the samples
+    WithholdSnapshot withhold_max_;      ///< DIAGNOSTIC: componentwise maximum over the samples
     std::size_t num_parked_for_credit_ = 0;
     std::size_t num_parked_for_capacity_ = 0;
     std::size_t num_redirect_buffer_stalls_ = 0;

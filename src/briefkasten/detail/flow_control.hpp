@@ -70,6 +70,7 @@ public:
         bool grant_pending = false;     ///< a newer grant is waiting for grant_request to complete
         bool grant_withheld = false;    ///< a grant is due, but the redirect limit is reached
         bool proxied_known = false;
+        double withheld_since = -1.0;  ///< DIAGNOSTIC: MPI_Wtime() when the current withhold episode began
     };
 
     /// Set by configure(), fixed afterwards.
@@ -105,7 +106,10 @@ public:
           grants_sent_(other.grants_sent_),
           grants_received_(other.grants_received_),
           num_oversize_passes_(other.num_oversize_passes_),
-          num_grants_withheld_(other.num_grants_withheld_) {
+          num_grants_withheld_(other.num_grants_withheld_),
+          num_withhold_episodes_(other.num_withhold_episodes_),
+          withheld_seconds_(other.withheld_seconds_),
+          max_withheld_seconds_(other.max_withheld_seconds_) {
         other.enabled_ = false;
         other.receive_requests_.clear();
         other.receive_buffers_.clear();
@@ -275,6 +279,30 @@ public:
         return num_oversize_passes_;
     }
 
+    /// DIAGNOSTIC: a withhold episode runs from the first withhold of a due grant until the grant is sent;
+    /// num_grants_withheld() also counts the retries in between.
+    [[nodiscard]] std::size_t num_withhold_episodes() const {
+        return num_withhold_episodes_;
+    }
+
+    /// DIAGNOSTIC: summed over the episodes that ended (link-seconds a proxied peer waited for a due grant).
+    [[nodiscard]] double withheld_seconds() const {
+        return withheld_seconds_;
+    }
+
+    [[nodiscard]] double max_withheld_seconds() const {
+        return max_withheld_seconds_;
+    }
+
+    /// DIAGNOSTIC: credit granted to proxied peers and not yet used, in elements.
+    [[nodiscard]] std::size_t sum_proxied_in_credit() const {
+        return sum_proxied_in_credit_;
+    }
+
+    [[nodiscard]] std::size_t max_num_redirect_elements() const {
+        return limits_.max_num_redirect_elements;
+    }
+
     [[nodiscard]] std::size_t num_grants_sent() const {
         return grants_sent_;
     }
@@ -309,6 +337,9 @@ public:
     void reset_counters() {
         num_oversize_passes_ = 0;
         num_grants_withheld_ = 0;
+        num_withhold_episodes_ = 0;
+        withheld_seconds_ = 0.0;
+        max_withheld_seconds_ = 0.0;
     }
 
 private:
@@ -346,6 +377,10 @@ private:
                 withheld_grants_.push_back(peer);
                 num_grants_withheld_++;
             }
+            if (state.withheld_since < 0.0) {
+                state.withheld_since = MPI_Wtime();
+                num_withhold_episodes_++;
+            }
         };
         auto const held = num_redirect_elements_buffered_ + sum_proxied_in_credit_;
         if (exact_redirect_limit_) {
@@ -368,6 +403,12 @@ private:
         }
         if (state.proxied) {
             sum_proxied_in_credit_ += added;
+        }
+        if (state.withheld_since >= 0.0) {
+            auto const waited = MPI_Wtime() - state.withheld_since;
+            withheld_seconds_ += waited;
+            max_withheld_seconds_ = std::max(max_withheld_seconds_, waited);
+            state.withheld_since = -1.0;
         }
         state.in_granted = new_in_granted;
         send_grant(peer, state);
@@ -509,6 +550,9 @@ private:
     std::size_t grants_received_ = 0;
     std::size_t num_oversize_passes_ = 0;
     std::size_t num_grants_withheld_ = 0;
+    std::size_t num_withhold_episodes_ = 0;
+    double withheld_seconds_ = 0.0;
+    double max_withheld_seconds_ = 0.0;
 };
 
 }  // namespace briefkasten::internal
