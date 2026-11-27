@@ -104,6 +104,9 @@ struct Config {
     /// messages share each destination's buffer (fewer partially filled sends), and an own post waits while the
     /// reserve holds more than one buffer per peer, which bounds the reserve with three more terms.
     bool separate_forwarding = true;
+    /// A proxy grants on a proxied link only if all of the grant fits the redirect limit, so it holds at most the
+    /// limit in forwarded elements. false: it grants while below the limit, overshooting it by at most one window.
+    bool exact_redirect_limit = true;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -165,6 +168,7 @@ public:
         idle_flush_ = effective_config_.idle_flush;
         idle_flush_round_robin_ = effective_config_.idle_flush_round_robin;
         separate_forwarding_ = effective_config_.separate_forwarding;
+        flow_.exact_redirect_limit(effective_config_.exact_redirect_limit);
         queue_.allow_large_messages(effective_config_.allow_large_messages);
         reserve_aggregation_buffers(effective_config_.num_request_slots);
 #ifdef BRIEFKASTEN_STALL_TRACE
