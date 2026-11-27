@@ -140,6 +140,9 @@ struct Config {
     /// all inbound windows plus the forwarded payload held stay within credit_budget_buffers * #peers buffers; with
     /// indirection that is also the redirect limit.
     std::optional<std::size_t> credit_budget_buffers = std::nullopt;
+    /// DIAGNOSTIC: classify withheld peers as feeders / bystanders of the congestion (num_withheld_bystanders etc.).
+    /// Costs a map update per forwarded message (~11 % on lake-lanier), so off unless asked for.
+    bool withhold_feeder_diagnostic = false;
 };
 
 /// Apply double-buffering defaults to \p config for a queue with at most \p fan_out distinct
@@ -1398,9 +1401,11 @@ private:
         if (redirecting_depth_ > 0 && merged > 0) {
             redirected_in_buffer_[key] += merged;
             flow_.hold_redirected(merged);
-            auto& by_destination = forwarded_by_source_[redirect_source_];
-            by_destination[receiver] += merged;
-            forwarded_from_source_[redirect_source_] += merged;
+            if (effective_config_.withhold_feeder_diagnostic) {
+                auto& by_destination = forwarded_by_source_[redirect_source_];
+                by_destination[receiver] += merged;
+                forwarded_from_source_[redirect_source_] += merged;
+            }
         }
         if (large) {
             num_large_messages_++;
@@ -1632,6 +1637,10 @@ private:
         // Is a withheld peer feeding the congestion, or a bystander? Congested: destinations with a forwarded
         // buffer parked for credit. A peer's share: of what it sent through this proxy so far, the part that went
         // to congested destinations.
+        if (!effective_config_.withhold_feeder_diagnostic) {
+            flow_.take_new_episode_peers();
+            return;
+        }
         congested_scratch_.clear();
         for (auto& [receiver, queue_for_peer] : parked_) {
             for (auto const& parked : queue_for_peer) {
